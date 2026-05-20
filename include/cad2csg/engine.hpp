@@ -51,6 +51,7 @@ enum class SplineFitKind {
     plane,
     sphere,
     cylinder,
+    cone,
 };
 
 struct SplineFaceFit {
@@ -63,6 +64,7 @@ struct SplineFaceFit {
     Vec3 origin;
     Vec3 direction;
     double radius = 0.0;
+    double half_angle = 0.0; // radians; populated for cone only
 };
 
 struct SplineFitCandidates {
@@ -70,6 +72,7 @@ struct SplineFitCandidates {
     SplineFaceFit plane;
     SplineFaceFit sphere;
     SplineFaceFit cylinder;
+    SplineFaceFit cone;
 };
 
 struct AnalyzedFace {
@@ -340,6 +343,18 @@ bool replace_face_with_fit(CadModel& model,
                            double max_deviation,
                            Diagnostic* diagnostic_out = nullptr,
                            const ConversionOptions& options = {});
+
+struct AutoFitSummary {
+    std::size_t spline_faces_seen = 0;
+    std::size_t applied = 0;
+    std::size_t skipped_no_fit = 0;
+    std::size_t skipped_over_budget = 0;
+};
+
+AutoFitSummary auto_fit_splines(CadModel& model,
+                                bool has_max_deviation,
+                                double max_deviation,
+                                const ConversionOptions& options = {});
 
 bool decompose_solid_by_planar_faces(CadModel& model,
                                      const std::string& solid_id,

@@ -18,7 +18,7 @@ struct SplineSample {
 };
 
 std::vector<SplineSample> sample_face_surface(const TopoDS_Face& face,
-                                              std::size_t grid_n = 7) {
+                                              std::size_t grid_n = 13) {
     std::vector<SplineSample> out;
     BRepAdaptor_Surface surface(face, true);
     const double u0 = surface.FirstUParameter();
@@ -425,6 +425,167 @@ double try_cylinder_axis(const std::vector<SplineSample>& samples,
     return fit.rms_deviation;
 }
 
+// Try one candidate cone axis direction. Given the axis, points project
+// onto a 1D coordinate `t` (along axis) with radial distance `r`. A cone
+// satisfies `r = alpha * (t - s)` for slope alpha = tan(half_angle) and
+// apex axial coordinate `s`. We solve `r ≈ alpha*t + beta` by least squares
+// (linear in alpha, beta); then alpha = tan(half_angle), s = -beta/alpha.
+double try_cone_axis(const std::vector<SplineSample>& samples,
+                     double cx, double cy, double cz,
+                     double ax, double ay, double az,
+                     double scale,
+                     SplineFaceFit* out) {
+    SplineFaceFit fit;
+    fit.kind = SplineFitKind::cone;
+    const double an = std::sqrt(ax * ax + ay * ay + az * az);
+    if (an < kEps) {
+        return std::numeric_limits<double>::infinity();
+    }
+    ax /= an;
+    ay /= an;
+    az /= an;
+
+    std::vector<double> ts;
+    std::vector<double> rs;
+    ts.reserve(samples.size());
+    rs.reserve(samples.size());
+    for (const SplineSample& s : samples) {
+        const double dx = s.p.X() - cx;
+        const double dy = s.p.Y() - cy;
+        const double dz = s.p.Z() - cz;
+        const double t = dx * ax + dy * ay + dz * az;
+        const double radial_x = dx - t * ax;
+        const double radial_y = dy - t * ay;
+        const double radial_z = dz - t * az;
+        const double r = std::sqrt(radial_x * radial_x
+                                   + radial_y * radial_y
+                                   + radial_z * radial_z);
+        ts.push_back(t);
+        rs.push_back(r);
+    }
+
+    // Least-squares fit r = alpha * t + beta.
+    double sum_t = 0.0;
+    double sum_r = 0.0;
+    double sum_tt = 0.0;
+    double sum_tr = 0.0;
+    const double n = static_cast<double>(ts.size());
+    for (std::size_t i = 0; i < ts.size(); ++i) {
+        sum_t += ts[i];
+        sum_r += rs[i];
+        sum_tt += ts[i] * ts[i];
+        sum_tr += ts[i] * rs[i];
+    }
+    const double denom = n * sum_tt - sum_t * sum_t;
+    if (std::abs(denom) < kEps) {
+        return std::numeric_limits<double>::infinity();
+    }
+    const double alpha = (n * sum_tr - sum_t * sum_r) / denom;
+    const double beta = (sum_r - alpha * sum_t) / n;
+    if (std::abs(alpha) < 1.0e-6) {
+        // Slope is too flat — this is effectively a cylinder, not a cone.
+        return std::numeric_limits<double>::infinity();
+    }
+    const double half_angle = std::atan(std::abs(alpha));
+    const double apex_t = -beta / alpha;
+    const double apex_x = cx + apex_t * ax;
+    const double apex_y = cy + apex_t * ay;
+    const double apex_z = cz + apex_t * az;
+    // Orient axis so the cone opens in the positive `t` direction.
+    double dir_x = ax;
+    double dir_y = ay;
+    double dir_z = az;
+    if (alpha < 0.0) {
+        dir_x = -ax;
+        dir_y = -ay;
+        dir_z = -az;
+    }
+
+    fit.origin = {apex_x, apex_y, apex_z};
+    fit.direction = {dir_x, dir_y, dir_z};
+    fit.half_angle = half_angle;
+    fit.radius = 0.0;
+
+    // NOTE: the apex inherits the centroid's lateral position. For samples
+    // that are angularly uniform around the true axis (e.g. a fully-revolved
+    // cone with uniform u-parameter spacing), this is the right axis. For
+    // NURBS-converted cones the u-knot vector is non-uniform, so the centroid
+    // is laterally biased by O(few percent of the bbox diagonal). Closing
+    // that gap requires either area-weighted sampling (via surface
+    // derivatives) or a nonlinear axis-refinement step; deferred.
+    const double cos_half = std::cos(half_angle);
+    std::vector<double> devs;
+    devs.reserve(ts.size());
+    for (std::size_t i = 0; i < ts.size(); ++i) {
+        const double expected = std::abs(alpha) * std::abs(ts[i] - apex_t);
+        devs.push_back((rs[i] - expected) * cos_half);
+    }
+    finalize_fit_deviations(fit, devs, scale);
+    *out = fit;
+    return fit.rms_deviation;
+}
+
+SplineFaceFit fit_cone_from_samples(const std::vector<SplineSample>& samples,
+                                    double scale) {
+    SplineFaceFit fit;
+    fit.kind = SplineFitKind::cone;
+    if (samples.size() < 8) {
+        return fit;
+    }
+    double cx = 0.0;
+    double cy = 0.0;
+    double cz = 0.0;
+    for (const SplineSample& s : samples) {
+        cx += s.p.X();
+        cy += s.p.Y();
+        cz += s.p.Z();
+    }
+    const double inv_n = 1.0 / static_cast<double>(samples.size());
+    cx *= inv_n;
+    cy *= inv_n;
+    cz *= inv_n;
+    double M[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+    for (const SplineSample& s : samples) {
+        const double dx = s.p.X() - cx;
+        const double dy = s.p.Y() - cy;
+        const double dz = s.p.Z() - cz;
+        M[0][0] += dx * dx;
+        M[0][1] += dx * dy;
+        M[0][2] += dx * dz;
+        M[1][1] += dy * dy;
+        M[1][2] += dy * dz;
+        M[2][2] += dz * dz;
+    }
+    M[1][0] = M[0][1];
+    M[2][0] = M[0][2];
+    M[2][1] = M[1][2];
+    double w[3];
+    double V[3][3];
+    jacobi_3x3(M, w, V);
+
+    SplineFaceFit best;
+    double best_rms = std::numeric_limits<double>::infinity();
+    auto try_axis = [&](double ax, double ay, double az) {
+        SplineFaceFit candidate;
+        const double rms = try_cone_axis(samples, cx, cy, cz, ax, ay, az,
+                                         scale, &candidate);
+        if (rms < best_rms) {
+            best_rms = rms;
+            best = candidate;
+        }
+    };
+    for (int k = 0; k < 3; ++k) {
+        try_axis(V[0][k], V[1][k], V[2][k]);
+    }
+    // Also try the world axes — for axis-aligned NURBS cones the moment
+    // matrix can be nearly degenerate, leaving the PCA eigenvectors rotated
+    // within the radial plane and producing a slightly tilted fit.
+    try_axis(1.0, 0.0, 0.0);
+    try_axis(0.0, 1.0, 0.0);
+    try_axis(0.0, 0.0, 1.0);
+    return best;
+}
+
 // A true cylinder's axis is one of the three principal axes of the centered
 // sample cloud. Which one depends on the aspect ratio (a tall thin cylinder
 // has the axis as the largest eigenvector; a short fat one has it as the
@@ -484,6 +645,22 @@ SplineFaceFit fit_cylinder_from_samples(const std::vector<SplineSample>& samples
 
 } // namespace
 
+const char* spline_fit_kind_name(SplineFitKind kind) {
+    switch (kind) {
+    case SplineFitKind::none:
+        return "none";
+    case SplineFitKind::plane:
+        return "plane";
+    case SplineFitKind::sphere:
+        return "sphere";
+    case SplineFitKind::cylinder:
+        return "cylinder";
+    case SplineFitKind::cone:
+        return "cone";
+    }
+    return "none";
+}
+
 SplineFitCandidates fit_spline_face(const TopoDS_Face& face) {
     SplineFitCandidates out;
     out.attempted = true;
@@ -495,6 +672,7 @@ SplineFitCandidates fit_spline_face(const TopoDS_Face& face) {
     out.plane = fit_plane_from_samples(samples, scale);
     out.sphere = fit_sphere_from_samples(samples, scale);
     out.cylinder = fit_cylinder_from_samples(samples, scale);
+    out.cone = fit_cone_from_samples(samples, scale);
     return out;
 }
 

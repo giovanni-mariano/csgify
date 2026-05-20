@@ -11,5 +11,6 @@
 namespace cad2csg::detail {
 
 SplineFitCandidates fit_spline_face(const TopoDS_Face& face);
+const char* spline_fit_kind_name(SplineFitKind kind);
 
 } // namespace cad2csg::detail

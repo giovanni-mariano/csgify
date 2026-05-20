@@ -154,4 +154,82 @@ if [ "$?" -ne 0 ]; then
     fail "face replacement contract validation failed"
 fi
 
+# ---- auto-fit: the NURBS cylinder fixture is a clean cylinder whose every
+#      face is a B-spline. Auto-fit with a tight budget must convert it
+#      end-to-end (3/3 spline faces accepted, 1/1 solids converted).
+
+"$exe" auto-fit "$fixtures/spline_face.step" \
+    --out "$outdir/spline_face_auto.i" \
+    --max-deviation 1e-6 \
+    --report "$outdir/spline_face_auto.json" >/dev/null 2>&1 \
+    || fail "auto-fit failed end-to-end on spline_face fixture"
+
+python3 - "$outdir/spline_face_auto.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+
+assert report["summary"]["solids_converted"] == 1, report["summary"]
+assert report["summary"]["spline_faces"] == 0, \
+    f"expected no spline diagnostics after auto-fit; got {report['summary']}"
+applied = [d for d in report["diagnostics"]
+           if d["code"] == "face_replacement_recorded"]
+assert len(applied) == 3, f"expected 3 face_replacement_recorded; got {len(applied)}"
+PY
+if [ "$?" -ne 0 ]; then
+    fail "auto-fit contract validation failed"
+fi
+
+# ---- auto-fit with a too-tight budget should leave most faces untouched.
+"$exe" auto-fit "$fixtures/spline_face.step" \
+    --out "$outdir/spline_face_strict.i" \
+    --max-deviation 1e-20 \
+    --report "$outdir/spline_face_strict.json" >/dev/null 2>&1 || true
+python3 - "$outdir/spline_face_strict.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+over = [d for d in report["diagnostics"] if d["code"] == "auto_fit_over_budget"]
+assert over, "tight budget must produce auto_fit_over_budget warnings"
+PY
+if [ "$?" -ne 0 ]; then
+    fail "auto-fit budget contract validation failed"
+fi
+
+# ---- cone fit: the spline_cone fixture has a NURBS cone side that must
+#      yield a cone candidate which beats plane/sphere/cylinder. The fit
+#      is currently first-pass and not pixel-perfect, but it must be the
+#      best of the four and stay within ~5% relative deviation.
+
+run_inspect spline_cone.step "$outdir/spline_cone.json"
+python3 - "$outdir/spline_cone.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+splines = [face for face in report["faces"] if face["surface_type"] == "bspline"]
+# Find the curved face: the one whose cone fit beats its plane fit.
+curved = None
+for face in splines:
+    fits = face["spline_fits"]
+    if fits["cone"]["max_deviation"] < fits["plane"]["max_deviation"]:
+        curved = face
+        break
+assert curved is not None, "expected at least one face where cone beats plane"
+cone = curved["spline_fits"]["cone"]
+assert cone["available"], cone
+assert cone["relative_max_deviation"] < 0.03, \
+    f"cone fit deviates too much: {cone['relative_max_deviation']}"
+# Half-angle must be roughly atan(1/4) ≈ 0.245 (cone fixture is r1=2, r2=1, h=4).
+import math
+assert abs(cone["half_angle"] - math.atan(0.25)) < 0.02, \
+    f"cone half-angle off: {cone['half_angle']}"
+PY
+if [ "$?" -ne 0 ]; then
+    fail "cone fit contract validation failed"
+fi
+
 exit 0

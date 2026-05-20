@@ -29,14 +29,15 @@ void usage(const char* argv0) {
               << "           --replace-solid-fitted-cylinder --replace-solid-fitted-sphere\n"
               << "           --replace-solid-fitted-cone     --decompose-planar\n"
               << "           --remove-solid\n"
-              << "         actions on a face id (e.g. face:1.4):\n"
+              << "         actions on a face id (e.g. face:1.4, or a comma list face:1.4,face:1.5):\n"
               << "           --replace-face-with-plane       --replace-face-with-cylinder\n"
-              << "           --replace-face-with-sphere\n"
+              << "           --replace-face-with-sphere      --replace-face-with-cone\n"
               << "         options:\n"
               << "           --max-abs-delta value     (solid replacement, volume guard)\n"
               << "           --max-rel-delta value     (solid replacement, volume guard)\n"
               << "           --max-deviation value     (face replacement, distance guard)\n"
               << "           --report report.json\n"
+              << "       " << argv0 << " auto-fit input.step --out output.i [--max-deviation X] [--report report.json]\n"
               << "       " << argv0 << " volume input.step\n"
               << "       " << argv0 << " volume original.step --compare candidate.step [--abs-tol value] [--rel-tol value]\n"
               << "       " << argv0 << " --version\n";
@@ -98,6 +99,7 @@ constexpr FaceActionEntry kFaceActions[] = {
     {"--replace-face-with-plane",    cad2csg::SplineFitKind::plane},
     {"--replace-face-with-sphere",   cad2csg::SplineFitKind::sphere},
     {"--replace-face-with-cylinder", cad2csg::SplineFitKind::cylinder},
+    {"--replace-face-with-cone",     cad2csg::SplineFitKind::cone},
 };
 
 bool face_kind_from_action(const std::string& action,
@@ -296,18 +298,34 @@ int run_simplify_command(int argc, char** argv) {
                       << "apply to solid replacement commands, not face replacement\n";
             return EXIT_FAILURE;
         }
-        cad2csg::Diagnostic face_diag;
-        action_ok = cad2csg::replace_face_with_fit(model, target_id, kind,
-                                                    has_max_deviation, max_deviation,
-                                                    &face_diag, options);
-        if (!action_ok) {
-            std::cerr << severity_name(face_diag.severity) << " "
-                      << face_diag.code;
-            if (!face_diag.shape_label.empty()) {
-                std::cerr << " " << face_diag.shape_label;
+        // target_id may be a single face:N.M or a comma-separated list.
+        action_ok = true;
+        std::size_t cursor = 0;
+        while (cursor <= target_id.size()) {
+            const std::size_t comma = target_id.find(',', cursor);
+            const std::size_t end = comma == std::string::npos ? target_id.size() : comma;
+            const std::string id = target_id.substr(cursor, end - cursor);
+            if (id.empty()) {
+                std::cerr << "error invalid_face_id: empty entry in face list\n";
+                return EXIT_FAILURE;
             }
-            std::cerr << ": " << face_diag.message << '\n';
-            return EXIT_FAILURE;
+            cad2csg::Diagnostic face_diag;
+            const bool ok = cad2csg::replace_face_with_fit(
+                model, id, kind, has_max_deviation, max_deviation,
+                &face_diag, options);
+            if (!ok) {
+                std::cerr << severity_name(face_diag.severity) << " "
+                          << face_diag.code;
+                if (!face_diag.shape_label.empty()) {
+                    std::cerr << " " << face_diag.shape_label;
+                }
+                std::cerr << ": " << face_diag.message << '\n';
+                return EXIT_FAILURE;
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            cursor = comma + 1;
         }
     } else if (action == "--remove-solid") {
         if (has_volume_limits) {
@@ -353,6 +371,69 @@ int run_simplify_command(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 
+    return EXIT_SUCCESS;
+}
+
+int run_auto_fit_command(int argc, char** argv) {
+    if (argc < 5) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    if (std::strcmp(argv[3], "--out") != 0) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string output_path = argv[4];
+
+    std::string report_path;
+    bool has_max_deviation = false;
+    double max_deviation = 0.0;
+
+    OptScanner scan(argc, argv, 5);
+    while (!scan.done()) {
+        if (scan.take_double("--max-deviation", &max_deviation, &has_max_deviation)) continue;
+        if (scan.take_string("--report", &report_path)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    std::cerr << "cad2csg: OCCT " << cad2csg::occt_version()
+              << ", Alea " << alea_version() << '\n';
+
+    cad2csg::ConversionOptions options;
+    cad2csg::CadModel model = cad2csg::load_step_model(input_path, options);
+    if (!model.loaded()) {
+        cad2csg::AnalysisReport report = cad2csg::analyze_model(model, options);
+        print_diagnostics(report);
+        return EXIT_FAILURE;
+    }
+
+    const cad2csg::AutoFitSummary summary =
+        cad2csg::auto_fit_splines(model, has_max_deviation, max_deviation, options);
+    std::cerr << "auto-fit: " << summary.applied << "/" << summary.spline_faces_seen
+              << " spline faces replaced, "
+              << summary.skipped_over_budget << " over budget, "
+              << summary.skipped_no_fit << " no candidate\n";
+
+    cad2csg::ConversionResult result = cad2csg::convert_model(model, options);
+    print_diagnostics(result.report);
+    print_summary(result.report);
+
+    if (!report_path.empty()
+        && cad2csg::write_report_json(result.report, report_path) != 0) {
+        std::cerr << "error report_write_failed: " << report_path << '\n';
+        return EXIT_FAILURE;
+    }
+
+    if (!result.report.ok() || result.report.solids_converted == 0) {
+        return EXIT_FAILURE;
+    }
+    if (cad2csg::export_mcnp(result.system.get(), output_path) != 0) {
+        std::cerr << "error mcnp_export_failed: " << alea_error() << '\n';
+        return EXIT_FAILURE;
+    }
     return EXIT_SUCCESS;
 }
 
@@ -435,6 +516,7 @@ int main(int argc, char** argv) {
     if (verb == "inspect") return run_inspect_command(argc, argv);
     if (verb == "volume")  return run_volume_command(argc, argv);
     if (verb == "simplify") return run_simplify_command(argc, argv);
+    if (verb == "auto-fit") return run_auto_fit_command(argc, argv);
 
     return run_default_convert(argc, argv);
 }

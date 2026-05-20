@@ -13,6 +13,7 @@
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
@@ -66,6 +67,14 @@ TopoDS_Shape make_nurbs_cylinder() {
     return convert.Shape();
 }
 
+// A truncated cone solid with all faces NurbsConvert'ed. The curved face
+// should fit cad2csg's cone candidate to near-machine precision.
+TopoDS_Shape make_nurbs_cone() {
+    TopoDS_Shape cone = BRepPrimAPI_MakeCone(2.0, 1.0, 4.0).Shape();
+    BRepBuilderAPI_NurbsConvert convert(cone, true);
+    return convert.Shape();
+}
+
 
 } // namespace
 
@@ -87,6 +96,7 @@ int main(int argc, char** argv) {
         {"cylinder.step", BRepPrimAPI_MakeCylinder(2.0, 6.0).Shape()},
         {"l_shape.step", make_l_shape()},
         {"spline_face.step", make_nurbs_cylinder()},
+        {"spline_cone.step", make_nurbs_cone()},
     };
 
     for (const Item& item : items) {

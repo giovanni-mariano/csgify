@@ -11,7 +11,16 @@ set(CAD2CSG_LIBALEA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../libalea" CACHE PATH "Pa
 find_package(OpenCASCADE 8.0.0 EXACT REQUIRED)
 
 add_library(cad2csg_engine
+    src/analytic_surface.cpp
+    src/analyze.cpp
+    src/cleanup.cpp
+    src/decompose.cpp
+    src/emit.cpp
     src/engine.cpp
+    src/engine_internal.cpp
+    src/fitted_candidates.cpp
+    src/import.cpp
+    src/report.cpp
     src/spline_fit.cpp
 )
 
