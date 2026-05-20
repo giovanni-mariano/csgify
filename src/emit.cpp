@@ -494,6 +494,9 @@ ConversionResult convert_model(const CadModel& model,
 
     std::size_t piece_index = 0;
     for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (!piece.active) {
+            continue;
+        }
         ++piece_index;
         ++result.report.solids_seen;
         ++result.report.decomposition_pieces;

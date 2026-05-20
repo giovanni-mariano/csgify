@@ -8,7 +8,9 @@
 
 #include <BRepBndLib.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
+#include <BRepGProp.hxx>
 #include <Bnd_Box.hxx>
+#include <GProp_GProps.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopAbs_State.hxx>
 #include <TopExp_Explorer.hxx>
@@ -16,13 +18,54 @@
 #include <TopoDS_Vertex.hxx>
 
 namespace cad2csg::detail {
+namespace {
+
+std::string shape_id_from_label(const std::string& label) {
+    std::size_t solid_pos = label.find("solid[");
+    if (solid_pos == std::string::npos) {
+        return {};
+    }
+    solid_pos += 6;
+    const std::size_t solid_end = label.find(']', solid_pos);
+    if (solid_end == std::string::npos) {
+        return {};
+    }
+    const std::string solid_number = label.substr(solid_pos, solid_end - solid_pos);
+
+    const std::size_t face_pos = label.find("/face[", solid_end);
+    if (face_pos == std::string::npos) {
+        return "solid:" + solid_number;
+    }
+    const std::size_t face_number_pos = face_pos + 6;
+    const std::size_t face_end = label.find(']', face_number_pos);
+    if (face_end == std::string::npos) {
+        return "solid:" + solid_number;
+    }
+    return "face:" + solid_number + "."
+        + label.substr(face_number_pos, face_end - face_number_pos);
+}
+
+bool looks_like_shape_id(const std::string& value) {
+    return value.compare(0, 6, "solid:") == 0
+        || value.compare(0, 5, "face:") == 0
+        || value.compare(0, 6, "piece:") == 0
+        || value.compare(0, 10, "synthetic:") == 0;
+}
+
+} // namespace
 
 void add_diag(ConversionReport& report,
               DiagnosticSeverity severity,
               const std::string& code,
               const std::string& message,
               const std::string& label) {
-    report.diagnostics.push_back({severity, code, message, label});
+    Diagnostic diagnostic{severity, code, message, label};
+    if (looks_like_shape_id(label)) {
+        diagnostic.shape_id = label;
+    } else {
+        diagnostic.shape_id = shape_id_from_label(label);
+    }
+    report.diagnostics.push_back(diagnostic);
 }
 
 bool is_error(const Diagnostic& diagnostic) {
@@ -324,6 +367,51 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
         }
     }
     return true;
+}
+
+bool find_convexity_failure_face(const TopoDS_Solid& solid,
+                                 std::size_t solid_index,
+                                 const ConversionOptions& options,
+                                 std::size_t* face_index_out) {
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(solid, props);
+    gp_Pnt interior_point;
+    if (!find_interior_point(solid, props, options.linear_tolerance, &interior_point)) {
+        return false;
+    }
+
+    const std::vector<gp_Pnt> vertices = solid_vertices(solid);
+    if (vertices.empty()) {
+        return false;
+    }
+
+    std::size_t face_index = 0;
+    ConversionReport scratch;
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
+        ++face_index;
+        AnalyticSurface surface;
+        if (!analytic_surface_from_face(TopoDS::Face(face_exp.Current()),
+                                        solid_index,
+                                        face_index,
+                                        scratch,
+                                        false,
+                                        &surface)) {
+            continue;
+        }
+        const double interior_value = surface.value_at(interior_point);
+        const int sense = interior_value <= options.linear_tolerance ? -1 : 1;
+        for (const gp_Pnt& vertex : vertices) {
+            const double value = surface.value_at(vertex);
+            const bool outside = sense < 0
+                ? value > options.linear_tolerance
+                : value < -options.linear_tolerance;
+            if (outside) {
+                *face_index_out = face_index;
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 double vec_len(Vec3 v) {

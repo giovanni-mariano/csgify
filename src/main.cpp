@@ -1,5 +1,12 @@
 #include "cad2csg/engine.hpp"
+#include "cad2csg/session.hpp"
 
+#include "engine_model.hpp"
+#include "lua_runner.hpp"
+#include "recipe.hpp"
+#include "replay.hpp"
+
+#include <alea.h>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -23,11 +30,18 @@ const char* severity_name(cad2csg::DiagnosticSeverity severity) {
 void usage(const char* argv0) {
     std::cerr << "usage: " << argv0 << " input.step output.i\n"
               << "       " << argv0 << " inspect input.step --report report.json\n"
+              << "       " << argv0 << " dump-assembly input.step\n"
+              << "       " << argv0 << " decompose-suggest input.step solid:N [--report proposals.json]\n"
+              << "       " << argv0 << " compact decisions.json --out recipe.lua\n"
+              << "       " << argv0 << " replay recipe.json --step input.step --out output.i --report replay.json [--out-step simplified.step]\n"
               << "       " << argv0 << " simplify input.step <action> <target> --out output.i [options]\n"
               << "         actions on a solid id (e.g. solid:1):\n"
               << "           --replace-solid-bbox            --replace-solid-bbox-cylinder\n"
               << "           --replace-solid-fitted-cylinder --replace-solid-fitted-sphere\n"
               << "           --replace-solid-fitted-cone     --decompose-planar\n"
+              << "           --auto-decompose-bsp\n"
+              << "           --apply-decomposition-candidate --candidate candidate:N\n"
+              << "           --decompose-by-face --by-face face:N.M\n"
               << "           --remove-solid\n"
               << "         actions on a face id (e.g. face:1.4, or a comma list face:1.4,face:1.5):\n"
               << "           --replace-face-with-plane       --replace-face-with-cylinder\n"
@@ -36,8 +50,15 @@ void usage(const char* argv0) {
               << "           --max-abs-delta value     (solid replacement, volume guard)\n"
               << "           --max-rel-delta value     (solid replacement, volume guard)\n"
               << "           --max-deviation value     (face replacement, distance guard)\n"
+              << "           --max-depth value         (safe BSP auto-decomposition)\n"
+              << "           --allow-bbox-fallback-auto\n"
+              << "           --allow-medium-confidence-auto\n"
               << "           --report report.json\n"
+              << "           --proposal-report proposals.json\n"
+              << "           --log decisions.json      (append-only decision log)\n"
+              << "           --out-step simplified.step (as-simplified geometry for review)\n"
               << "       " << argv0 << " auto-fit input.step --out output.i [--max-deviation X] [--report report.json]\n"
+              << "       " << argv0 << " lua script.lua [args...]\n"
               << "       " << argv0 << " volume input.step\n"
               << "       " << argv0 << " volume original.step --compare candidate.step [--abs-tol value] [--rel-tol value]\n"
               << "       " << argv0 << " --version\n";
@@ -144,6 +165,14 @@ public:
     const char* peek() const { return pos_ < argc_ ? argv_[pos_] : nullptr; }
     int pos() const { return pos_; }
 
+    bool take_flag(const char* flag) {
+        if (pos_ >= argc_ || std::strcmp(argv_[pos_], flag) != 0) {
+            return false;
+        }
+        ++pos_;
+        return true;
+    }
+
     bool take_string(const char* flag, std::string* out) {
         if (!matches(flag)) {
             return false;
@@ -199,8 +228,12 @@ int run_volume_command(int argc, char** argv) {
     }
 
     cad2csg::ConversionOptions options;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
     if (compare_path.empty()) {
-        cad2csg::ConversionReport report = cad2csg::inspect_step_file(input, options);
+        const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input);
+        cad2csg::CommandResult analysis =
+            cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
+        const cad2csg::ConversionReport& report = analysis.report;
         std::cout << "volume " << report.total_volume << '\n';
         std::cout << "solids " << report.solid_volumes.size() << '\n';
         for (const cad2csg::SolidVolume& solid : report.solid_volumes) {
@@ -209,8 +242,15 @@ int run_volume_command(int argc, char** argv) {
         return report.solids_seen > 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
+    const cad2csg::DocumentId original_id = cad2csg::load_step(*session, input);
+    const cad2csg::DocumentId candidate_id = cad2csg::load_step(*session, compare_path);
     cad2csg::VolumeComparison comparison =
-        cad2csg::compare_step_volumes(input, compare_path, abs_tol, rel_tol, options);
+        cad2csg::compare_document_volumes(*session,
+                                          original_id,
+                                          candidate_id,
+                                          abs_tol,
+                                          rel_tol,
+                                          cad2csg::ReportIdMode::local);
     std::cout << "original_volume " << comparison.original.total_volume << '\n';
     std::cout << "candidate_volume " << comparison.candidate.total_volume << '\n';
     std::cout << "absolute_delta " << comparison.absolute_delta << '\n';
@@ -220,6 +260,49 @@ int run_volume_command(int argc, char** argv) {
     std::cout << "within_tolerance "
               << (comparison.within_tolerance ? "true" : "false") << '\n';
     return comparison.within_tolerance ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int run_decompose_suggest_command(int argc, char** argv) {
+    if (argc < 4) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    const std::string target_id = argv[3];
+    std::string report_path;
+
+    OptScanner scan(argc, argv, 4);
+    while (!scan.done()) {
+        if (scan.take_string("--report", &report_path)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    cad2csg::ConversionOptions options;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    cad2csg::load_step(*session, input_path);
+    cad2csg::DecompositionProposal proposal =
+        cad2csg::propose_decomposition(*session,
+                                       target_id,
+                                       cad2csg::ReportIdMode::local);
+
+    if (!report_path.empty()) {
+        if (cad2csg::write_decomposition_proposal_json(proposal, report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+            return EXIT_FAILURE;
+        }
+    } else {
+        std::cout << cad2csg::decomposition_proposal_json_string(proposal);
+    }
+
+    std::cerr << "decomposition candidates: " << proposal.candidates.size()
+              << ", best: "
+              << (proposal.best_candidate_id.empty()
+                  ? std::string("-")
+                  : proposal.best_candidate_id)
+              << ", ok: " << (proposal.ok ? "true" : "false") << '\n';
+    return proposal.ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 int run_simplify_command(int argc, char** argv) {
@@ -239,6 +322,13 @@ int run_simplify_command(int argc, char** argv) {
 
     cad2csg::ReplacementLimits replacement_limits;
     std::string report_path;
+    std::string proposal_report_path;
+    std::string log_path;
+    std::string step_out_path;
+    std::string by_face_id;
+    std::string candidate_id;
+    double max_depth_value = 4.0;
+    cad2csg::DecompositionPolicy decomposition_policy;
     bool has_max_deviation = false;
     double max_deviation = 0.0;
 
@@ -251,7 +341,21 @@ int run_simplify_command(int argc, char** argv) {
                              &replacement_limits.max_relative_delta,
                              &replacement_limits.has_relative_delta)) continue;
         if (scan.take_double("--max-deviation", &max_deviation, &has_max_deviation)) continue;
+        if (scan.take_double("--max-depth", &max_depth_value)) continue;
         if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--proposal-report", &proposal_report_path)) continue;
+        if (scan.take_string("--log", &log_path)) continue;
+        if (scan.take_string("--out-step", &step_out_path)) continue;
+        if (scan.take_string("--by-face", &by_face_id)) continue;
+        if (scan.take_string("--candidate", &candidate_id)) continue;
+        if (scan.take_flag("--allow-bbox-fallback-auto")) {
+            decomposition_policy.allow_bbox_fallback_auto = true;
+            continue;
+        }
+        if (scan.take_flag("--allow-medium-confidence-auto")) {
+            decomposition_policy.allow_medium_confidence_auto = true;
+            continue;
+        }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -261,35 +365,44 @@ int run_simplify_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
-    cad2csg::CadModel model = cad2csg::load_step_model(input_path, options);
-    if (!model.loaded()) {
-        cad2csg::AnalysisReport report = cad2csg::analyze_model(model, options);
-        print_diagnostics(report);
-        return EXIT_FAILURE;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    if (!log_path.empty()) {
+        try {
+            cad2csg::attach_decision_log(*session, log_path, input_path);
+        } catch (const std::exception& e) {
+            std::cerr << "error decision_log_open_failed: " << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
     }
+    const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input_path);
 
     const bool has_volume_limits =
         replacement_limits.has_absolute_delta || replacement_limits.has_relative_delta;
 
     cad2csg::ReplacementOperation operation;
-    bool action_ok = false;
+    cad2csg::CommandResult action_result;
     if (operation_from_action(action, &operation)) {
         if (has_volume_limits) {
-            cad2csg::ReplacementCheck check;
-            action_ok = cad2csg::apply_checked_replacement_operation(
-                model, target_id, operation, replacement_limits, &check, options);
-            if (!action_ok && !check.diagnostic.code.empty()) {
-                std::cerr << severity_name(check.diagnostic.severity) << " "
-                          << check.diagnostic.code;
-                if (!check.diagnostic.shape_label.empty()) {
-                    std::cerr << " " << check.diagnostic.shape_label;
+            cad2csg::ReplacementCommandResult replacement =
+                cad2csg::apply_checked_replacement_operation(
+                    *session,
+                    target_id,
+                    operation,
+                    replacement_limits,
+                    cad2csg::ReportIdMode::local);
+            action_result = replacement.command;
+            if (!action_result.ok && !replacement.check.diagnostic.code.empty()) {
+                std::cerr << severity_name(replacement.check.diagnostic.severity) << " "
+                          << replacement.check.diagnostic.code;
+                if (!replacement.check.diagnostic.shape_label.empty()) {
+                    std::cerr << " " << replacement.check.diagnostic.shape_label;
                 }
-                std::cerr << ": " << check.diagnostic.message << '\n';
+                std::cerr << ": " << replacement.check.diagnostic.message << '\n';
                 return EXIT_FAILURE;
             }
         } else {
-            action_ok = cad2csg::apply_replacement_operation(
-                model, target_id, operation, options);
+            action_result = cad2csg::apply_replacement_operation(
+                *session, target_id, operation, cad2csg::ReportIdMode::local);
         }
     } else if (cad2csg::SplineFitKind kind = cad2csg::SplineFitKind::none;
                face_kind_from_action(action, &kind)) {
@@ -299,7 +412,7 @@ int run_simplify_command(int argc, char** argv) {
             return EXIT_FAILURE;
         }
         // target_id may be a single face:N.M or a comma-separated list.
-        action_ok = true;
+        bool action_ok = true;
         std::size_t cursor = 0;
         while (cursor <= target_id.size()) {
             const std::size_t comma = target_id.find(',', cursor);
@@ -309,11 +422,18 @@ int run_simplify_command(int argc, char** argv) {
                 std::cerr << "error invalid_face_id: empty entry in face list\n";
                 return EXIT_FAILURE;
             }
-            cad2csg::Diagnostic face_diag;
-            const bool ok = cad2csg::replace_face_with_fit(
-                model, id, kind, has_max_deviation, max_deviation,
-                &face_diag, options);
-            if (!ok) {
+            action_result = cad2csg::replace_face_with_fit(
+                *session,
+                id,
+                kind,
+                has_max_deviation,
+                max_deviation,
+                cad2csg::ReportIdMode::local);
+            if (!action_result.ok) {
+                const cad2csg::Diagnostic face_diag =
+                    action_result.report.diagnostics.empty()
+                        ? cad2csg::Diagnostic{}
+                        : action_result.report.diagnostics.back();
                 std::cerr << severity_name(face_diag.severity) << " "
                           << face_diag.code;
                 if (!face_diag.shape_label.empty()) {
@@ -327,32 +447,106 @@ int run_simplify_command(int argc, char** argv) {
             }
             cursor = comma + 1;
         }
+        if (!action_ok) {
+            return EXIT_FAILURE;
+        }
     } else if (action == "--remove-solid") {
         if (has_volume_limits) {
             std::cerr << "error replacement_limit_not_applicable: volume delta limits "
                       << "apply to replacement commands, not remove-solid\n";
             return EXIT_FAILURE;
         }
-        action_ok = cad2csg::remove_solid(model, target_id);
+        action_result = cad2csg::remove_solid(
+            *session, target_id, cad2csg::ReportIdMode::local);
     } else if (action == "--decompose-planar") {
         if (has_volume_limits) {
             std::cerr << "error replacement_limit_not_applicable: volume delta limits "
                       << "apply to replacement commands, not decompose-planar\n";
             return EXIT_FAILURE;
         }
-        action_ok = cad2csg::decompose_solid_by_planar_faces(model, target_id, options);
+        action_result = cad2csg::decompose_planar(
+            *session, target_id, cad2csg::ReportIdMode::local);
+    } else if (action == "--decompose-by-face") {
+        if (has_volume_limits) {
+            std::cerr << "error replacement_limit_not_applicable: volume delta limits "
+                      << "apply to replacement commands, not decompose-by-face\n";
+            return EXIT_FAILURE;
+        }
+        if (by_face_id.empty()) {
+            std::cerr << "error missing_by_face: --decompose-by-face requires --by-face face:N.M\n";
+            return EXIT_FAILURE;
+        }
+        action_result = cad2csg::decompose_by_face(
+            *session, target_id, by_face_id, cad2csg::ReportIdMode::local);
+    } else if (action == "--auto-decompose-bsp") {
+        if (has_volume_limits) {
+            std::cerr << "error replacement_limit_not_applicable: volume delta limits "
+                      << "apply to replacement commands, not auto-decompose-bsp\n";
+            return EXIT_FAILURE;
+        }
+        if (max_depth_value < 0.0) {
+            std::cerr << "error invalid_max_depth: --max-depth must be non-negative\n";
+            return EXIT_FAILURE;
+        }
+        action_result = cad2csg::auto_decompose_bsp(
+            *session,
+            target_id,
+            static_cast<int>(max_depth_value),
+            decomposition_policy,
+            cad2csg::ReportIdMode::local);
+    } else if (action == "--apply-decomposition-candidate") {
+        if (has_volume_limits) {
+            std::cerr << "error replacement_limit_not_applicable: volume delta limits "
+                      << "apply to replacement commands, not apply-decomposition-candidate\n";
+            return EXIT_FAILURE;
+        }
+        if (candidate_id.empty()) {
+            std::cerr << "error missing_candidate: --apply-decomposition-candidate requires --candidate candidate:N\n";
+            return EXIT_FAILURE;
+        }
+        action_result = cad2csg::apply_decomposition_candidate(
+            *session,
+            target_id,
+            candidate_id,
+            cad2csg::ReportIdMode::local);
     } else {
         usage(argv[0]);
         return EXIT_FAILURE;
     }
 
-    if (!action_ok) {
-        cad2csg::AnalysisReport report = cad2csg::analyze_model(model, options);
-        print_diagnostics(report);
+    if (!proposal_report_path.empty()) {
+        const cad2csg::DecompositionProposal& proposal =
+            cad2csg::last_decomposition_proposal(*session);
+        if (cad2csg::write_decomposition_proposal_json(proposal,
+                                                       proposal_report_path) != 0) {
+            std::cerr << "error proposal_report_write_failed: "
+                      << proposal_report_path << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+
+    if (!action_result.ok) {
+        print_diagnostics(action_result.report);
         return EXIT_FAILURE;
     }
 
-    cad2csg::ConversionResult result = cad2csg::convert_model(model, options);
+    if (!step_out_path.empty()) {
+        cad2csg::CommandResult step_result =
+            cad2csg::export_document_step(*session,
+                                          document_id,
+                                          step_out_path,
+                                          cad2csg::ReportIdMode::local);
+        if (!step_result.ok) {
+            print_diagnostics(step_result.report);
+            return EXIT_FAILURE;
+        }
+    }
+
+    cad2csg::CommandResult result =
+        cad2csg::emit_document(*session,
+                               document_id,
+                               output_path,
+                               cad2csg::ReportIdMode::local);
     print_diagnostics(result.report);
     print_summary(result.report);
 
@@ -363,11 +557,6 @@ int run_simplify_command(int argc, char** argv) {
     }
 
     if (!result.report.ok() || result.report.solids_converted == 0) {
-        return EXIT_FAILURE;
-    }
-
-    if (cad2csg::export_mcnp(result.system.get(), output_path) != 0) {
-        std::cerr << "error mcnp_export_failed: " << alea_error() << '\n';
         return EXIT_FAILURE;
     }
 
@@ -403,21 +592,26 @@ int run_auto_fit_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
-    cad2csg::CadModel model = cad2csg::load_step_model(input_path, options);
-    if (!model.loaded()) {
-        cad2csg::AnalysisReport report = cad2csg::analyze_model(model, options);
-        print_diagnostics(report);
-        return EXIT_FAILURE;
-    }
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input_path);
 
-    const cad2csg::AutoFitSummary summary =
-        cad2csg::auto_fit_splines(model, has_max_deviation, max_deviation, options);
-    std::cerr << "auto-fit: " << summary.applied << "/" << summary.spline_faces_seen
+    cad2csg::AutoFitCommandResult auto_fit =
+        cad2csg::auto_fit_splines_with_summary(*session,
+                                               document_id,
+                                               has_max_deviation,
+                                               max_deviation,
+                                               cad2csg::ReportIdMode::local);
+    std::cerr << "auto-fit: " << auto_fit.summary.applied << "/"
+              << auto_fit.summary.spline_faces_seen
               << " spline faces replaced, "
-              << summary.skipped_over_budget << " over budget, "
-              << summary.skipped_no_fit << " no candidate\n";
+              << auto_fit.summary.skipped_over_budget << " over budget, "
+              << auto_fit.summary.skipped_no_fit << " no candidate\n";
 
-    cad2csg::ConversionResult result = cad2csg::convert_model(model, options);
+    cad2csg::CommandResult result =
+        cad2csg::emit_document(*session,
+                               document_id,
+                               output_path,
+                               cad2csg::ReportIdMode::local);
     print_diagnostics(result.report);
     print_summary(result.report);
 
@@ -430,10 +624,6 @@ int run_auto_fit_command(int argc, char** argv) {
     if (!result.report.ok() || result.report.solids_converted == 0) {
         return EXIT_FAILURE;
     }
-    if (cad2csg::export_mcnp(result.system.get(), output_path) != 0) {
-        std::cerr << "error mcnp_export_failed: " << alea_error() << '\n';
-        return EXIT_FAILURE;
-    }
     return EXIT_SUCCESS;
 }
 
@@ -444,10 +634,12 @@ int run_inspect_command(int argc, char** argv) {
     }
     const std::string input_path = argv[2];
     std::string report_path;
+    std::string log_path;
 
     OptScanner scan(argc, argv, 3);
     while (!scan.done()) {
         if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--log", &log_path)) continue;
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -461,8 +653,19 @@ int run_inspect_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
-    cad2csg::ConversionReport report =
-        cad2csg::inspect_step_file(input_path, options);
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    if (!log_path.empty()) {
+        try {
+            cad2csg::attach_decision_log(*session, log_path, input_path);
+        } catch (const std::exception& e) {
+            std::cerr << "error decision_log_open_failed: " << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input_path);
+    cad2csg::CommandResult inspect =
+        cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
+    cad2csg::ConversionReport report = inspect.report;
     print_diagnostics(report);
     print_summary(report);
 
@@ -482,8 +685,13 @@ int run_default_convert(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
-    cad2csg::ConversionResult result =
-        cad2csg::convert_step_file(argv[1], options);
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    const cad2csg::DocumentId document_id = cad2csg::load_step(*session, argv[1]);
+    cad2csg::CommandResult result =
+        cad2csg::emit_document(*session,
+                               document_id,
+                               argv[2],
+                               cad2csg::ReportIdMode::local);
 
     print_diagnostics(result.report);
     print_summary(result.report);
@@ -491,12 +699,112 @@ int run_default_convert(int argc, char** argv) {
     if (!result.report.ok() || result.report.solids_converted == 0) {
         return EXIT_FAILURE;
     }
+    return EXIT_SUCCESS;
+}
 
-    if (cad2csg::export_mcnp(result.system.get(), argv[2]) != 0) {
-        std::cerr << "error mcnp_export_failed: " << alea_error() << '\n';
+int run_replay_command(int argc, char** argv) {
+    if (argc < 3) {
+        usage(argv[0]);
         return EXIT_FAILURE;
     }
+    const std::string recipe_path = argv[2];
+    std::string step_override;
+    std::string output_path;
+    std::string report_path;
+    std::string step_out_path;
+    OptScanner scan(argc, argv, 3);
+    while (!scan.done()) {
+        if (scan.take_string("--step", &step_override)) continue;
+        if (scan.take_string("--out", &output_path)) continue;
+        if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--out-step", &step_out_path)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (output_path.empty() || report_path.empty()) {
+        std::cerr << "error: replay requires --out and --report\n";
+        return EXIT_FAILURE;
+    }
+    return cad2csg::replay_recipe(recipe_path, step_override,
+                                  output_path, report_path,
+                                  step_out_path) == 0
+        ? EXIT_SUCCESS
+        : EXIT_FAILURE;
+}
+
+int run_compact_command(int argc, char** argv) {
+    if (argc < 3) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string log_path = argv[2];
+    std::string recipe_path;
+    OptScanner scan(argc, argv, 3);
+    while (!scan.done()) {
+        if (scan.take_string("--out", &recipe_path)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    if (recipe_path.empty()) {
+        std::cerr << "error: compact requires --out path\n";
+        return EXIT_FAILURE;
+    }
+    return cad2csg::compact_log_to_recipe(log_path, recipe_path) == 0
+        ? EXIT_SUCCESS
+        : EXIT_FAILURE;
+}
+
+int run_dump_assembly_command(int argc, char** argv) {
+    if (argc < 3) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+
+    cad2csg::ConversionOptions options;
+    cad2csg::CadModel model = cad2csg::load_step_model(input_path, options);
+
+    for (const cad2csg::Diagnostic& d : model.diagnostics) {
+        std::cerr << severity_name(d.severity) << " " << d.code
+                  << ": " << d.message << '\n';
+    }
+    if (!model.loaded()) {
+        std::cerr << "error: could not load " << input_path << '\n';
+        return EXIT_FAILURE;
+    }
+
+    std::cout << "# solids (" << model.solid_metadata.size() << ")\n";
+    std::cout << "# shape_id\tcomponent_entry\tname\thierarchy_path\n";
+    for (const cad2csg::ShapeMetadata& m : model.solid_metadata) {
+        std::cout << m.shape_id << '\t'
+                  << (m.component_entry.empty() ? "-" : m.component_entry) << '\t'
+                  << (m.name.empty() ? "-" : m.name) << '\t'
+                  << (m.hierarchy_path.empty() ? "-" : m.hierarchy_path) << '\n';
+    }
+
+    std::cout << "\n# assembly nodes (" << model.assembly.size() << ")\n";
+    std::cout << "# id\tparent\tkind\tshape_id\tlabel_entry\tpath\n";
+    for (const cad2csg::AssemblyNode& n : model.assembly) {
+        std::cout << n.id << '\t'
+                  << (n.parent_id.empty() ? "-" : n.parent_id) << '\t'
+                  << n.kind << '\t'
+                  << (n.shape_id.empty() ? "-" : n.shape_id) << '\t'
+                  << (n.label_entry.empty() ? "-" : n.label_entry) << '\t'
+                  << (n.path.empty() ? "-" : n.path) << '\n';
+    }
     return EXIT_SUCCESS;
+}
+
+int run_lua_command(int argc, char** argv) {
+    if (argc < 3) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    return cad2csg::run_lua_script(argv[2], argc - 3, argv + 3) == 0
+        ? EXIT_SUCCESS
+        : EXIT_FAILURE;
 }
 
 } // namespace
@@ -514,9 +822,14 @@ int main(int argc, char** argv) {
 
     const std::string verb = argv[1];
     if (verb == "inspect") return run_inspect_command(argc, argv);
+    if (verb == "dump-assembly") return run_dump_assembly_command(argc, argv);
+    if (verb == "decompose-suggest") return run_decompose_suggest_command(argc, argv);
+    if (verb == "compact") return run_compact_command(argc, argv);
+    if (verb == "replay") return run_replay_command(argc, argv);
     if (verb == "volume")  return run_volume_command(argc, argv);
     if (verb == "simplify") return run_simplify_command(argc, argv);
     if (verb == "auto-fit") return run_auto_fit_command(argc, argv);
+    if (verb == "lua") return run_lua_command(argc, argv);
 
     return run_default_convert(argc, argv);
 }

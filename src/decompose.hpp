@@ -8,7 +8,9 @@
 
 #include <vector>
 
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Solid.hxx>
+#include <gp_Pln.hxx>
 
 namespace cad2csg::detail {
 
@@ -18,5 +20,19 @@ std::vector<TopoDS_Solid> split_solid_by_planar_faces(const TopoDS_Solid& solid,
                                                       const ConversionOptions& options,
                                                       ConversionReport& report,
                                                       std::size_t solid_index);
+
+std::vector<TopoDS_Solid> split_solid_by_face(const TopoDS_Solid& solid,
+                                              const TopoDS_Face& face,
+                                              const ConversionOptions& options,
+                                              ConversionReport& report,
+                                              std::size_t solid_index,
+                                              std::size_t face_index);
+
+std::vector<TopoDS_Solid> split_solid_by_plane(const TopoDS_Solid& solid,
+                                               const gp_Pln& plane,
+                                               const ConversionOptions& options,
+                                               ConversionReport& report,
+                                               std::size_t solid_index,
+                                               const std::string& label);
 
 } // namespace cad2csg::detail

@@ -28,6 +28,9 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Solid.hxx>
+#include <gp_Dir.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Pnt.hxx>
 
 namespace cad2csg {
 namespace {
@@ -40,6 +43,60 @@ std::string next_synthetic_id(const CadModel& model) {
 
 std::string next_decomposed_piece_id(const CadModel& model) {
     return "piece:" + std::to_string(model.decomposed_pieces.size() + 1);
+}
+
+bool parse_piece_id(const std::string& id, std::size_t* index_out) {
+    constexpr const char* prefix = "piece:";
+    const std::size_t prefix_len = 6;
+    if (id.compare(0, prefix_len, prefix) != 0 || id.size() == prefix_len) {
+        return false;
+    }
+    std::size_t value = 0;
+    for (std::size_t i = prefix_len; i < id.size(); ++i) {
+        const char ch = id[i];
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        value = value * 10 + static_cast<std::size_t>(ch - '0');
+    }
+    if (value == 0) {
+        return false;
+    }
+    *index_out = value;
+    return true;
+}
+
+bool parse_piece_face_id(const std::string& id,
+                         std::string* piece_id_out,
+                         std::size_t* face_index_out) {
+    constexpr const char* marker = "/face:";
+    const std::size_t marker_pos = id.find(marker);
+    if (marker_pos == std::string::npos || marker_pos == 0) {
+        return false;
+    }
+    const std::string piece_id = id.substr(0, marker_pos);
+    std::size_t piece_index = 0;
+    if (!parse_piece_id(piece_id, &piece_index)) {
+        return false;
+    }
+    std::size_t value = 0;
+    const std::size_t start = marker_pos + 6;
+    if (start >= id.size()) {
+        return false;
+    }
+    for (std::size_t i = start; i < id.size(); ++i) {
+        const char ch = id[i];
+        if (ch < '0' || ch > '9') {
+            return false;
+        }
+        value = value * 10 + static_cast<std::size_t>(ch - '0');
+    }
+    if (value == 0) {
+        return false;
+    }
+    *piece_id_out = piece_id;
+    *face_index_out = value;
+    return true;
 }
 
 bool find_solid_by_id(const CadModel& model,
@@ -58,6 +115,78 @@ bool find_solid_by_id(const CadModel& model,
             *index_out = solid_index;
             return true;
         }
+    }
+    return false;
+}
+
+DecomposedSolidPiece* find_piece_by_id(CadModel& model, const std::string& id) {
+    for (DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (piece.id == id && piece.active) {
+            return &piece;
+        }
+    }
+    return nullptr;
+}
+
+const DecomposedSolidPiece* find_piece_by_id(const CadModel& model,
+                                             const std::string& id) {
+    for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (piece.id == id && piece.active) {
+            return &piece;
+        }
+    }
+    return nullptr;
+}
+
+struct DecompositionTarget {
+    TopoDS_Solid solid;
+    std::size_t report_index = 0;
+    bool is_piece = false;
+    DecomposedSolidPiece* piece = nullptr;
+};
+
+bool find_decomposition_target(CadModel& model,
+                               const std::string& id,
+                               DecompositionTarget* target) {
+    TopoDS_Solid solid;
+    std::size_t index = 0;
+    if (find_solid_by_id(model, id, &solid, &index)) {
+        target->solid = solid;
+        target->report_index = index;
+        target->is_piece = false;
+        target->piece = nullptr;
+        return true;
+    }
+    if (DecomposedSolidPiece* piece = find_piece_by_id(model, id)) {
+        std::size_t piece_number = 0;
+        parse_piece_id(id, &piece_number);
+        target->solid = piece->solid;
+        target->report_index = 100000 + piece_number;
+        target->is_piece = true;
+        target->piece = piece;
+        return true;
+    }
+    return false;
+}
+
+bool find_decomposition_target(const CadModel& model,
+                               const std::string& id,
+                               TopoDS_Solid* solid_out,
+                               std::size_t* report_index_out,
+                               bool* is_piece_out) {
+    std::size_t index = 0;
+    if (find_solid_by_id(model, id, solid_out, &index)) {
+        *report_index_out = index;
+        *is_piece_out = false;
+        return true;
+    }
+    if (const DecomposedSolidPiece* piece = find_piece_by_id(model, id)) {
+        std::size_t piece_number = 0;
+        parse_piece_id(id, &piece_number);
+        *solid_out = piece->solid;
+        *report_index_out = 100000 + piece_number;
+        *is_piece_out = true;
+        return true;
     }
     return false;
 }
@@ -97,6 +226,21 @@ bool find_face_in_root(const TopoDS_Shape& root,
     return false;
 }
 
+bool find_face_in_solid(const TopoDS_Solid& solid,
+                        std::size_t target_face_index,
+                        TopoDS_Face* face_out) {
+    std::size_t face_index = 0;
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
+         face_exp.More(); face_exp.Next()) {
+        ++face_index;
+        if (face_index == target_face_index) {
+            *face_out = TopoDS::Face(face_exp.Current());
+            return true;
+        }
+    }
+    return false;
+}
+
 } // namespace
 
 bool remove_solid(CadModel& model, const std::string& id) {
@@ -125,8 +269,11 @@ bool replace_face_with_fit(CadModel& model,
                            Diagnostic* diagnostic_out,
                            const ConversionOptions& /*options*/) {
     using namespace cad2csg::detail;
+    std::string diagnostic_label = face_id_str;
+    std::string diagnostic_id = face_id_str;
     auto emit = [&](DiagnosticSeverity sev, const char* code, const std::string& msg) {
-        Diagnostic d{sev, code, msg, face_id_str};
+        Diagnostic d{sev, code, msg, diagnostic_label};
+        d.shape_id = diagnostic_id;
         if (diagnostic_out) {
             *diagnostic_out = d;
         }
@@ -140,6 +287,7 @@ bool replace_face_with_fit(CadModel& model,
              "Face ID must look like face:N.M with positive N and M.");
         return false;
     }
+    diagnostic_label = face_label(solid_index, face_index);
 
     TopoDS_Face face;
     if (!find_face_in_root(model.root, solid_index, face_index, &face)) {
@@ -336,6 +484,504 @@ bool decompose_solid_by_planar_faces(CadModel& model,
         model.decomposed_pieces.push_back(decomposed);
     }
     return true;
+}
+
+bool decompose_solid_by_face(CadModel& model,
+                             const std::string& solid_id_str,
+                             const std::string& face_id_str,
+                             const ConversionOptions& options) {
+    using namespace cad2csg::detail;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, solid_id_str, &target)) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "decomposition_target_not_found",
+            "Requested decomposition target ID was not found.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    std::size_t face_index = 0;
+    TopoDS_Face face;
+    if (target.is_piece) {
+        std::string face_piece_id;
+        if (!parse_piece_face_id(face_id_str, &face_piece_id, &face_index)) {
+            model.diagnostics.push_back({
+                DiagnosticSeverity::error,
+                "invalid_face_id",
+                "Piece face ID must look like piece:N/face:M.",
+                face_id_str
+            });
+            return false;
+        }
+        if (face_piece_id != solid_id_str) {
+            model.diagnostics.push_back({
+                DiagnosticSeverity::error,
+                "face_solid_mismatch",
+                "Directed decomposition face must belong to the target piece.",
+                face_id_str
+            });
+            return false;
+        }
+        if (!find_face_in_solid(target.solid, face_index, &face)) {
+            model.diagnostics.push_back({
+                DiagnosticSeverity::error,
+                "face_not_found",
+                "Requested face ID was not found in the target piece.",
+                face_id_str
+            });
+            return false;
+        }
+    } else {
+        std::size_t face_solid_index = 0;
+        if (!parse_face_id(face_id_str, &face_solid_index, &face_index)) {
+            model.diagnostics.push_back({
+                DiagnosticSeverity::error,
+                "invalid_face_id",
+                "Face ID must look like face:N.M with positive N and M.",
+                face_id_str
+            });
+            return false;
+        }
+        if (face_solid_index != target.report_index) {
+            model.diagnostics.push_back({
+                DiagnosticSeverity::error,
+                "face_solid_mismatch",
+                "Directed decomposition face must belong to the target solid.",
+                face_id_str
+            });
+            return false;
+        }
+        if (!find_face_in_root(model.root, face_solid_index, face_index, &face)) {
+            model.diagnostics.push_back({
+                DiagnosticSeverity::error,
+                "face_not_found",
+                "Requested face ID was not found in the loaded model.",
+                face_id_str
+            });
+            return false;
+        }
+    }
+
+    ConversionReport decomposition_report;
+    std::vector<TopoDS_Solid> pieces =
+        split_solid_by_face(target.solid, face, options, decomposition_report,
+                            target.report_index, face_index);
+    for (const Diagnostic& diagnostic : decomposition_report.diagnostics) {
+        model.diagnostics.push_back(diagnostic);
+    }
+    if (pieces.empty()) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "face_decomposition_failed",
+            "Directed face decomposition did not produce usable pieces.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    GProp_GProps original_props;
+    BRepGProp::VolumeProperties(target.solid, original_props);
+    const double original_volume = std::abs(original_props.Mass());
+    double pieces_volume = 0.0;
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps piece_props;
+        BRepGProp::VolumeProperties(piece, piece_props);
+        pieces_volume += std::abs(piece_props.Mass());
+    }
+
+    const double absolute_delta = std::abs(pieces_volume - original_volume);
+    double relative_delta = 0.0;
+    if (original_volume > kEps) {
+        relative_delta = absolute_delta / original_volume;
+    }
+
+    std::ostringstream msg;
+    msg << "Directed face decomposition using " << face_id_str
+        << " produced " << pieces.size()
+        << " pieces. original_volume=" << std::setprecision(10) << original_volume
+        << " pieces_volume=" << pieces_volume
+        << " relative_delta=" << relative_delta;
+    model.diagnostics.push_back({
+        relative_delta <= 1.0e-6 ? DiagnosticSeverity::info : DiagnosticSeverity::warning,
+        "face_decomposition",
+        msg.str(),
+        solid_id_str
+    });
+
+    if (target.is_piece) {
+        target.piece->active = false;
+    } else {
+        remove_solid(model, solid_id_str);
+    }
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps piece_props;
+        BRepGProp::VolumeProperties(piece, piece_props);
+
+        DecomposedSolidPiece decomposed;
+        decomposed.id = next_decomposed_piece_id(model);
+        decomposed.label = decomposed.id + "/from_" + solid_id_str;
+        decomposed.source_solid_id = solid_id_str;
+        decomposed.solid = piece;
+        decomposed.volume = std::abs(piece_props.Mass());
+        decomposed.active = true;
+        model.decomposed_pieces.push_back(decomposed);
+    }
+    return true;
+}
+
+namespace {
+
+constexpr double kProposalVolumeTolerance = 1.0e-6;
+constexpr double kProposalSliverVolumeFraction = 1.0e-8;
+
+std::string split_tool_kind_for_surface(GeomAbs_SurfaceType type) {
+    switch (type) {
+    case GeomAbs_Plane: return "face_plane";
+    case GeomAbs_Cylinder: return "face_cylinder";
+    case GeomAbs_Cone: return "face_cone";
+    case GeomAbs_Sphere: return "face_sphere";
+    case GeomAbs_Torus: return "torus_axis_plane";
+    default: return "unsupported";
+    }
+}
+
+std::string first_diagnostic_reason(const std::vector<Diagnostic>& diagnostics) {
+    for (const Diagnostic& diagnostic : diagnostics) {
+        if (diagnostic.severity == DiagnosticSeverity::error
+            || diagnostic.severity == DiagnosticSeverity::warning) {
+            return diagnostic.code + ": " + diagnostic.message;
+        }
+    }
+    return {};
+}
+
+void score_decomposition_candidate(DecompositionCandidate& candidate) {
+    if (candidate.piece_count < 2) {
+        candidate.usable = false;
+        candidate.confidence = "rejected";
+        if (candidate.rejection_reason.empty()) {
+            candidate.rejection_reason = "split produced fewer than two pieces";
+        }
+        return;
+    }
+    if (candidate.relative_delta > kProposalVolumeTolerance) {
+        candidate.usable = false;
+        candidate.confidence = "rejected";
+        std::ostringstream msg;
+        msg << "relative volume delta " << candidate.relative_delta
+            << " exceeds " << kProposalVolumeTolerance;
+        candidate.rejection_reason = msg.str();
+        return;
+    }
+    if (candidate.sliver_piece_count > 0) {
+        candidate.usable = false;
+        candidate.confidence = "rejected";
+        candidate.rejection_reason = "split produced sliver pieces";
+        return;
+    }
+
+    candidate.usable = true;
+    const double exact_fraction = candidate.piece_count > 0
+        ? static_cast<double>(candidate.exact_piece_count)
+            / static_cast<double>(candidate.piece_count)
+        : 0.0;
+    const double decision_fraction = candidate.piece_count > 0
+        ? static_cast<double>(candidate.pieces_requiring_user_decision)
+            / static_cast<double>(candidate.piece_count)
+        : 1.0;
+
+    double surface_bonus = 0.0;
+    if (candidate.tool_kind == "face_plane") {
+        surface_bonus = 6.0;
+    } else if (candidate.tool_kind == "face_cylinder"
+               || candidate.tool_kind == "face_cone") {
+        surface_bonus = 4.0;
+    } else if (candidate.tool_kind == "face_sphere") {
+        surface_bonus = 3.0;
+    } else if (candidate.tool_kind == "torus_axis_plane") {
+        surface_bonus = 2.0;
+    }
+
+    double reason_bonus = 0.0;
+    if (candidate.reason == "convexity_failure_face") {
+        reason_bonus = 25.0;
+    } else if (candidate.reason == "existing_face") {
+        reason_bonus = 5.0;
+    } else if (candidate.reason == "bbox_axis_fallback") {
+        reason_bonus = -10.0;
+    }
+
+    candidate.score =
+        100.0
+        + 40.0 * exact_fraction
+        + 20.0 * candidate.volume_balance
+        + surface_bonus
+        + reason_bonus
+        - 25.0 * decision_fraction
+        - 100000.0 * candidate.relative_delta;
+
+    if (candidate.exact_piece_count == candidate.piece_count
+        && candidate.pieces_requiring_user_decision == 0
+        && candidate.relative_delta <= 1.0e-8
+        && candidate.volume_balance >= 0.1
+        && candidate.reason != "bbox_axis_fallback") {
+        candidate.confidence = "high";
+    } else if (candidate.exact_piece_count > 0
+               && candidate.pieces_requiring_decomposition < candidate.piece_count) {
+        candidate.confidence = "medium";
+    } else {
+        candidate.confidence = "low";
+    }
+}
+
+bool has_clear_score_dominance(const std::vector<DecompositionCandidate>& candidates,
+                               const DecompositionCandidate& candidate) {
+    double second_best = -1.0e100;
+    for (const DecompositionCandidate& other : candidates) {
+        if (!other.usable || other.id == candidate.id) {
+            continue;
+        }
+        second_best = std::max(second_best, other.score);
+    }
+    return second_best < -1.0e90 || candidate.score >= second_best + 10.0;
+}
+
+} // namespace
+
+DecompositionProposal propose_decomposition_candidates(
+    const CadModel& model,
+    const std::string& solid_id_str,
+    const ConversionOptions& options) {
+    using namespace cad2csg::detail;
+    DecompositionProposal proposal;
+    proposal.target_id = solid_id_str;
+
+    TopoDS_Solid solid;
+    std::size_t report_index = 0;
+    bool is_piece = false;
+    if (!find_decomposition_target(model, solid_id_str, &solid, &report_index, &is_piece)) {
+        proposal.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "decomposition_target_not_found",
+            "Requested decomposition target ID was not found.",
+            solid_id_str
+        });
+        return proposal;
+    }
+
+    GProp_GProps original_props;
+    BRepGProp::VolumeProperties(solid, original_props);
+    const double original_volume = std::abs(original_props.Mass());
+    if (original_volume <= kEps) {
+        proposal.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "empty_or_tiny_solid",
+            "Cannot propose decomposition for a near-zero-volume solid.",
+            solid_id_str
+        });
+        return proposal;
+    }
+
+    std::size_t convexity_failure_face_index = 0;
+    const bool has_convexity_failure_face =
+        find_convexity_failure_face(solid,
+                                    report_index,
+                                    options,
+                                    &convexity_failure_face_index);
+
+    auto finish_candidate = [&](DecompositionCandidate& candidate,
+                                const std::vector<TopoDS_Solid>& pieces) {
+        candidate.piece_count = pieces.size();
+        double min_fraction = 0.0;
+        double max_fraction = 0.0;
+        std::size_t piece_index = 0;
+        for (const TopoDS_Solid& piece : pieces) {
+            ++piece_index;
+            GProp_GProps piece_props;
+            BRepGProp::VolumeProperties(piece, piece_props);
+            const double volume = std::abs(piece_props.Mass());
+            candidate.pieces_volume += volume;
+            const double fraction = volume / original_volume;
+            if (piece_index == 1) {
+                min_fraction = fraction;
+                max_fraction = fraction;
+            } else {
+                min_fraction = std::min(min_fraction, fraction);
+                max_fraction = std::max(max_fraction, fraction);
+            }
+            if (fraction <= kProposalSliverVolumeFraction) {
+                ++candidate.sliver_piece_count;
+            }
+
+            DecomposedSolidPiece piece_record;
+            piece_record.id = "proposal_piece:" + std::to_string(piece_index);
+            piece_record.label = piece_record.id + "/from_" + solid_id_str;
+            piece_record.source_solid_id = solid_id_str;
+            piece_record.solid = piece;
+            piece_record.volume = volume;
+
+            const std::size_t report_solid_index = 200000 + piece_index;
+            const AnalyzedDecomposedPiece analyzed =
+                analyze_decomposed_piece(piece_record, piece_index,
+                                         report_solid_index, options);
+
+            DecompositionCandidatePiece summary;
+            summary.index = piece_index;
+            summary.volume = volume;
+            summary.volume_fraction = fraction;
+            summary.bbox = analyzed.bbox;
+            summary.face_count = analyzed.face_count;
+            summary.exact_csg_supported = analyzed.exact_csg_supported;
+            summary.needs_decomposition = analyzed.needs_decomposition;
+            summary.needs_spline_replacement = analyzed.needs_spline_replacement;
+            summary.needs_user_decision = analyzed.needs_user_decision;
+            candidate.pieces.push_back(summary);
+
+            if (analyzed.exact_csg_supported) {
+                ++candidate.exact_piece_count;
+            }
+            if (analyzed.needs_decomposition) {
+                ++candidate.pieces_requiring_decomposition;
+            }
+            if (analyzed.needs_spline_replacement) {
+                ++candidate.pieces_requiring_spline_replacement;
+            }
+            if (analyzed.needs_user_decision) {
+                ++candidate.pieces_requiring_user_decision;
+            }
+        }
+
+        candidate.absolute_delta =
+            std::abs(candidate.pieces_volume - candidate.original_volume);
+        candidate.relative_delta = candidate.absolute_delta / candidate.original_volume;
+        candidate.min_piece_volume_fraction = min_fraction;
+        candidate.max_piece_volume_fraction = max_fraction;
+        if (max_fraction > kEps) {
+            candidate.volume_balance = min_fraction / max_fraction;
+        }
+
+        score_decomposition_candidate(candidate);
+    };
+
+    std::size_t face_index = 0;
+    std::size_t candidate_index = 0;
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
+        ++face_index;
+        ++candidate_index;
+        const TopoDS_Face face = TopoDS::Face(face_exp.Current());
+        BRepAdaptor_Surface adaptor(face, false);
+
+        DecompositionCandidate candidate;
+        candidate.id = "candidate:" + std::to_string(candidate_index);
+        candidate.target_id = solid_id_str;
+        candidate.source_face_id = is_piece
+            ? solid_id_str + "/face:" + std::to_string(face_index)
+            : face_id(report_index, face_index);
+        candidate.source_face_label = is_piece
+            ? solid_id_str + "/face[" + std::to_string(face_index) + "]"
+            : face_label(report_index, face_index);
+        candidate.surface_type = surface_type_name(adaptor.GetType());
+        candidate.tool_kind = split_tool_kind_for_surface(adaptor.GetType());
+        candidate.reason = has_convexity_failure_face
+            && face_index == convexity_failure_face_index
+            ? "convexity_failure_face"
+            : "existing_face";
+        candidate.original_volume = original_volume;
+
+        ConversionReport split_report;
+        std::vector<TopoDS_Solid> pieces =
+            split_solid_by_face(solid, face, options, split_report,
+                                report_index, face_index);
+        candidate.diagnostics = split_report.diagnostics;
+        candidate.rejection_reason = first_diagnostic_reason(candidate.diagnostics);
+        finish_candidate(candidate, pieces);
+        proposal.candidates.push_back(std::move(candidate));
+    }
+
+    bool has_usable_face_candidate = false;
+    for (const DecompositionCandidate& candidate : proposal.candidates) {
+        if (candidate.usable) {
+            has_usable_face_candidate = true;
+            break;
+        }
+    }
+
+    if (!has_usable_face_candidate) {
+        const BBox bbox = bbox_from_shape(solid);
+        if (bbox.valid) {
+            struct AxisFallback {
+                const char* axis;
+                gp_Pnt point;
+                gp_Dir normal;
+            };
+            const double cx = 0.5 * (bbox.xmin + bbox.xmax);
+            const double cy = 0.5 * (bbox.ymin + bbox.ymax);
+            const double cz = 0.5 * (bbox.zmin + bbox.zmax);
+            const AxisFallback fallbacks[] = {
+                {"x", gp_Pnt(cx, cy, cz), gp_Dir(1.0, 0.0, 0.0)},
+                {"y", gp_Pnt(cx, cy, cz), gp_Dir(0.0, 1.0, 0.0)},
+                {"z", gp_Pnt(cx, cy, cz), gp_Dir(0.0, 0.0, 1.0)},
+            };
+            for (const AxisFallback& fallback : fallbacks) {
+                ++candidate_index;
+                DecompositionCandidate candidate;
+                candidate.id = "candidate:" + std::to_string(candidate_index);
+                candidate.target_id = solid_id_str;
+                candidate.surface_type = "plane";
+                candidate.tool_kind = std::string("bbox_plane_") + fallback.axis;
+                candidate.reason = "bbox_axis_fallback";
+                candidate.original_volume = original_volume;
+
+                ConversionReport split_report;
+                const gp_Pln plane(fallback.point, fallback.normal);
+                std::vector<TopoDS_Solid> pieces =
+                    split_solid_by_plane(solid, plane, options, split_report,
+                                         report_index, candidate.tool_kind);
+                candidate.diagnostics = split_report.diagnostics;
+                candidate.rejection_reason =
+                    first_diagnostic_reason(candidate.diagnostics);
+                finish_candidate(candidate, pieces);
+                proposal.candidates.push_back(std::move(candidate));
+            }
+        }
+    }
+
+    std::stable_sort(proposal.candidates.begin(), proposal.candidates.end(),
+                     [](const DecompositionCandidate& a,
+                        const DecompositionCandidate& b) {
+        if (a.usable != b.usable) {
+            return a.usable && !b.usable;
+        }
+        return a.score > b.score;
+    });
+
+    for (const DecompositionCandidate& candidate : proposal.candidates) {
+        if (candidate.usable) {
+            proposal.ok = true;
+            proposal.best_candidate_id = candidate.id;
+            if (candidate.confidence == "high"
+                && !has_clear_score_dominance(proposal.candidates, candidate)) {
+                for (DecompositionCandidate& mutable_candidate : proposal.candidates) {
+                    if (mutable_candidate.id == candidate.id) {
+                        mutable_candidate.confidence = "medium";
+                        proposal.best_candidate_id = mutable_candidate.id;
+                        break;
+                    }
+                }
+            }
+            return proposal;
+        }
+    }
+
+    proposal.diagnostics.push_back({
+        DiagnosticSeverity::warning,
+        "decomposition_no_usable_candidate",
+        "No face-driven decomposition candidate produced usable pieces.",
+        solid_id_str
+    });
+    return proposal;
 }
 
 std::string add_synthetic_box(CadModel& model,

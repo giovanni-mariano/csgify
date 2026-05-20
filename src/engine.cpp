@@ -8,8 +8,7 @@
 // Every other public function is implemented in the corresponding stage TU:
 //   import.cpp, analyze.cpp, cleanup.cpp, emit.cpp, report.cpp.
 
-#include "cad2csg/engine.hpp"
-
+#include "engine_model.hpp"
 #include "engine_internal.hpp"
 
 #include <cmath>

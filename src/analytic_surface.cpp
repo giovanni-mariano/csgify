@@ -80,13 +80,6 @@ std::string surface_type_name(GeomAbs_SurfaceType type) {
     return "unknown";
 }
 
-bool surface_type_supported_for_emit(GeomAbs_SurfaceType type) {
-    return type == GeomAbs_Plane
-        || type == GeomAbs_Sphere
-        || type == GeomAbs_Cylinder
-        || type == GeomAbs_Cone;
-}
-
 bool surface_type_is_spline(GeomAbs_SurfaceType type) {
     return type == GeomAbs_BSplineSurface || type == GeomAbs_BezierSurface;
 }

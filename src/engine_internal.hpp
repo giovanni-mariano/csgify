@@ -3,7 +3,7 @@
 // Engine-internal helpers shared across analyze / cleanup / emit stages.
 // Not part of the public API. All under cad2csg::detail.
 
-#include "cad2csg/engine.hpp"
+#include "engine_model.hpp"
 
 #include <string>
 #include <vector>
@@ -71,6 +71,10 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
                                     bool count_decomposition,
                                     bool count_faces,
                                     const std::vector<FaceReplacement>* replacements = nullptr);
+bool find_convexity_failure_face(const TopoDS_Solid& solid,
+                                 std::size_t solid_index,
+                                 const ConversionOptions& options,
+                                 std::size_t* face_index_out);
 
 // Small cross-cutting utilities.
 double vec_len(Vec3 v);

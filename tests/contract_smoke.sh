@@ -57,6 +57,28 @@ assert_codes "$outdir/sphere.json" ""
 "$exe" "$fixtures/sphere.step" "$outdir/sphere.i" >/dev/null 2>&1 \
     || fail "sphere.step failed to convert"
 
+"$exe" decompose-suggest "$fixtures/sphere.step" solid:1 \
+    --report "$outdir/sphere_proposals.json" >/dev/null 2>&1 \
+    || fail "decompose-suggest failed to produce fallback candidates on sphere fixture"
+
+python3 - "$outdir/sphere_proposals.json" <<'PY'
+import json
+import sys
+
+proposal = json.load(open(sys.argv[1], encoding="utf-8"))
+fallbacks = [c for c in proposal["candidates"]
+             if c["reason"] == "bbox_axis_fallback"]
+assert len(fallbacks) == 3, proposal["candidates"]
+assert all(c["usable"] for c in fallbacks), fallbacks
+assert all(c["confidence"] != "high" for c in fallbacks), fallbacks
+assert {c["tool_kind"] for c in fallbacks} == {
+    "bbox_plane_x", "bbox_plane_y", "bbox_plane_z"
+}, fallbacks
+PY
+if [ "$?" -ne 0 ]; then
+    fail "bbox fallback proposal contract validation failed"
+fi
+
 run_inspect cylinder.step "$outdir/cylinder.json"
 assert_codes "$outdir/cylinder.json" ""
 "$exe" "$fixtures/cylinder.step" "$outdir/cylinder.i" >/dev/null 2>&1 \
@@ -66,6 +88,125 @@ assert_codes "$outdir/cylinder.json" ""
 
 run_inspect l_shape.step "$outdir/l_shape.json"
 assert_codes "$outdir/l_shape.json" "nonconvex_solid_requires_decomposition"
+
+"$exe" decompose-suggest "$fixtures/l_shape.step" solid:1 \
+    --report "$outdir/l_shape_proposals.json" >/dev/null 2>&1 \
+    || fail "decompose-suggest failed on l_shape fixture"
+
+python3 - "$outdir/l_shape_proposals.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    proposal = json.load(handle)
+
+assert proposal["ok"] is True, proposal
+assert proposal["best_candidate_id"], proposal
+usable = [c for c in proposal["candidates"] if c["usable"]]
+assert usable, "expected at least one usable split candidate"
+best = usable[0]
+assert best["confidence"] == "high", best
+assert best["piece_count"] == 2, best
+assert best["exact_piece_count"] == 2, best
+assert best["relative_delta"] <= 1e-8, best
+assert best["reason"] == "convexity_failure_face", best
+assert best["source_face_id"] == "face:1.7", best
+PY
+if [ "$?" -ne 0 ]; then
+    fail "decomposition proposal contract validation failed"
+fi
+
+"$exe" simplify "$fixtures/l_shape.step" \
+    --decompose-by-face solid:1 \
+    --out "$outdir/l_shape_split_by_face.i" \
+    --by-face face:1.7 \
+    --report "$outdir/l_shape_split_by_face.json" >/dev/null 2>&1 \
+    || fail "directed face decomposition failed on l_shape fixture"
+
+python3 - "$outdir/l_shape_split_by_face.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+
+summary = report["summary"]
+assert summary["decomposition_pieces"] == 2, summary
+assert summary["solids_converted"] == 2, summary
+codes = {d["code"] for d in report["diagnostics"]}
+assert "face_decomposition" in codes, codes
+assert "nonconvex_solid_requires_decomposition" not in codes, codes
+PY
+if [ "$?" -ne 0 ]; then
+    fail "directed face decomposition contract validation failed"
+fi
+
+"$exe" simplify "$fixtures/l_shape.step" \
+    --auto-decompose-bsp solid:1 \
+    --out "$outdir/l_shape_auto_bsp.i" \
+    --report "$outdir/l_shape_auto_bsp.json" >/dev/null 2>&1 \
+    || fail "safe BSP auto-decomposition failed on l_shape fixture"
+
+python3 - "$outdir/l_shape_auto_bsp.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+
+summary = report["summary"]
+assert summary["decomposition_pieces"] == 2, summary
+assert summary["solids_converted"] == 2, summary
+codes = {d["code"] for d in report["diagnostics"]}
+assert "auto_decompose_bsp_complete" in codes, codes
+assert "face_decomposition" in codes, codes
+assert "nonconvex_solid_requires_decomposition" not in codes, codes
+PY
+if [ "$?" -ne 0 ]; then
+    fail "safe BSP auto-decomposition contract validation failed"
+fi
+
+"$exe" simplify "$fixtures/l_shape.step" \
+    --apply-decomposition-candidate solid:1 \
+    --out "$outdir/l_shape_apply_candidate.i" \
+    --candidate candidate:7 \
+    --report "$outdir/l_shape_apply_candidate.json" \
+    --proposal-report "$outdir/l_shape_apply_candidate_proposals.json" >/dev/null 2>&1 \
+    || fail "apply-decomposition-candidate failed on l_shape fixture"
+
+python3 - "$outdir/l_shape_apply_candidate.json" "$outdir/l_shape_apply_candidate_proposals.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+proposal = json.load(open(sys.argv[2], encoding="utf-8"))
+assert report["summary"]["solids_converted"] == 2, report["summary"]
+assert report["summary"]["decomposition_pieces"] == 2, report["summary"]
+assert proposal["best_candidate_id"] == "candidate:7", proposal
+assert proposal["candidates"][0]["source_face_id"] == "face:1.7", proposal["candidates"][0]
+PY
+if [ "$?" -ne 0 ]; then
+    fail "apply-decomposition-candidate contract validation failed"
+fi
+
+"$exe" simplify "$fixtures/l_shape.step" \
+    --auto-decompose-bsp solid:1 \
+    --out "$outdir/l_shape_auto_bsp_depth0.i" \
+    --max-depth 0 \
+    --proposal-report "$outdir/l_shape_auto_bsp_depth0_proposals.json" >/dev/null 2>&1 || true
+
+python3 - "$outdir/l_shape_auto_bsp_depth0_proposals.json" <<'PY'
+import json
+import sys
+
+proposal = json.load(open(sys.argv[1], encoding="utf-8"))
+assert proposal["ok"] is True, proposal
+assert proposal["best_candidate_id"] == "candidate:7", proposal
+assert proposal["candidates"][0]["confidence"] == "high", proposal["candidates"][0]
+PY
+if [ "$?" -ne 0 ]; then
+    fail "stopped BSP proposal-report contract validation failed"
+fi
 
 # ---- spline solid: must produce unsupported_spline_face and emit useful
 #      fit candidates that an agent can act on.
@@ -146,6 +287,12 @@ for d in report["diagnostics"]:
         sys.exit(1)
 
 # The replacement record must show up as an info diagnostic.
+recorded = [d for d in report["diagnostics"]
+            if d["code"] == "face_replacement_recorded"]
+assert recorded, "expected face_replacement_recorded info diagnostic"
+assert recorded[0]["shape_id"] == "face:1.1", recorded[0]
+assert recorded[0]["shape_label"] == "solid[1]/face[1]", recorded[0]
+
 applied = [d for d in report["diagnostics"]
            if d["code"] == "face_replacement_applied"]
 assert applied, "expected face_replacement_applied info diagnostic"

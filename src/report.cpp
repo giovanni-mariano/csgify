@@ -258,7 +258,17 @@ void write_bbox_json(std::ostream& out, const BBox& bbox, const std::string& ind
     out << indent << "}";
 }
 
-std::string shape_id_from_label(const std::string& label) {
+std::string diagnostic_shape_id(const Diagnostic& diagnostic) {
+    if (!diagnostic.shape_id.empty()) {
+        return diagnostic.shape_id;
+    }
+    const std::string& label = diagnostic.shape_label;
+    if (label.compare(0, 6, "solid:") == 0
+        || label.compare(0, 5, "face:") == 0
+        || label.compare(0, 6, "piece:") == 0
+        || label.compare(0, 10, "synthetic:") == 0) {
+        return label;
+    }
     std::size_t solid_pos = label.find("solid[");
     if (solid_pos == std::string::npos) {
         return {};
@@ -283,18 +293,17 @@ std::string shape_id_from_label(const std::string& label) {
         + label.substr(face_number_pos, face_end - face_number_pos);
 }
 
-} // namespace
-
-int write_report_json(const ConversionReport& report, const std::string& output_path) {
-    std::ofstream out(output_path);
-    if (!out) {
-        return -1;
-    }
-
+void write_report_json_stream(std::ostream& out, const ConversionReport& report) {
     out << "{\n";
     out << "  \"ok\": " << (report.ok() ? "true" : "false") << ",\n";
     out << "  \"occt_version\": \"" << json_escape(occt_version()) << "\",\n";
     out << "  \"alea_version\": \"" << json_escape(alea_version()) << "\",\n";
+    if (!report.document_id.empty() || !report.source_path.empty()) {
+        out << "  \"document\": {\n";
+        out << "    \"id\": \"" << json_escape(report.document_id) << "\",\n";
+        out << "    \"source_path\": \"" << json_escape(report.source_path) << "\"\n";
+        out << "  },\n";
+    }
     out << "  \"summary\": {\n";
     out << "    \"solids_seen\": " << report.solids_seen << ",\n";
     out << "    \"solids_converted\": " << report.solids_converted << ",\n";
@@ -326,6 +335,8 @@ int write_report_json(const ConversionReport& report, const std::string& output_
         out << "    {\n";
         out << "      \"id\": \"" << json_escape(solid.id) << "\",\n";
         out << "      \"label\": \"" << json_escape(solid.label) << "\",\n";
+        out << "      \"name\": \"" << json_escape(solid.name) << "\",\n";
+        out << "      \"hierarchy_path\": \"" << json_escape(solid.hierarchy_path) << "\",\n";
         out << "      \"index\": " << solid.index << ",\n";
         out << "      \"volume\": " << std::setprecision(17) << solid.volume << ",\n";
         out << "      \"volume_fraction\": " << std::setprecision(17)
@@ -401,6 +412,8 @@ int write_report_json(const ConversionReport& report, const std::string& output_
         out << "    {\n";
         out << "      \"id\": \"" << json_escape(face.id) << "\",\n";
         out << "      \"label\": \"" << json_escape(face.label) << "\",\n";
+        out << "      \"name\": \"" << json_escape(face.name) << "\",\n";
+        out << "      \"hierarchy_path\": \"" << json_escape(face.hierarchy_path) << "\",\n";
         out << "      \"solid_id\": \"" << json_escape(face.solid_id) << "\",\n";
         out << "      \"index\": " << face.index << ",\n";
         out << "      \"surface_type\": \"" << json_escape(face.surface_type) << "\",\n";
@@ -452,13 +465,33 @@ int write_report_json(const ConversionReport& report, const std::string& output_
         out << "\n";
     }
     out << "  ],\n";
+    out << "  \"assembly\": [\n";
+    for (std::size_t i = 0; i < report.assembly.size(); ++i) {
+        const AssemblyNode& node = report.assembly[i];
+        out << "    {\n";
+        out << "      \"id\": \"" << json_escape(node.id) << "\",\n";
+        out << "      \"parent_id\": \"" << json_escape(node.parent_id) << "\",\n";
+        out << "      \"name\": \"" << json_escape(node.name) << "\",\n";
+        out << "      \"label_entry\": \"" << json_escape(node.label_entry) << "\",\n";
+        out << "      \"shape_id\": \"" << json_escape(node.shape_id) << "\",\n";
+        out << "      \"kind\": \"" << json_escape(node.kind) << "\",\n";
+        out << "      \"path\": \"" << json_escape(node.path) << "\"\n";
+        out << "    }";
+        if (i + 1 < report.assembly.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
     out << "  \"diagnostics\": [\n";
     for (std::size_t i = 0; i < report.diagnostics.size(); ++i) {
         const Diagnostic& diagnostic = report.diagnostics[i];
         out << "    {\n";
         out << "      \"severity\": \"" << severity_json_name(diagnostic.severity) << "\",\n";
         out << "      \"code\": \"" << json_escape(diagnostic.code) << "\",\n";
-        out << "      \"shape_id\": \"" << json_escape(shape_id_from_label(diagnostic.shape_label)) << "\",\n";
+        out << "      \"document_id\": \"" << json_escape(diagnostic.document_id) << "\",\n";
+        out << "      \"shape_id\": \"" << json_escape(diagnostic_shape_id(diagnostic)) << "\",\n";
+        out << "      \"local_shape_id\": \"" << json_escape(diagnostic.local_shape_id) << "\",\n";
         out << "      \"shape_label\": \"" << json_escape(diagnostic.shape_label) << "\",\n";
         out << "      \"message\": \"" << json_escape(diagnostic.message) << "\",\n";
         out << "      \"actions\": [";
@@ -472,8 +505,195 @@ int write_report_json(const ConversionReport& report, const std::string& output_
     }
     out << "  ]\n";
     out << "}\n";
+}
+
+} // namespace
+
+int write_report_json(const ConversionReport& report, const std::string& output_path) {
+    std::ofstream out(output_path);
+    if (!out) {
+        return -1;
+    }
+    write_report_json_stream(out, report);
 
     return out ? 0 : -1;
+}
+
+std::string report_json_string(const ConversionReport& report) {
+    std::ostringstream out;
+    write_report_json_stream(out, report);
+    return out.str();
+}
+
+namespace {
+
+void write_decomposition_candidate_piece_json(
+    std::ostream& out,
+    const DecompositionCandidatePiece& piece,
+    const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"index\": " << piece.index << ",\n";
+    out << indent << "  \"volume\": " << std::setprecision(17)
+        << piece.volume << ",\n";
+    out << indent << "  \"volume_fraction\": " << std::setprecision(17)
+        << piece.volume_fraction << ",\n";
+    out << indent << "  \"bbox\": ";
+    write_bbox_json(out, piece.bbox, indent + "  ");
+    out << ",\n";
+    out << indent << "  \"face_count\": " << piece.face_count << ",\n";
+    out << indent << "  \"exact_csg_supported\": "
+        << (piece.exact_csg_supported ? "true" : "false") << ",\n";
+    out << indent << "  \"needs_decomposition\": "
+        << (piece.needs_decomposition ? "true" : "false") << ",\n";
+    out << indent << "  \"needs_spline_replacement\": "
+        << (piece.needs_spline_replacement ? "true" : "false") << ",\n";
+    out << indent << "  \"needs_user_decision\": "
+        << (piece.needs_user_decision ? "true" : "false") << "\n";
+    out << indent << "}";
+}
+
+void write_diagnostic_json(std::ostream& out,
+                           const Diagnostic& diagnostic,
+                           const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"severity\": \""
+        << severity_json_name(diagnostic.severity) << "\",\n";
+    out << indent << "  \"code\": \"" << json_escape(diagnostic.code) << "\",\n";
+    out << indent << "  \"document_id\": \""
+        << json_escape(diagnostic.document_id) << "\",\n";
+    out << indent << "  \"shape_id\": \""
+        << json_escape(diagnostic_shape_id(diagnostic)) << "\",\n";
+    out << indent << "  \"local_shape_id\": \""
+        << json_escape(diagnostic.local_shape_id) << "\",\n";
+    out << indent << "  \"shape_label\": \""
+        << json_escape(diagnostic.shape_label) << "\",\n";
+    out << indent << "  \"message\": \""
+        << json_escape(diagnostic.message) << "\"\n";
+    out << indent << "}";
+}
+
+void write_decomposition_candidate_json(
+    std::ostream& out,
+    const DecompositionCandidate& candidate,
+    const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"id\": \"" << json_escape(candidate.id) << "\",\n";
+    out << indent << "  \"target_id\": \""
+        << json_escape(candidate.target_id) << "\",\n";
+    out << indent << "  \"source_face_id\": \""
+        << json_escape(candidate.source_face_id) << "\",\n";
+    out << indent << "  \"source_face_label\": \""
+        << json_escape(candidate.source_face_label) << "\",\n";
+    out << indent << "  \"surface_type\": \""
+        << json_escape(candidate.surface_type) << "\",\n";
+    out << indent << "  \"tool_kind\": \""
+        << json_escape(candidate.tool_kind) << "\",\n";
+    out << indent << "  \"reason\": \""
+        << json_escape(candidate.reason) << "\",\n";
+    out << indent << "  \"usable\": "
+        << (candidate.usable ? "true" : "false") << ",\n";
+    out << indent << "  \"confidence\": \""
+        << json_escape(candidate.confidence) << "\",\n";
+    out << indent << "  \"score\": " << std::setprecision(17)
+        << candidate.score << ",\n";
+    out << indent << "  \"rejection_reason\": \""
+        << json_escape(candidate.rejection_reason) << "\",\n";
+    out << indent << "  \"piece_count\": " << candidate.piece_count << ",\n";
+    out << indent << "  \"exact_piece_count\": "
+        << candidate.exact_piece_count << ",\n";
+    out << indent << "  \"pieces_requiring_decomposition\": "
+        << candidate.pieces_requiring_decomposition << ",\n";
+    out << indent << "  \"pieces_requiring_spline_replacement\": "
+        << candidate.pieces_requiring_spline_replacement << ",\n";
+    out << indent << "  \"pieces_requiring_user_decision\": "
+        << candidate.pieces_requiring_user_decision << ",\n";
+    out << indent << "  \"sliver_piece_count\": "
+        << candidate.sliver_piece_count << ",\n";
+    out << indent << "  \"original_volume\": " << std::setprecision(17)
+        << candidate.original_volume << ",\n";
+    out << indent << "  \"pieces_volume\": " << std::setprecision(17)
+        << candidate.pieces_volume << ",\n";
+    out << indent << "  \"absolute_delta\": " << std::setprecision(17)
+        << candidate.absolute_delta << ",\n";
+    out << indent << "  \"relative_delta\": " << std::setprecision(17)
+        << candidate.relative_delta << ",\n";
+    out << indent << "  \"min_piece_volume_fraction\": "
+        << std::setprecision(17) << candidate.min_piece_volume_fraction << ",\n";
+    out << indent << "  \"max_piece_volume_fraction\": "
+        << std::setprecision(17) << candidate.max_piece_volume_fraction << ",\n";
+    out << indent << "  \"volume_balance\": " << std::setprecision(17)
+        << candidate.volume_balance << ",\n";
+    out << indent << "  \"pieces\": [\n";
+    for (std::size_t i = 0; i < candidate.pieces.size(); ++i) {
+        out << indent << "    ";
+        write_decomposition_candidate_piece_json(out, candidate.pieces[i],
+                                                 indent + "    ");
+        if (i + 1 < candidate.pieces.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << indent << "  ],\n";
+    out << indent << "  \"diagnostics\": [\n";
+    for (std::size_t i = 0; i < candidate.diagnostics.size(); ++i) {
+        out << indent << "    ";
+        write_diagnostic_json(out, candidate.diagnostics[i], indent + "    ");
+        if (i + 1 < candidate.diagnostics.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << indent << "  ]\n";
+    out << indent << "}";
+}
+
+void write_decomposition_proposal_json_stream(
+    std::ostream& out,
+    const DecompositionProposal& proposal) {
+    out << "{\n";
+    out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
+    out << "  \"target_id\": \"" << json_escape(proposal.target_id) << "\",\n";
+    out << "  \"best_candidate_id\": \""
+        << json_escape(proposal.best_candidate_id) << "\",\n";
+    out << "  \"candidates\": [\n";
+    for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
+        out << "    ";
+        write_decomposition_candidate_json(out, proposal.candidates[i], "    ");
+        if (i + 1 < proposal.candidates.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"diagnostics\": [\n";
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        out << "    ";
+        write_diagnostic_json(out, proposal.diagnostics[i], "    ");
+        if (i + 1 < proposal.diagnostics.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+} // namespace
+
+int write_decomposition_proposal_json(const DecompositionProposal& proposal,
+                                      const std::string& output_path) {
+    std::ofstream out(output_path);
+    if (!out) {
+        return -1;
+    }
+    write_decomposition_proposal_json_stream(out, proposal);
+    return out ? 0 : -1;
+}
+
+std::string decomposition_proposal_json_string(const DecompositionProposal& proposal) {
+    std::ostringstream out;
+    write_decomposition_proposal_json_stream(out, proposal);
+    return out.str();
 }
 
 } // namespace cad2csg

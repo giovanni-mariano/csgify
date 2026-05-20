@@ -31,8 +31,18 @@ namespace {
 
 using namespace cad2csg::detail;
 
+const ShapeMetadata* find_solid_metadata(const CadModel& model, const std::string& id) {
+    for (const ShapeMetadata& metadata : model.solid_metadata) {
+        if (metadata.shape_id == id) {
+            return &metadata;
+        }
+    }
+    return nullptr;
+}
+
 void inspect_solid(const TopoDS_Solid& solid,
                    std::size_t solid_index,
+                   const CadModel& model,
                    const ConversionOptions& options,
                    ConversionReport& report) {
     GProp_GProps props;
@@ -43,6 +53,10 @@ void inspect_solid(const TopoDS_Solid& solid,
     analyzed_solid.id = solid_id(solid_index);
     analyzed_solid.label = label;
     analyzed_solid.index = solid_index;
+    if (const ShapeMetadata* metadata = find_solid_metadata(model, analyzed_solid.id)) {
+        analyzed_solid.name = metadata->name;
+        analyzed_solid.hierarchy_path = metadata->hierarchy_path;
+    }
     analyzed_solid.volume = volume;
     analyzed_solid.bbox = bbox_from_shape(solid);
 
@@ -275,6 +289,7 @@ AnalysisReport analyze_model(const CadModel& model,
     using namespace cad2csg::detail;
     AnalysisReport report;
     report.diagnostics = model.diagnostics;
+    report.assembly = model.assembly;
 
     if (model.root.IsNull()) {
         return report;
@@ -290,7 +305,7 @@ AnalysisReport analyze_model(const CadModel& model,
             continue;
         }
         ++report.solids_seen;
-        inspect_solid(TopoDS::Solid(solid_exp.Current()), solid_index, options, report);
+        inspect_solid(TopoDS::Solid(solid_exp.Current()), solid_index, model, options, report);
     }
 
     for (const SyntheticBody& body : model.synthetic_bodies) {
@@ -311,6 +326,9 @@ AnalysisReport analyze_model(const CadModel& model,
 
     std::size_t piece_index = 0;
     for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (!piece.active) {
+            continue;
+        }
         ++piece_index;
         const std::size_t report_solid_index = 100000 + piece_index;
         AnalyzedDecomposedPiece analyzed_piece =

@@ -5,7 +5,7 @@
 // path that lets a recorded FaceReplacement substitute the OCCT surface with
 // a fitted analytic surface.
 
-#include "cad2csg/engine.hpp"
+#include "engine_model.hpp"
 
 #include <vector>
 
@@ -51,7 +51,6 @@ struct AnalyticSurface {
 };
 
 std::string surface_type_name(GeomAbs_SurfaceType type);
-bool surface_type_supported_for_emit(GeomAbs_SurfaceType type);
 bool surface_type_is_spline(GeomAbs_SurfaceType type);
 bool surface_type_needs_emitter(GeomAbs_SurfaceType type);
 
