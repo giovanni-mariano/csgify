@@ -32,6 +32,10 @@ void usage(const char* argv0) {
               << "       " << argv0 << " inspect input.step --report report.json\n"
               << "       " << argv0 << " dump-assembly input.step\n"
               << "       " << argv0 << " decompose-suggest input.step solid:N [--report proposals.json]\n"
+              << "       " << argv0 << " decompose-apply input.step --out output.i\n"
+              << "                                  [--policy auto|conservative] [--max-depth N]\n"
+              << "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
+              << "                                  [--log decisions.json] [--out-step simplified.step] [--report report.json]\n"
               << "       " << argv0 << " compact decisions.json --out recipe.lua\n"
               << "       " << argv0 << " replay recipe.json --step input.step --out output.i --report replay.json [--out-step simplified.step]\n"
               << "       " << argv0 << " simplify input.step <action> <target> --out output.i [options]\n"
@@ -676,6 +680,132 @@ int run_inspect_command(int argc, char** argv) {
     return report.ok() ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+int run_decompose_apply_command(int argc, char** argv) {
+    if (argc < 5) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    if (std::strcmp(argv[3], "--out") != 0) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string output_path = argv[4];
+
+    std::string log_path;
+    std::string step_out_path;
+    std::string report_path;
+    std::string policy_name = "auto";
+    double max_depth_value = 4.0;
+    bool has_max_depth = false;
+    bool allow_medium = false;
+    bool allow_bbox_fallback = false;
+
+    OptScanner scan(argc, argv, 5);
+    while (!scan.done()) {
+        if (scan.take_string("--log", &log_path)) continue;
+        if (scan.take_string("--out-step", &step_out_path)) continue;
+        if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--policy", &policy_name)) continue;
+        if (scan.take_double("--max-depth", &max_depth_value, &has_max_depth)) continue;
+        if (scan.take_flag("--allow-medium-confidence-auto")) { allow_medium = true; continue; }
+        if (scan.take_flag("--allow-bbox-fallback-auto")) { allow_bbox_fallback = true; continue; }
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    cad2csg::DecompositionPolicy policy;
+    if (policy_name == "auto") {
+        policy.allow_high_confidence_face_auto = true;
+        policy.allow_medium_confidence_auto = allow_medium;
+        policy.allow_bbox_fallback_auto = allow_bbox_fallback;
+    } else if (policy_name == "conservative") {
+        policy.allow_high_confidence_face_auto = true;
+        policy.allow_medium_confidence_auto = false;
+        policy.allow_bbox_fallback_auto = false;
+    } else {
+        std::cerr << "error invalid_policy: expected auto|conservative, got "
+                  << policy_name << '\n';
+        return EXIT_FAILURE;
+    }
+
+    std::cerr << "cad2csg: OCCT " << cad2csg::occt_version()
+              << ", Alea " << alea_version() << '\n';
+
+    cad2csg::ConversionOptions options;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    if (!log_path.empty()) {
+        try {
+            cad2csg::attach_decision_log(*session, log_path, input_path);
+        } catch (const std::exception& e) {
+            std::cerr << "error decision_log_open_failed: " << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input_path);
+
+    cad2csg::CommandResult analysis =
+        cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
+
+    // analysis.ok may be false here: nonconvex_solid_requires_decomposition
+    // is an error-severity diagnostic and is *exactly* the condition this
+    // command is meant to resolve. We snapshot the targets regardless and
+    // bail only if the snapshot is also empty (i.e., nothing to do and
+    // analysis already failed for other reasons).
+    std::vector<std::string> targets;
+    for (const cad2csg::AnalyzedSolid& s : analysis.report.solids) {
+        if (s.needs_decomposition) targets.push_back(s.id);
+    }
+
+    if (targets.empty() && !analysis.ok) {
+        print_diagnostics(analysis.report);
+        return EXIT_FAILURE;
+    }
+
+    std::size_t attempted = 0, succeeded = 0;
+    for (const std::string& id : targets) {
+        ++attempted;
+        cad2csg::CommandResult r =
+            cad2csg::auto_decompose_bsp(*session, id,
+                                        static_cast<int>(max_depth_value),
+                                        policy,
+                                        cad2csg::ReportIdMode::local);
+        if (r.ok) ++succeeded;
+    }
+
+    std::cerr << "decompose-apply: " << succeeded << "/" << attempted
+              << " non-convex solid(s) decomposed (policy=" << policy_name
+              << ", max-depth=" << static_cast<int>(max_depth_value) << ")\n";
+
+    if (!step_out_path.empty()) {
+        cad2csg::CommandResult step_result =
+            cad2csg::export_document_step(*session, document_id, step_out_path,
+                                          cad2csg::ReportIdMode::local);
+        if (!step_result.ok) {
+            print_diagnostics(step_result.report);
+            return EXIT_FAILURE;
+        }
+    }
+
+    cad2csg::CommandResult result =
+        cad2csg::emit_document(*session, document_id, output_path,
+                               cad2csg::ReportIdMode::local);
+    print_diagnostics(result.report);
+    print_summary(result.report);
+
+    if (!report_path.empty()
+        && cad2csg::write_report_json(result.report, report_path) != 0) {
+        std::cerr << "error report_write_failed: " << report_path << '\n';
+        return EXIT_FAILURE;
+    }
+
+    if (!result.report.ok() || result.report.solids_converted == 0) {
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 int run_default_convert(int argc, char** argv) {
     if (argc != 3) {
         usage(argv[0]);
@@ -824,6 +954,7 @@ int main(int argc, char** argv) {
     if (verb == "inspect") return run_inspect_command(argc, argv);
     if (verb == "dump-assembly") return run_dump_assembly_command(argc, argv);
     if (verb == "decompose-suggest") return run_decompose_suggest_command(argc, argv);
+    if (verb == "decompose-apply") return run_decompose_apply_command(argc, argv);
     if (verb == "compact") return run_compact_command(argc, argv);
     if (verb == "replay") return run_replay_command(argc, argv);
     if (verb == "volume")  return run_volume_command(argc, argv);

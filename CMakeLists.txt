@@ -202,6 +202,33 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME cad2csg_decompose_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/decompose_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/decompose-output"
+    )
+
+    add_test(
+        NAME cad2csg_decompose_apply_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/decompose_apply_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/decompose-apply-output"
+    )
+
+    add_test(
+        NAME cad2csg_tilted_torus_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/tilted_torus_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/tilted-torus-output"
+    )
+
+    add_test(
         NAME cad2csg_session_smoke
         COMMAND
             "$<TARGET_FILE:cad2csg_session_smoke>"

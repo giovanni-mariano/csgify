@@ -65,9 +65,21 @@ void write_actions_for_code(std::ostream& out, const std::string& code) {
     if (code == "unsupported_spline_face") {
         out << "\"replace_with_plane\", \"replace_with_cylinder\", "
             << "\"replace_with_sphere\", \"replace_with_cone\", "
+            << "\"split_face_piecewise\", "
             << "\"approximate_with_facets\", \"remove_feature\", \"manual\"";
+    } else if (code == "unsupported_torus_orientation") {
+        // Until the piecewise surface splitter lands, the workable paths
+        // are: decompose the bounding solid along the torus axis plane
+        // (engine already supports this via decompose-by-face on the torus
+        // face), replace the face with a single cylinder or cone surrogate
+        // for low-deviation tori, or remove the part entirely.
+        out << "\"decompose_along_torus_axis_plane\", "
+            << "\"replace_with_cylinder\", \"replace_with_cone\", "
+            << "\"split_face_piecewise\", "
+            << "\"remove_solid\", \"manual\"";
     } else if (code == "unsupported_analytic_face") {
-        out << "\"add_emitter\", \"replace_surface\", \"manual\"";
+        out << "\"add_emitter\", \"replace_surface\", "
+            << "\"split_face_piecewise\", \"manual\"";
     } else if (code == "nonconvex_solid_requires_decomposition") {
         out << "\"split_by_plane\", \"split_by_existing_face\", "
             << "\"split_by_cylinder\", \"accept_manual_decomposition\", \"manual\"";

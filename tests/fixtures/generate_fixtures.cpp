@@ -17,6 +17,7 @@
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakePrism.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
+#include <BRepPrimAPI_MakeTorus.hxx>
 #include <BRepBuilderAPI_NurbsConvert.hxx>
 #include <BRepBuilderAPI_Sewing.hxx>
 #include <BRepBuilderAPI_MakeSolid.hxx>
@@ -32,8 +33,10 @@
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
 #include <TopoDS_Shape.hxx>
+#include <gp_Ax2.hxx>
 #include <gp_Ax3.hxx>
 #include <gp_Cylinder.hxx>
+#include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 
@@ -75,6 +78,18 @@ TopoDS_Shape make_nurbs_cone() {
     return convert.Shape();
 }
 
+// A solid torus whose axis is along (1,1,1)/sqrt(3) — explicitly not aligned
+// with any global axis. cad2csg's analyze pass must classify this with
+// `unsupported_torus_orientation`. The surface-splitting workflow targets
+// exactly this kind of geometry.
+TopoDS_Shape make_tilted_torus() {
+    const gp_Pnt origin(0.0, 0.0, 0.0);
+    const gp_Dir tilted(1.0, 1.0, 1.0);
+    const gp_Ax2 axis(origin, tilted);
+    const double major_radius = 5.0;
+    const double minor_radius = 1.0;
+    return BRepPrimAPI_MakeTorus(axis, major_radius, minor_radius).Shape();
+}
 
 } // namespace
 
@@ -97,6 +112,7 @@ int main(int argc, char** argv) {
         {"l_shape.step", make_l_shape()},
         {"spline_face.step", make_nurbs_cylinder()},
         {"spline_cone.step", make_nurbs_cone()},
+        {"tilted_torus.step", make_tilted_torus()},
     };
 
     for (const Item& item : items) {
