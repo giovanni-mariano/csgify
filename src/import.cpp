@@ -13,9 +13,11 @@
 
 #include <Bnd_Box.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
+#include <gp_Trsf.hxx>
 #include <TCollection_AsciiString.hxx>
 #include <TDataStd_Name.hxx>
 #include <TDF_Label.hxx>
@@ -29,8 +31,10 @@
 #include <TopoDS_Shape.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp_Explorer.hxx>
+#include <UnitsMethods_LengthUnit.hxx>
 #include <XCAFApp_Application.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
+#include <XCAFDoc_LengthUnit.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 
 namespace cad2csg {
@@ -223,7 +227,34 @@ struct ImportedShape {
     TopoDS_Shape shape;
     std::vector<AssemblyNode> assembly;
     std::vector<ShapeMetadata> solid_metadata;
+    // Length unit captured from the XCAF document (or via the
+    // XCAFDoc_LengthUnit attribute if the document carries one). Empty
+    // name + 1.0 factor means "could not determine; assume native".
+    std::string length_unit;
+    double length_unit_to_mm = 1.0;
 };
+
+// Map the meter-scale factor returned by XCAFDoc_DocumentTool::GetLengthUnit
+// to a short unit label (the value is the size of one internal unit in
+// metres). Returns empty string if no exact match; in that case we still
+// store the numeric factor so downstream code can reason about it.
+const char* unit_name_from_meter_factor(double f) {
+    constexpr double eps = 1.0e-9;
+    auto close = [eps](double a, double b) {
+        return std::abs(a - b) <= eps + eps * std::abs(b);
+    };
+    if (close(f, 1.0))            return "m";
+    if (close(f, 0.001))          return "mm";
+    if (close(f, 0.01))           return "cm";
+    if (close(f, 1000.0))         return "km";
+    if (close(f, 1.0e-6))         return "micron";
+    if (close(f, 0.0254))         return "in";
+    if (close(f, 0.3048))         return "ft";
+    if (close(f, 1609.344))       return "mile";
+    if (close(f, 2.54e-5))        return "mil";
+    if (close(f, 2.54e-8))        return "microinch";
+    return "";
+}
 
 ImportedShape read_step_shape(const std::string& step_path, ConversionReport& report) {
     STEPCAFControl_Reader reader;
@@ -245,6 +276,28 @@ ImportedShape read_step_shape(const std::string& step_path, ConversionReport& re
 
     ImportedShape imported;
     imported.shape = reader.Reader().OneShape();
+
+    // STEP length unit. Prefer the XCAFDoc_LengthUnit attribute if the
+    // file carries one (it has both a name and a scale); otherwise fall
+    // back to GetLengthUnit, which returns the meter-scale factor. If
+    // neither is available, leave the fields empty and let downstream
+    // code surface the ambiguity as a diagnostic.
+    Handle(XCAFDoc_LengthUnit) length_unit_attr;
+    if (doc->Main().FindAttribute(XCAFDoc_LengthUnit::GetID(), length_unit_attr)
+        && !length_unit_attr.IsNull() && !length_unit_attr->IsEmpty()) {
+        imported.length_unit = length_unit_attr->GetUnitName().ToCString();
+        // GetUnitValue() returns the scale to metres; convert to mm.
+        imported.length_unit_to_mm = length_unit_attr->GetUnitValue() * 1000.0;
+    } else {
+        double meters = 0.0;
+        if (XCAFDoc_DocumentTool::GetLengthUnit(doc, meters) && meters > 0.0) {
+            const char* name = unit_name_from_meter_factor(meters);
+            if (name && name[0]) {
+                imported.length_unit = name;
+            }
+            imported.length_unit_to_mm = meters * 1000.0;
+        }
+    }
 
     Handle(XCAFDoc_ShapeTool) shape_tool =
         XCAFDoc_DocumentTool::ShapeTool(doc->Main());
@@ -307,6 +360,24 @@ ImportedShape load_and_prepare_shape(const std::string& step_path,
 
 } // namespace
 
+namespace {
+// Map from short unit label to the scale factor that converts a value
+// in that unit to millimetres. Used by --units / --normalize-units.
+double scale_to_mm_from_name(const std::string& name) {
+    if (name == "mm") return 1.0;
+    if (name == "cm") return 10.0;
+    if (name == "m")  return 1000.0;
+    if (name == "km") return 1000000.0;
+    if (name == "micron") return 0.001;
+    if (name == "in") return 25.4;
+    if (name == "ft") return 304.8;
+    if (name == "mile") return 1609344.0;
+    if (name == "mil") return 0.0254;
+    if (name == "microinch") return 0.0000254;
+    return 0.0;
+}
+} // namespace
+
 CadModel load_step_model(const std::string& step_path,
                          const ConversionOptions& options) {
     CadModel model;
@@ -317,7 +388,90 @@ CadModel load_step_model(const std::string& step_path,
     model.root = imported.shape;
     model.assembly = imported.assembly;
     model.solid_metadata = imported.solid_metadata;
+    model.length_unit = imported.length_unit;
+    model.length_unit_to_mm = imported.length_unit_to_mm;
     model.diagnostics = load_report.diagnostics;
+
+    // --units NAME overrides the asserted unit name (no geometry change).
+    // --scale X overrides the scale-to-mm factor (no geometry change).
+    // Both are recorded as info diagnostics so the override is visible
+    // in the report and decision log.
+    if (!options.unit_override.empty()) {
+        const double known = scale_to_mm_from_name(options.unit_override);
+        const std::string before = model.length_unit;
+        model.length_unit = options.unit_override;
+        if (known > 0.0) {
+            model.length_unit_to_mm = known;
+        }
+        model.diagnostics.push_back(
+            {DiagnosticSeverity::info, "unit_override",
+             "Length unit overridden by --units '" + options.unit_override
+                 + "' (was '" + (before.empty() ? "unknown" : before) + "').",
+             {}, {}, {}, {}});
+    }
+    if (options.unit_scale_to_mm_override > 0.0) {
+        const double before = model.length_unit_to_mm;
+        model.length_unit_to_mm = options.unit_scale_to_mm_override;
+        std::ostringstream msg;
+        msg << "Length-to-mm scale overridden by --scale "
+            << options.unit_scale_to_mm_override
+            << " (was " << before << ").";
+        model.diagnostics.push_back(
+            {DiagnosticSeverity::info, "unit_scale_override", msg.str(),
+             {}, {}, {}, {}});
+    }
+
+    // --normalize-units NAME actually rescales geometry. This is a
+    // mutating operation and is logged at info severity. The factor
+    // applied is (current model unit -> target unit), so a model in
+    // cm normalized to mm gets a 10x scale, and the report afterwards
+    // claims the target unit.
+    if (!options.normalize_to_unit.empty() && !model.root.IsNull()) {
+        const double target_to_mm = scale_to_mm_from_name(options.normalize_to_unit);
+        if (target_to_mm <= 0.0) {
+            model.diagnostics.push_back(
+                {DiagnosticSeverity::error, "unit_normalize_unknown_target",
+                 "--normalize-units '" + options.normalize_to_unit
+                     + "' is not a recognized unit name.",
+                 {}, {}, {}, {}});
+        } else if (model.length_unit_to_mm > 0.0) {
+            const double factor = model.length_unit_to_mm / target_to_mm;
+            if (std::abs(factor - 1.0) > 1.0e-12) {
+                gp_Trsf trsf;
+                trsf.SetScaleFactor(factor);
+                BRepBuilderAPI_Transform xform(model.root, trsf, /*copy=*/true);
+                if (xform.IsDone()) {
+                    model.root = xform.Shape();
+                    std::ostringstream msg;
+                    msg << "Geometry rescaled from "
+                        << (model.length_unit.empty() ? "unknown"
+                                                      : model.length_unit)
+                        << " to " << options.normalize_to_unit
+                        << " (factor=" << factor << ").";
+                    model.diagnostics.push_back(
+                        {DiagnosticSeverity::info, "unit_normalized",
+                         msg.str(), {}, {}, {}, {}});
+                    model.length_unit = options.normalize_to_unit;
+                    model.length_unit_to_mm = target_to_mm;
+                } else {
+                    model.diagnostics.push_back(
+                        {DiagnosticSeverity::error, "unit_normalize_failed",
+                         "BRepBuilderAPI_Transform did not complete the "
+                         "rescale; geometry left untouched.",
+                         {}, {}, {}, {}});
+                }
+            }
+        }
+    }
+
+    if (model.length_unit.empty() && !model.root.IsNull()) {
+        model.diagnostics.push_back(
+            {DiagnosticSeverity::warning, "step_unit_unknown",
+             "STEP file did not declare a length unit; values are reported "
+             "in OCCT's native units (mm). Use --units or --normalize-units "
+             "to override.",
+             {}, {}, {}, {}});
+    }
     return model;
 }
 

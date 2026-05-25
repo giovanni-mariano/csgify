@@ -28,6 +28,7 @@
 #include <Geom_CylindricalSurface.hxx>
 #include <GeomAPI_PointsToBSpline.hxx>
 #include <GeomAPI_PointsToBSplineSurface.hxx>
+#include <Interface_Static.hxx>
 #include <STEPControl_Writer.hxx>
 #include <TColgp_Array1OfPnt.hxx>
 #include <TColgp_Array2OfPnt.hxx>
@@ -53,6 +54,30 @@ int write_step(const TopoDS_Shape& shape, const std::string& path) {
         std::cerr << "write failed: " << path << '\n';
         return 1;
     }
+    return 0;
+}
+
+// Write a STEP file with a specific declared length unit. The shape
+// coordinates are in OCCT's native units (mm); writing with a CM unit
+// causes downstream tools (and OCCT readers) to interpret the same
+// coordinate values as centimetres, so the *declared* volume is 1000x
+// the mm version. Used by units_smoke.sh to confirm the unit-detection
+// path.
+int write_step_with_unit(const TopoDS_Shape& shape,
+                        const std::string& path,
+                        const char* unit) {
+    STEPControl_Writer writer;
+    Interface_Static::SetCVal("write.step.unit", unit);
+    if (writer.Transfer(shape, STEPControl_AsIs) != IFSelect_RetDone) {
+        std::cerr << "transfer failed: " << path << '\n';
+        return 1;
+    }
+    if (writer.Write(path.c_str()) != IFSelect_RetDone) {
+        std::cerr << "write failed: " << path << '\n';
+        return 1;
+    }
+    // Restore default for subsequent writes.
+    Interface_Static::SetCVal("write.step.unit", "MM");
     return 0;
 }
 
@@ -90,6 +115,25 @@ TopoDS_Shape make_tilted_torus() {
     const double major_radius = 5.0;
     const double minor_radius = 1.0;
     return BRepPrimAPI_MakeTorus(axis, major_radius, minor_radius).Shape();
+}
+
+// A compound of four non-overlapping unit boxes laid out along the X
+// axis. Used by id_stability_smoke.sh to assert that suppressing one
+// solid does not shift the TopExp order (and hence the solid:N ids)
+// of the surviving solids.
+TopoDS_Shape make_four_solids() {
+    TopoDS_Compound compound;
+    BRep_Builder builder;
+    builder.MakeCompound(compound);
+    for (int i = 0; i < 4; ++i) {
+        const double x = static_cast<double>(i) * 3.0;
+        TopoDS_Shape box =
+            BRepPrimAPI_MakeBox(gp_Pnt(x, 0.0, 0.0),
+                                1.0 + 0.1 * static_cast<double>(i),
+                                1.0, 1.0).Shape();
+        builder.Add(compound, box);
+    }
+    return compound;
 }
 
 TopoDS_Shape make_bolt_hole() {
@@ -132,6 +176,7 @@ int main(int argc, char** argv) {
         {"spline_cone.step", make_nurbs_cone()},
         {"tilted_torus.step", make_tilted_torus()},
         {"bolt_hole.step", make_bolt_hole()},
+        {"four_solids.step", make_four_solids()},
     };
 
     for (const Item& item : items) {
@@ -141,5 +186,17 @@ int main(int argc, char** argv) {
         }
         std::cout << "wrote " << path << '\n';
     }
+
+    // Same 10x5x2 box, but written with CM as the declared STEP unit.
+    // The coordinate values are unchanged (still 10/5/2), but a STEP
+    // reader will interpret them as centimetres, producing a declared
+    // volume 1000x larger in mm. units_smoke.sh exercises this.
+    TopoDS_Shape box_cm = BRepPrimAPI_MakeBox(10.0, 5.0, 2.0).Shape();
+    const std::string box_cm_path = dir + "/box_cm.step";
+    if (write_step_with_unit(box_cm, box_cm_path, "CM") != 0) {
+        return EXIT_FAILURE;
+    }
+    std::cout << "wrote " << box_cm_path << '\n';
+
     return EXIT_SUCCESS;
 }

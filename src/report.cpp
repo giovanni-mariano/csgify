@@ -387,6 +387,11 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         out << "    \"source_path\": \"" << json_escape(report.source_path) << "\"\n";
         out << "  },\n";
     }
+    out << "  \"units\": {\n";
+    out << "    \"length_unit\": \"" << json_escape(report.length_unit) << "\",\n";
+    out << "    \"length_unit_to_mm\": " << std::setprecision(17)
+        << report.length_unit_to_mm << "\n";
+    out << "  },\n";
     out << "  \"summary\": {\n";
     out << "    \"solids_seen\": " << report.solids_seen << ",\n";
     out << "    \"solids_converted\": " << report.solids_converted << ",\n";

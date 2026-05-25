@@ -16,13 +16,16 @@
 #include <OpenGl_GraphicDriverFactory.hxx>
 #endif
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <set>
 #include <vector>
@@ -41,73 +44,461 @@ const char* severity_name(cad2csg::DiagnosticSeverity severity) {
     return "unknown";
 }
 
+// Per-verb help table. Drives both the global usage listing and the
+// per-verb --help output. Keeping the help as data (vs. a long branchy
+// usage() function) means new verbs only need one entry to be wired up,
+// and the help text is also visible from `cad2csg <verb> --help`.
+struct VerbHelp {
+    const char* name;
+    const char* synopsis;     // multi-line: each line shown after "usage:"
+    const char* description;  // one-line summary; may be empty
+    const char* options;      // multi-line option block; may be empty
+    const char* mutation;     // mutation contract (empty for read-only verbs)
+};
+
+constexpr const char* kReadOnlyMutation = "Read-only: no model changes.";
+constexpr const char* kPropMutation = "Read-only: proposal generation only.";
+
+constexpr VerbHelp kVerbHelp[] = {
+    {"inspect",
+     "inspect input.step [--report report.json|-] [--log decisions.json]\n"
+     "                            [--units mm|cm|m|in|...] [--scale X]\n"
+     "                            [--normalize-units mm|cm|m|in|...]",
+     "Analyze a STEP file; print a human summary or write JSON.",
+     "  --report PATH         write JSON report to PATH (`-` for stdout)\n"
+     "  --log PATH            open an append-only decision log alongside the run\n"
+     "  --units NAME          assert the source unit (no geometry rescale)\n"
+     "  --scale X             assert the source-unit-to-mm factor (no rescale)\n"
+     "  --normalize-units NM  actually rescale geometry to NM (mm|cm|m|in|...)",
+     kReadOnlyMutation},
+    {"explain",
+     "explain <shape-id> input.step [--report report.json|-]",
+     "Explain why a target solid/piece/face is not emit-ready.",
+     "  <shape-id>            solid:N, piece:N, or face:N.M (doc:1/ prefix ok)\n"
+     "  --report PATH         write the underlying JSON analysis report",
+     kReadOnlyMutation},
+    {"decision-pack",
+     "decision-pack input.step --out decisions/ [--target id] [--max-packets N]\n"
+     "                                  [--hole-fill --host solid:N --near-removed solid:M]",
+     "Bundle decision packets for a human or agent reviewer.",
+     "", kReadOnlyMutation},
+    {"dump-assembly",
+     "dump-assembly input.step",
+     "Print the XCAF assembly tree as text.", "", kReadOnlyMutation},
+    {"inspect-tree",
+     "inspect-tree input.step",
+     "Print the per-solid status overlaid on the assembly tree.", "",
+     kReadOnlyMutation},
+    {"remove-suggest",
+     "remove-suggest input.step [--report removals.json|-]",
+     "Propose solids that are safe to remove.", "", kPropMutation},
+    {"surface-suggest",
+     "surface-suggest input.step face:N.M [--report proposal.json|-]",
+     "Propose analytic-surface replacements for a spline face.", "",
+     kPropMutation},
+    {"hole-fill-suggest",
+     "hole-fill-suggest input.step [--host solid:N] [--near-removed solid:M]\n"
+     "                                  [--max-radius value] [--max-volume-fraction value]\n"
+     "                                  [--max-candidates N] [--report holes.json|-]",
+     "Propose synthetic plug solids for cylindrical holes.", "",
+     kPropMutation},
+    {"decompose-suggest",
+     "decompose-suggest input.step solid:N [--report proposals.json|-]",
+     "Propose decompositions for a non-convex solid.", "", kPropMutation},
+    {"preprocess",
+     "preprocess input.step --out-step simplified.step\n"
+     "                                  [--policy auto|medium|low|conservative] [--max-depth N]\n"
+     "                                  [--target solid:N] [--max-targets N] [--max-splits N]\n"
+     "                                  [--apply-removal-candidates high|medium]\n"
+     "                                  [--safe-all] [--dry-run]\n"
+     "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
+     "                                  [--log decisions.json] [--report report.json|-]",
+     "Apply safe high-confidence operations and emit a simplified STEP.",
+     "  --safe-all              compose every safe pass (auto-fit + BSP + high-confidence removals)\n"
+     "  --dry-run               print the plan without mutating; --out-step optional\n"
+     "  --apply-removal-candidates LEVEL  one of: high | medium (default: none)",
+     "Mutation contract: may suppress solids selected for removal, may auto-fit\n"
+     "  spline faces in place (when --safe-all), and may decompose non-convex\n"
+     "  targets. Decomposed solid:N is suppressed and produces piece:1..K\n"
+     "  (scoped doc:1/piece:N). Surviving solid:N IDs do NOT shift -- TopExp\n"
+     "  order of surviving solids is stable."},
+    {"decompose-apply",
+     "decompose-apply input.step --out output.i\n"
+     "                                  [--policy auto|medium|low|conservative] [--max-depth N]\n"
+     "                                  [--target solid:N] [--max-targets N] [--max-splits N]\n"
+     "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
+     "                                  [--log decisions.json] [--out-step simplified.step] [--report report.json|-]",
+     "Run safe BSP decomposition then emit MCNP.",
+     "",
+     "Mutation contract: decomposed solid:N is suppressed and produces\n"
+     "  piece:1..K. Surviving solid:N IDs do NOT shift."},
+    {"compact",
+     "compact decisions.json --out recipe.lua",
+     "Compact a decision log into a deterministic Lua recipe.", "",
+     kReadOnlyMutation},
+    {"replay",
+     "replay recipe.json --step input.step --out output.i --report replay.json [--out-step simplified.step]",
+     "Replay a recipe against a STEP file and emit MCNP.",
+     "",
+     "Mutation contract: the recipe's ops are applied in order. Each op's\n"
+     "  contract is the same as its direct CLI form."},
+    {"simplify",
+     "simplify input.step <action> <target> --out output.i [options]",
+     "Apply a single solid/face action and emit MCNP.",
+     "  Solid actions (target solid:N):\n"
+     "    --replace-solid-bbox            --replace-solid-bbox-cylinder\n"
+     "    --replace-solid-fitted-cylinder --replace-solid-fitted-sphere\n"
+     "    --replace-solid-fitted-cone     --decompose-planar\n"
+     "    --auto-decompose-bsp\n"
+     "    --fill-hole\n"
+     "    --apply-decomposition-candidate --candidate candidate:N\n"
+     "    --decompose-by-face --by-face face:N.M\n"
+     "    --remove-solid\n"
+     "  Face actions (target face:N.M, comma list allowed):\n"
+     "    --replace-face-with-plane       --replace-face-with-cylinder\n"
+     "    --replace-face-with-sphere      --replace-face-with-cone\n"
+     "    --apply-surface-candidate --candidate candidate:N\n"
+     "  Options:\n"
+     "    --max-abs-delta value          (solid replacement volume guard)\n"
+     "    --max-rel-delta value          (solid replacement volume guard)\n"
+     "    --max-deviation value          (face replacement distance guard)\n"
+     "    --max-depth value              (safe BSP auto-decomposition)\n"
+     "    --allow-bbox-fallback-auto\n"
+     "    --allow-medium-confidence-auto\n"
+     "    --report PATH                  (`-` for stdout)\n"
+     "    --proposal-report PATH         (`-` for stdout)\n"
+     "    --host solid:N                 (fill-hole proposal context)\n"
+     "    --near-removed solid:N         (fill-hole proposal context)\n"
+     "    --max-radius value             (fill-hole proposal guard)\n"
+     "    --max-volume-fraction value    (fill-hole proposal guard)\n"
+     "    --log decisions.json           (append-only decision log)\n"
+     "    --out-step simplified.step     (as-simplified geometry for review)",
+     "Mutation contract:\n"
+     "  --replace-solid-*    suppresses solid:N; emits a synthetic body with\n"
+     "                       the same solid:N id. Surviving solid:N unchanged.\n"
+     "  --remove-solid       suppresses solid:N. Surviving solid:N unchanged.\n"
+     "  --decompose-*        suppresses solid:N; produces piece:1..K.\n"
+     "                       Surviving solid:N unchanged.\n"
+     "  --fill-hole          creates a synthetic plug (synthetic:N). Host\n"
+     "                       solid:N id is unchanged. Surviving IDs unchanged.\n"
+     "  --replace-face-*     replaces face geometry in place; solid:N id is\n"
+     "                       unchanged. Surviving IDs unchanged."},
+    {"auto-fit",
+     "auto-fit input.step --out output.i [--max-deviation X] [--report report.json|-]",
+     "Replace every spline face whose best fit meets --max-deviation.",
+     "",
+     "Mutation contract: replaces spline face geometry in place. Solid:N IDs\n"
+     "  are not affected; only face contents change."},
+    {"lua",
+     "lua script.lua [args...]",
+     "Run a Lua driver script against the cad2csg session API.", "",
+     "Mutation contract: depends on the script. Each op called from Lua\n"
+     "  follows the contract of its CLI equivalent."},
+    {"volume",
+     "volume input.step\n"
+     "       volume original.step --compare candidate.step [--abs-tol value] [--rel-tol value]",
+     "Report total volume; optionally compare two STEP files.", "",
+     kReadOnlyMutation},
+    {"propose",
+     "propose <kind> <target?> input.step [--report report.json|-]\n"
+     "  where <kind> is one of: decompose | surface | removal | hole-fill\n"
+     "  <target> is solid:N for decompose, face:N.M for surface, omitted otherwise",
+     "Generate candidate proposals (unified front door over the *-suggest verbs).",
+     "  --report PATH                  write JSON proposal (`-` for stdout)\n"
+     "  --host solid:N                 (hole-fill kind only)\n"
+     "  --near-removed solid:N         (hole-fill kind only)\n"
+     "  --max-radius value             (hole-fill kind only)\n"
+     "  --max-volume-fraction value    (hole-fill kind only)\n"
+     "  --max-candidates N             (hole-fill kind only)",
+     kPropMutation},
+    {"apply",
+     "apply <kind> <target> input.step --out out.i [--candidate candidate:N] [options]\n"
+     "  where <kind> is one of: decompose | surface | removal | hole-fill\n"
+     "  --candidate required for decompose / surface / hole-fill",
+     "Apply a candidate proposal (unified front door over simplify --apply-*-candidate).",
+     "  --candidate candidate:N        the candidate id from `propose`\n"
+     "  --log decisions.json           append-only decision log\n"
+     "  --report PATH                  (`-` for stdout)",
+     "Mutation contract: same as the simplify --apply-*-candidate it forwards to."},
+    {"viewer-check",
+     "viewer-check",
+     "Probe whether the OCCT viewer can run in this environment.", "",
+     kReadOnlyMutation},
+    {"view",
+     "view input.step [--select doc:N/solid:M|solid:M]\n"
+     "                         [--candidate candidate:N]\n"
+     "                         [--review-removal removal:N]\n"
+     "                         [--review-hole-fill hole-fill:N [--host solid:N] [--near-removed solid:M]]\n"
+     "                         [--review-decomp candidate:N --select solid:N]\n"
+     "                         [--review-surface-replacement candidate:N --select-face face:N.M]",
+     "Open the OCCT viewer for visual review.", "", kReadOnlyMutation},
+    {"help",
+     "help [verb]",
+     "Show global usage, or the help for a specific verb.", "", ""},
+    {"--version",
+     "--version",
+     "Print the cad2csg version, OCCT version, and Alea version.", "", ""},
+};
+
+const VerbHelp* lookup_verb_help(const std::string& name) {
+    for (const VerbHelp& v : kVerbHelp) {
+        if (name == v.name) return &v;
+    }
+    return nullptr;
+}
+
+void print_synopsis_line(std::ostream& out, const char* argv0,
+                         const VerbHelp& v) {
+    // Synopsis may be multi-line. The first line gets the "usage:" prefix;
+    // continuation lines align under it.
+    const std::string syn(v.synopsis);
+    const std::size_t lead = std::strlen(argv0) + std::strlen("usage: ") + 1;
+    std::size_t start = 0;
+    bool first = true;
+    while (start <= syn.size()) {
+        const std::size_t nl = syn.find('\n', start);
+        const std::string line = syn.substr(start,
+                                            nl == std::string::npos
+                                                ? syn.size() - start
+                                                : nl - start);
+        if (first) {
+            out << "usage: " << argv0 << " " << line << "\n";
+            first = false;
+        } else {
+            out << std::string(lead, ' ') << line << "\n";
+        }
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+}
+
+void print_verb_help(std::ostream& out, const char* argv0, const VerbHelp& v) {
+    print_synopsis_line(out, argv0, v);
+    if (v.description && v.description[0]) {
+        out << "\n" << v.description << "\n";
+    }
+    if (v.options && v.options[0]) {
+        out << "\n" << v.options << "\n";
+    }
+    if (v.mutation && v.mutation[0]) {
+        out << "\nMutation contract: " << v.mutation << "\n";
+    }
+}
+
+void print_global_usage(std::ostream& out, const char* argv0) {
+    out << "usage: " << argv0 << " input.step output.i      "
+        << "(default: emit MCNP from STEP)\n";
+    out << "       " << argv0 << " <verb> ...\n";
+    out << "       " << argv0 << " help [verb]              "
+        << "(per-verb help; also: <verb> --help)\n";
+    out << "\nVerbs:\n";
+    for (const VerbHelp& v : kVerbHelp) {
+        // Skip --version (mentioned in synopsis) and the help meta-verb.
+        if (std::strcmp(v.name, "--version") == 0) continue;
+        if (std::strcmp(v.name, "help") == 0) continue;
+        out << "  " << v.name;
+        const std::size_t pad = std::strlen(v.name) >= 20
+                                    ? 1
+                                    : 20 - std::strlen(v.name);
+        out << std::string(pad, ' ');
+        out << (v.description ? v.description : "") << "\n";
+    }
+    out << "\n  --version              print versions and exit\n";
+    out << "\nFor details on a verb: " << argv0 << " <verb> --help\n";
+}
+
 void usage(const char* argv0) {
-    std::cerr << "usage: " << argv0 << " input.step output.i\n"
-              << "       " << argv0 << " inspect input.step --report report.json\n"
-              << "       " << argv0 << " decision-pack input.step --out decisions/ [--target id] [--max-packets N]\n"
-              << "                                  [--hole-fill --host solid:N --near-removed solid:M]\n"
-              << "       " << argv0 << " dump-assembly input.step\n"
-              << "       " << argv0 << " inspect-tree input.step\n"
-              << "       " << argv0 << " remove-suggest input.step [--report removals.json]\n"
-              << "       " << argv0 << " surface-suggest input.step face:N.M [--report proposal.json]\n"
-              << "       " << argv0 << " hole-fill-suggest input.step [--host solid:N] [--near-removed solid:M]\n"
-              << "                                  [--max-radius value] [--max-volume-fraction value]\n"
-              << "                                  [--max-candidates N] [--report holes.json]\n"
-              << "       " << argv0 << " decompose-suggest input.step solid:N [--report proposals.json]\n"
-              << "       " << argv0 << " preprocess input.step --out-step simplified.step\n"
-              << "                                  [--policy auto|medium|low|conservative] [--max-depth N]\n"
-              << "                                  [--target solid:N] [--max-targets N] [--max-splits N]\n"
-              << "                                  [--apply-removal-candidates high|medium]\n"
-              << "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
-              << "                                  [--log decisions.json] [--report report.json]\n"
-              << "       " << argv0 << " decompose-apply input.step --out output.i\n"
-              << "                                  [--policy auto|medium|low|conservative] [--max-depth N]\n"
-              << "                                  [--target solid:N] [--max-targets N] [--max-splits N]\n"
-              << "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
-              << "                                  [--log decisions.json] [--out-step simplified.step] [--report report.json]\n"
-              << "       " << argv0 << " compact decisions.json --out recipe.lua\n"
-              << "       " << argv0 << " replay recipe.json --step input.step --out output.i --report replay.json [--out-step simplified.step]\n"
-              << "       " << argv0 << " simplify input.step <action> <target> --out output.i [options]\n"
-              << "         actions on a solid id (e.g. solid:1):\n"
-              << "           --replace-solid-bbox            --replace-solid-bbox-cylinder\n"
-              << "           --replace-solid-fitted-cylinder --replace-solid-fitted-sphere\n"
-              << "           --replace-solid-fitted-cone     --decompose-planar\n"
-              << "           --auto-decompose-bsp\n"
-              << "           --fill-hole\n"
-              << "           --apply-decomposition-candidate --candidate candidate:N\n"
-              << "           --decompose-by-face --by-face face:N.M\n"
-              << "           --remove-solid\n"
-              << "         actions on a face id (e.g. face:1.4, or a comma list face:1.4,face:1.5):\n"
-              << "           --replace-face-with-plane       --replace-face-with-cylinder\n"
-              << "           --replace-face-with-sphere      --replace-face-with-cone\n"
-              << "           --apply-surface-candidate --candidate candidate:N\n"
-              << "         options:\n"
-              << "           --max-abs-delta value     (solid replacement, volume guard)\n"
-              << "           --max-rel-delta value     (solid replacement, volume guard)\n"
-              << "           --max-deviation value     (face replacement, distance guard)\n"
-              << "           --max-depth value         (safe BSP auto-decomposition)\n"
-              << "           --allow-bbox-fallback-auto\n"
-              << "           --allow-medium-confidence-auto\n"
-              << "           --report report.json\n"
-              << "           --proposal-report proposals.json\n"
-              << "           --host solid:N           (fill-hole proposal context)\n"
-              << "           --near-removed solid:N   (fill-hole proposal context)\n"
-              << "           --max-radius value       (fill-hole proposal guard)\n"
-              << "           --max-volume-fraction value (fill-hole proposal guard)\n"
-              << "           --log decisions.json      (append-only decision log)\n"
-              << "           --out-step simplified.step (as-simplified geometry for review)\n"
-              << "       " << argv0 << " auto-fit input.step --out output.i [--max-deviation X] [--report report.json]\n"
-              << "       " << argv0 << " lua script.lua [args...]\n"
-              << "       " << argv0 << " volume input.step\n"
-              << "       " << argv0 << " volume original.step --compare candidate.step [--abs-tol value] [--rel-tol value]\n"
-              << "       " << argv0 << " viewer-check\n"
-              << "       " << argv0 << " view input.step [--select doc:N/solid:M|solid:M]\n"
-              << "                         [--candidate candidate:N]\n"
-              << "                         [--review-removal removal:N]\n"
-              << "                         [--review-hole-fill hole-fill:N [--host solid:N] [--near-removed solid:M]]\n"
-              << "                         [--review-decomp candidate:N --select solid:N]\n"
-              << "                         [--review-surface-replacement candidate:N --select-face face:N.M]\n"
-              << "       " << argv0 << " --version\n";
+    print_global_usage(std::cerr, argv0);
+}
+
+// Returns true if argv contains a top-level --help or -h token. Used by
+// every run_*_command so that `<verb> --help` prints that verb's help
+// on stdout and exits 0 instead of falling through to argument parsing
+// and erroring on argc.
+bool wants_help(int argc, char** argv) {
+    for (int i = 2; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--help") == 0
+            || std::strcmp(argv[i], "-h") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int print_verb_help_and_exit(const char* argv0, const std::string& verb) {
+    const VerbHelp* v = lookup_verb_help(verb);
+    if (!v) {
+        std::cerr << "internal_error: no help wired for verb '" << verb
+                  << "'\n";
+        return EXIT_FAILURE;
+    }
+    print_verb_help(std::cout, argv0, *v);
+    return EXIT_SUCCESS;
+}
+
+// Path-like heuristic. Used by main() to decide whether a non-verb
+// argv[1] looks like a STEP path (in which case we run the default
+// convert), or whether it is a typo'd verb that we should reject with
+// "unknown command" + a did-you-mean suggestion.
+bool is_step_path_like(const char* arg) {
+    if (!arg || !arg[0]) return false;
+    const std::size_t n = std::strlen(arg);
+    auto ends_with = [&](const char* suf) {
+        const std::size_t sn = std::strlen(suf);
+        if (n < sn) return false;
+        for (std::size_t i = 0; i < sn; ++i) {
+            const char a = std::tolower(static_cast<unsigned char>(arg[n - sn + i]));
+            const char b = std::tolower(static_cast<unsigned char>(suf[i]));
+            if (a != b) return false;
+        }
+        return true;
+    };
+    if (ends_with(".step") || ends_with(".stp")) return true;
+    if (std::strchr(arg, '/') != nullptr) return true;
+    struct stat st;
+    return ::stat(arg, &st) == 0;
+}
+
+int edit_distance(const std::string& a, const std::string& b) {
+    const std::size_t na = a.size();
+    const std::size_t nb = b.size();
+    if (na == 0) return static_cast<int>(nb);
+    if (nb == 0) return static_cast<int>(na);
+    std::vector<int> prev(nb + 1);
+    std::vector<int> cur(nb + 1);
+    for (std::size_t j = 0; j <= nb; ++j) prev[j] = static_cast<int>(j);
+    for (std::size_t i = 1; i <= na; ++i) {
+        cur[0] = static_cast<int>(i);
+        for (std::size_t j = 1; j <= nb; ++j) {
+            const int cost = a[i - 1] == b[j - 1] ? 0 : 1;
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+        }
+        prev.swap(cur);
+    }
+    return prev[nb];
+}
+
+const char* suggest_verb(const std::string& typo) {
+    const int threshold = typo.size() <= 4 ? 1 : static_cast<int>(typo.size() / 3 + 1);
+    int best = threshold + 1;
+    const char* best_name = nullptr;
+    for (const VerbHelp& v : kVerbHelp) {
+        if (v.name[0] == '-') continue;
+        const int d = edit_distance(typo, v.name);
+        if (d < best) {
+            best = d;
+            best_name = v.name;
+        }
+    }
+    return best_name;
+}
+
+// `-` is the conventional stdout sentinel; every verb that takes a
+// --report path routes through these helpers so the convention is
+// uniform.
+bool is_stdout_path(const std::string& path) { return path == "-"; }
+
+int write_report_or_stdout(const cad2csg::ConversionReport& report,
+                           const std::string& path) {
+    if (is_stdout_path(path)) {
+        std::cout << cad2csg::report_json_string(report);
+        return 0;
+    }
+    return cad2csg::write_report_json(report, path);
+}
+
+int write_decomp_proposal_or_stdout(const cad2csg::DecompositionProposal& p,
+                                    const std::string& path) {
+    if (is_stdout_path(path)) {
+        std::cout << cad2csg::decomposition_proposal_json_string(p);
+        return 0;
+    }
+    return cad2csg::write_decomposition_proposal_json(p, path);
+}
+
+int write_removal_proposal_or_stdout(const cad2csg::RemovalProposal& p,
+                                     const std::string& path) {
+    if (is_stdout_path(path)) {
+        std::cout << cad2csg::removal_proposal_json_string(p);
+        return 0;
+    }
+    return cad2csg::write_removal_proposal_json(p, path);
+}
+
+int write_hole_fill_proposal_or_stdout(const cad2csg::HoleFillProposal& p,
+                                       const std::string& path) {
+    if (is_stdout_path(path)) {
+        std::cout << cad2csg::hole_fill_proposal_json_string(p);
+        return 0;
+    }
+    return cad2csg::write_hole_fill_proposal_json(p, path);
+}
+
+int write_surface_proposal_or_stdout(
+    const cad2csg::SurfaceReplacementProposal& p,
+    const std::string& path) {
+    if (is_stdout_path(path)) {
+        std::cout << cad2csg::surface_replacement_proposal_json_string(p);
+        return 0;
+    }
+    return cad2csg::write_surface_replacement_proposal_json(p, path);
+}
+
+// Compact human summary for `inspect` without --report. The JSON report
+// is canonical and exposes every field; this is the at-a-glance view
+// for a user who just typed `cad2csg inspect file.step`.
+std::string solid_status_label(const cad2csg::AnalyzedSolid& solid);
+
+void print_human_inspect(std::ostream& out,
+                         const cad2csg::ConversionReport& report) {
+    std::size_t ready = 0;
+    for (const cad2csg::AnalyzedSolid& s : report.solids) {
+        if (s.exact_csg_supported) ++ready;
+    }
+    out << "cad2csg inspect";
+    if (!report.source_path.empty()) {
+        out << " " << report.source_path;
+    }
+    out << "\n";
+    out << "  solids:  " << ready << "/" << report.solids_seen
+        << " emit-ready";
+    if (report.solids_requiring_decomposition > 0) {
+        out << ", " << report.solids_requiring_decomposition
+            << " need decomposition";
+    }
+    out << "\n";
+    out << "  faces:   " << report.analytic_faces << "/" << report.faces_seen
+        << " analytic, " << report.spline_faces << " spline\n";
+    out << "  volume:  " << report.total_volume;
+    if (!report.length_unit.empty()) {
+        out << " " << report.length_unit << "^3";
+    }
+    out << "\n";
+    out << "  units:   "
+        << (report.length_unit.empty() ? "unknown (assumed mm)" : report.length_unit);
+    if (!report.length_unit.empty()
+        && report.length_unit != "mm"
+        && report.length_unit_to_mm > 0.0) {
+        out << " (x" << report.length_unit_to_mm << " to mm)";
+    }
+    out << "\n";
+    if (!report.solids.empty()) {
+        out << "\nPer-solid status:\n";
+        for (const cad2csg::AnalyzedSolid& s : report.solids) {
+            out << "  " << s.id << "  " << solid_status_label(s)
+                << "  vol=" << s.volume;
+            if (!s.name.empty()) out << "  " << s.name;
+            out << "\n";
+        }
+    }
+    if (!report.diagnostics.empty()) {
+        out << "\nDiagnostics:\n";
+        for (const cad2csg::Diagnostic& d : report.diagnostics) {
+            out << "  " << severity_name(d.severity) << " " << d.code;
+            if (!d.shape_label.empty()) out << " " << d.shape_label;
+            out << ": " << d.message << "\n";
+        }
+    }
 }
 
 void print_summary(const cad2csg::ConversionReport& report) {
@@ -119,7 +510,11 @@ void print_summary(const cad2csg::ConversionReport& report) {
               << ", faces: " << report.analytic_faces << "/"
               << report.faces_seen << " analytic"
               << ", splines: " << report.spline_faces
-              << ", volume: " << report.total_volume << '\n';
+              << ", volume: " << report.total_volume;
+    if (!report.length_unit.empty()) {
+        std::cerr << " " << report.length_unit << "^3";
+    }
+    std::cerr << '\n';
 }
 
 void print_diagnostics(const cad2csg::ConversionReport& report) {
@@ -285,6 +680,7 @@ private:
 };
 
 int run_volume_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "volume");
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -340,6 +736,7 @@ int run_volume_command(int argc, char** argv) {
 }
 
 int run_view_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "view");
 #if CAD2CSG_HAVE_TKOPENGL
     if (argc < 3) {
         std::cerr << "usage: " << argv[0] << " view input.step"
@@ -591,6 +988,9 @@ int run_viewer_check_command() {
 }
 
 int run_decompose_suggest_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "decompose-suggest");
+    std::cerr << "info deprecated_verb: `decompose-suggest` will be removed; "
+              << "use `propose decompose <solid:N> <input.step>` instead.\n";
     if (argc < 4) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -616,7 +1016,7 @@ int run_decompose_suggest_command(int argc, char** argv) {
                                        cad2csg::ReportIdMode::local);
 
     if (!report_path.empty()) {
-        if (cad2csg::write_decomposition_proposal_json(proposal, report_path) != 0) {
+        if (write_decomp_proposal_or_stdout(proposal, report_path) != 0) {
             std::cerr << "error report_write_failed: " << report_path << '\n';
             return EXIT_FAILURE;
         }
@@ -634,6 +1034,7 @@ int run_decompose_suggest_command(int argc, char** argv) {
 }
 
 int run_decision_pack_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "decision-pack");
     if (argc < 5) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -707,6 +1108,9 @@ int run_decision_pack_command(int argc, char** argv) {
 }
 
 int run_remove_suggest_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "remove-suggest");
+    std::cerr << "info deprecated_verb: `remove-suggest` will be removed; "
+              << "use `propose removal <input.step>` instead.\n";
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -731,7 +1135,7 @@ int run_remove_suggest_command(int argc, char** argv) {
                                   cad2csg::ReportIdMode::local);
 
     if (!report_path.empty()) {
-        if (cad2csg::write_removal_proposal_json(proposal, report_path) != 0) {
+        if (write_removal_proposal_or_stdout(proposal, report_path) != 0) {
             std::cerr << "error report_write_failed: " << report_path << '\n';
             return EXIT_FAILURE;
         }
@@ -748,6 +1152,9 @@ int run_remove_suggest_command(int argc, char** argv) {
 }
 
 int run_hole_fill_suggest_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "hole-fill-suggest");
+    std::cerr << "info deprecated_verb: `hole-fill-suggest` will be removed; "
+              << "use `propose hole-fill <input.step>` instead.\n";
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -785,7 +1192,7 @@ int run_hole_fill_suggest_command(int argc, char** argv) {
                                     cad2csg::ReportIdMode::local);
 
     if (!report_path.empty()) {
-        if (cad2csg::write_hole_fill_proposal_json(proposal, report_path) != 0) {
+        if (write_hole_fill_proposal_or_stdout(proposal, report_path) != 0) {
             std::cerr << "error report_write_failed: " << report_path << '\n';
             return EXIT_FAILURE;
         }
@@ -800,6 +1207,9 @@ int run_hole_fill_suggest_command(int argc, char** argv) {
 }
 
 int run_surface_suggest_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "surface-suggest");
+    std::cerr << "info deprecated_verb: `surface-suggest` will be removed; "
+              << "use `propose surface <face:N.M> <input.step>` instead.\n";
     if (argc < 4) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -825,8 +1235,7 @@ int run_surface_suggest_command(int argc, char** argv) {
                                              cad2csg::ReportIdMode::local);
 
     if (!report_path.empty()) {
-        if (cad2csg::write_surface_replacement_proposal_json(proposal,
-                                                             report_path) != 0) {
+        if (write_surface_proposal_or_stdout(proposal, report_path) != 0) {
             std::cerr << "error report_write_failed: " << report_path << '\n';
             return EXIT_FAILURE;
         }
@@ -844,6 +1253,7 @@ int run_surface_suggest_command(int argc, char** argv) {
 }
 
 int run_simplify_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "simplify");
     if (argc < 7) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -979,7 +1389,24 @@ int run_simplify_command(int argc, char** argv) {
                 has_max_deviation,
                 max_deviation,
                 cad2csg::ReportIdMode::local);
-            if (!action_result.ok) {
+            // `action_result.ok` from the session API is
+            // `op_succeeded && document.report.ok()`. When the
+            // requested face replacement applied cleanly but *other*
+            // faces of the same solid still carry error-severity
+            // diagnostics (e.g. unsupported_spline_face on a sibling),
+            // `report.ok()` returns false even though the targeted op
+            // worked. Distinguish the two cases by looking for the
+            // op's own `face_replacement_recorded` info diagnostic on
+            // the requested face id. If present, the action applied.
+            const bool op_recorded = std::any_of(
+                action_result.report.diagnostics.begin(),
+                action_result.report.diagnostics.end(),
+                [&](const cad2csg::Diagnostic& d) {
+                    return d.code == "face_replacement_recorded"
+                        && (d.shape_id == id
+                            || d.local_shape_id == id);
+                });
+            if (!action_result.ok && !op_recorded) {
                 const cad2csg::Diagnostic face_diag =
                     action_result.report.diagnostics.empty()
                         ? cad2csg::Diagnostic{}
@@ -990,7 +1417,19 @@ int run_simplify_command(int argc, char** argv) {
                     std::cerr << " " << face_diag.shape_label;
                 }
                 std::cerr << ": " << face_diag.message << '\n';
+                if (!report_path.empty()
+                    && write_report_or_stdout(action_result.report,
+                                              report_path) != 0) {
+                    std::cerr << "error report_write_failed: "
+                              << report_path << '\n';
+                }
                 return EXIT_FAILURE;
+            }
+            // Op applied but other model errors remain: keep action_result.ok
+            // truthful so the outer flow can still emit (and surface what's
+            // left via diagnostics + the on-disk report).
+            if (op_recorded) {
+                action_result.ok = true;
             }
             if (comma == std::string::npos) {
                 break;
@@ -1108,18 +1547,16 @@ int run_simplify_command(int argc, char** argv) {
     if (!proposal_report_path.empty()) {
         int proposal_rc = 0;
         if (action == "--fill-hole") {
-            proposal_rc = cad2csg::write_hole_fill_proposal_json(
+            proposal_rc = write_hole_fill_proposal_or_stdout(
                 cad2csg::last_hole_fill_proposal(*session),
                 proposal_report_path);
         } else if (action == "--apply-surface-candidate") {
-            proposal_rc = cad2csg::write_surface_replacement_proposal_json(
+            proposal_rc = write_surface_proposal_or_stdout(
                 cad2csg::last_surface_replacement_proposal(*session),
                 proposal_report_path);
         } else {
-            const cad2csg::DecompositionProposal& proposal =
-                cad2csg::last_decomposition_proposal(*session);
-            proposal_rc = cad2csg::write_decomposition_proposal_json(
-                proposal,
+            proposal_rc = write_decomp_proposal_or_stdout(
+                cad2csg::last_decomposition_proposal(*session),
                 proposal_report_path);
         }
         if (proposal_rc != 0) {
@@ -1130,7 +1567,18 @@ int run_simplify_command(int argc, char** argv) {
     }
 
     if (!action_result.ok) {
+        // `action_result.ok` from finish_document_mutation is
+        // `op_succeeded && report.ok()`. The report may carry errors
+        // about *other* parts of the model (e.g., remaining spline
+        // faces) even when the requested action itself applied
+        // cleanly. When --report was requested, write the post-action
+        // report anyway so the caller can see what changed and what's
+        // still blocked. Exit code remains EXIT_FAILURE.
         print_diagnostics(action_result.report);
+        if (!report_path.empty()
+            && write_report_or_stdout(action_result.report, report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+        }
         return EXIT_FAILURE;
     }
 
@@ -1155,7 +1603,7 @@ int run_simplify_command(int argc, char** argv) {
     print_summary(result.report);
 
     if (!report_path.empty()
-        && cad2csg::write_report_json(result.report, report_path) != 0) {
+        && write_report_or_stdout(result.report, report_path) != 0) {
         std::cerr << "error report_write_failed: " << report_path << '\n';
         return EXIT_FAILURE;
     }
@@ -1168,6 +1616,7 @@ int run_simplify_command(int argc, char** argv) {
 }
 
 int run_auto_fit_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "auto-fit");
     if (argc < 5) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1220,7 +1669,7 @@ int run_auto_fit_command(int argc, char** argv) {
     print_summary(result.report);
 
     if (!report_path.empty()
-        && cad2csg::write_report_json(result.report, report_path) != 0) {
+        && write_report_or_stdout(result.report, report_path) != 0) {
         std::cerr << "error report_write_failed: " << report_path << '\n';
         return EXIT_FAILURE;
     }
@@ -1232,6 +1681,7 @@ int run_auto_fit_command(int argc, char** argv) {
 }
 
 int run_inspect_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "inspect");
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1239,16 +1689,18 @@ int run_inspect_command(int argc, char** argv) {
     const std::string input_path = argv[2];
     std::string report_path;
     std::string log_path;
+    std::string units_override;
+    std::string normalize_to;
+    double scale_override = 0.0;
 
     OptScanner scan(argc, argv, 3);
     while (!scan.done()) {
         if (scan.take_string("--report", &report_path)) continue;
         if (scan.take_string("--log", &log_path)) continue;
+        if (scan.take_string("--units", &units_override)) continue;
+        if (scan.take_string("--normalize-units", &normalize_to)) continue;
+        if (scan.take_double("--scale", &scale_override)) continue;
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
-        usage(argv[0]);
-        return EXIT_FAILURE;
-    }
-    if (report_path.empty()) {
         usage(argv[0]);
         return EXIT_FAILURE;
     }
@@ -1257,6 +1709,9 @@ int run_inspect_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
+    options.unit_override = units_override;
+    options.normalize_to_unit = normalize_to;
+    options.unit_scale_to_mm_override = scale_override;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -1271,16 +1726,230 @@ int run_inspect_command(int argc, char** argv) {
         cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
     cad2csg::ConversionReport report = inspect.report;
     print_diagnostics(report);
-    print_summary(report);
 
-    if (cad2csg::write_report_json(report, report_path) != 0) {
-        std::cerr << "error report_write_failed: " << report_path << '\n';
-        return EXIT_FAILURE;
+    // No --report: print a human-readable summary to stdout. With --report
+    // (file or `-`), write JSON there and keep a one-line summary on stderr.
+    if (report_path.empty()) {
+        print_human_inspect(std::cout, report);
+    } else {
+        print_summary(report);
+        if (write_report_or_stdout(report, report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+            return EXIT_FAILURE;
+        }
     }
     return report.ok() ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+// Human-readable face description used by `explain` to surface why a
+// face is blocking emission. Anchored on the AnalyzedFace fields the
+// analyzer already populates -- explain is a *read-only view* over
+// existing analysis, not new geometry logic.
+const char* face_blocker_reason(const cad2csg::AnalyzedFace& f) {
+    if (f.exact_csg_supported) return "supported";
+    if (f.needs_spline_replacement) return "spline (needs analytic fit)";
+    if (f.needs_surface_replacement) return "surface needs replacement";
+    if (f.needs_emitter) return "no emitter wired for this surface";
+    return "unsupported";
+}
+
+const char* face_suggested_action(const cad2csg::AnalyzedFace& f) {
+    if (f.exact_csg_supported) return "none";
+    if (f.needs_spline_replacement || f.needs_surface_replacement) {
+        return "replace-face-with-* (try `surface-suggest` to score candidates)";
+    }
+    return "decompose-by-face or manual review";
+}
+
+int run_explain_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "explain");
+    if (argc < 4) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string target_id = argv[2];
+    const std::string input_path = argv[3];
+    std::string report_path;
+
+    OptScanner scan(argc, argv, 4);
+    while (!scan.done()) {
+        if (scan.take_string("--report", &report_path)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    cad2csg::ConversionOptions options;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    cad2csg::load_step(*session, input_path);
+    cad2csg::CommandResult analysis =
+        cad2csg::analyze(*session, "doc:1", cad2csg::ReportIdMode::local);
+    const cad2csg::ConversionReport& report = analysis.report;
+
+    // Locate the target. Accept solid:N, piece:N, and face:N.M (with or
+    // without doc:1/ prefix). The analyzer's report carries one row per
+    // active solid/piece, plus one row per face per solid.
+    const cad2csg::AnalyzedSolid* solid_hit = nullptr;
+    const cad2csg::AnalyzedDecomposedPiece* piece_hit = nullptr;
+    const cad2csg::AnalyzedFace* face_hit = nullptr;
+
+    auto strip_doc_prefix = [](std::string s) {
+        const std::string prefix = "doc:1/";
+        if (s.rfind(prefix, 0) == 0) s.erase(0, prefix.size());
+        return s;
+    };
+    const std::string id = strip_doc_prefix(target_id);
+
+    for (const cad2csg::AnalyzedSolid& s : report.solids) {
+        if (s.id == id) { solid_hit = &s; break; }
+    }
+    if (!solid_hit) {
+        for (const cad2csg::AnalyzedDecomposedPiece& p : report.decomposed_pieces) {
+            if (p.id == id) { piece_hit = &p; break; }
+        }
+    }
+    if (!solid_hit && !piece_hit) {
+        for (const cad2csg::AnalyzedFace& f : report.faces) {
+            if (f.id == id) { face_hit = &f; break; }
+        }
+    }
+
+    if (!solid_hit && !piece_hit && !face_hit) {
+        std::cerr << "error explain_target_not_found: '" << target_id
+                  << "' is not a solid, piece, or face in this STEP\n";
+        return EXIT_FAILURE;
+    }
+
+    // Print a human-readable explanation. Exit code reflects whether
+    // the target is already emit-ready: 0 if ready, 1 if it still
+    // needs a decision/decompose/replace.
+    bool target_ready = false;
+
+    if (solid_hit) {
+        target_ready = solid_hit->exact_csg_supported;
+        std::cout << "explain " << target_id << "\n";
+        std::cout << "  kind:    solid\n";
+        std::cout << "  status:  " << solid_status_label(*solid_hit) << "\n";
+        std::cout << "  volume:  " << solid_hit->volume;
+        if (!report.length_unit.empty()) std::cout << " " << report.length_unit << "^3";
+        std::cout << "\n";
+        if (!solid_hit->name.empty()) {
+            std::cout << "  name:    " << solid_hit->name << "\n";
+        }
+        if (target_ready) {
+            std::cout << "  ready:   yes; emit will produce exact CSG.\n";
+        } else {
+            std::cout << "  ready:   no\n";
+            if (solid_hit->needs_decomposition) {
+                std::cout << "  blocker: non-convex (needs decomposition)\n";
+            }
+            if (solid_hit->needs_spline_replacement) {
+                std::cout << "  blocker: spline face(s) need analytic fit\n";
+            }
+            if (solid_hit->needs_surface_replacement) {
+                std::cout << "  blocker: face surface(s) need replacement\n";
+            }
+            if (solid_hit->needs_user_decision) {
+                std::cout << "  blocker: user decision required\n";
+            }
+        }
+
+        // Per-face details for blocking faces.
+        std::vector<const cad2csg::AnalyzedFace*> blocking_faces;
+        for (const cad2csg::AnalyzedFace& f : report.faces) {
+            if (f.solid_id == solid_hit->id && !f.exact_csg_supported) {
+                blocking_faces.push_back(&f);
+            }
+        }
+        if (!blocking_faces.empty()) {
+            std::cout << "\nBlocking faces:\n";
+            for (const cad2csg::AnalyzedFace* f : blocking_faces) {
+                std::cout << "  " << f->id << "  type=" << f->surface_type
+                          << "  " << face_blocker_reason(*f) << "\n";
+                std::cout << "    action: " << face_suggested_action(*f) << "\n";
+            }
+        }
+
+        // Decomposition proposals (if non-convex).
+        if (solid_hit->needs_decomposition) {
+            cad2csg::DecompositionProposal proposal =
+                cad2csg::propose_decomposition(*session, solid_hit->id,
+                                                cad2csg::ReportIdMode::local);
+            std::cout << "\nDecomposition candidates: " << proposal.candidates.size();
+            if (!proposal.best_candidate_id.empty()) {
+                std::cout << " (best: " << proposal.best_candidate_id << ")";
+            }
+            std::cout << "\n";
+            const std::size_t limit = std::min<std::size_t>(
+                3, proposal.candidates.size());
+            for (std::size_t i = 0; i < limit; ++i) {
+                const cad2csg::DecompositionCandidate& c = proposal.candidates[i];
+                std::cout << "  " << c.id << "  " << c.tool_kind
+                          << "  confidence=" << c.confidence
+                          << "  pieces=" << c.piece_count
+                          << "  rel_delta=" << c.relative_delta << "\n";
+            }
+            if (proposal.candidates.size() > limit) {
+                std::cout << "  ... (" << (proposal.candidates.size() - limit)
+                          << " more; run `decompose-suggest` for the full list)\n";
+            }
+        }
+    } else if (piece_hit) {
+        target_ready = piece_hit->exact_csg_supported;
+        std::cout << "explain " << target_id << "\n";
+        std::cout << "  kind:    piece (from decomposition)\n";
+        std::cout << "  source:  " << piece_hit->source_solid_id << "\n";
+        std::cout << "  volume:  " << piece_hit->volume;
+        if (!report.length_unit.empty()) std::cout << " " << report.length_unit << "^3";
+        std::cout << "\n";
+        std::cout << "  ready:   " << (target_ready ? "yes" : "no") << "\n";
+    } else if (face_hit) {
+        target_ready = face_hit->exact_csg_supported;
+        std::cout << "explain " << target_id << "\n";
+        std::cout << "  kind:    face\n";
+        std::cout << "  type:    " << face_hit->surface_type << "\n";
+        std::cout << "  solid:   " << face_hit->solid_id << "\n";
+        std::cout << "  area:    " << face_hit->area << "\n";
+        std::cout << "  ready:   " << (target_ready ? "yes" : "no") << "\n";
+        if (!target_ready) {
+            std::cout << "  blocker: " << face_blocker_reason(*face_hit) << "\n";
+            std::cout << "  action:  " << face_suggested_action(*face_hit) << "\n";
+            // Surface-replacement candidates for non-ready faces.
+            cad2csg::SurfaceReplacementProposal proposal =
+                cad2csg::propose_surface_replacement(*session, face_hit->id,
+                                                       cad2csg::ReportIdMode::local);
+            if (!proposal.candidates.empty()) {
+                std::cout << "\nSurface-replacement candidates: "
+                          << proposal.candidates.size();
+                if (!proposal.best_candidate_id.empty()) {
+                    std::cout << " (best: " << proposal.best_candidate_id << ")";
+                }
+                std::cout << "\n";
+                const std::size_t limit = std::min<std::size_t>(
+                    3, proposal.candidates.size());
+                for (std::size_t i = 0; i < limit; ++i) {
+                    const cad2csg::SurfaceReplacementCandidate& c =
+                        proposal.candidates[i];
+                    std::cout << "  " << c.id << "  " << c.kind
+                              << "  confidence=" << c.confidence
+                              << "  max_dev=" << c.max_deviation << "\n";
+                }
+            }
+        }
+    }
+
+    if (!report_path.empty()) {
+        if (write_report_or_stdout(report, report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+
+    return target_ready ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
 int run_decompose_apply_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "decompose-apply");
     if (argc < 5) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1487,7 +2156,7 @@ int run_decompose_apply_command(int argc, char** argv) {
     print_summary(result.report);
 
     if (!report_path.empty()
-        && cad2csg::write_report_json(result.report, report_path) != 0) {
+        && write_report_or_stdout(result.report, report_path) != 0) {
         std::cerr << "error report_write_failed: " << report_path << '\n';
         return EXIT_FAILURE;
     }
@@ -1499,6 +2168,7 @@ int run_decompose_apply_command(int argc, char** argv) {
 }
 
 int run_preprocess_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "preprocess");
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1517,6 +2187,8 @@ int run_preprocess_command(int argc, char** argv) {
     std::size_t max_splits_value = 16;
     std::size_t max_targets_value = 0;
     std::vector<std::string> selected_targets;
+    bool safe_all = false;
+    bool dry_run = false;
 
     OptScanner scan(argc, argv, 3);
     while (!scan.done()) {
@@ -1536,13 +2208,22 @@ int run_preprocess_command(int argc, char** argv) {
         }
         if (scan.take_flag("--allow-medium-confidence-auto")) { allow_medium = true; continue; }
         if (scan.take_flag("--allow-bbox-fallback-auto")) { allow_bbox_fallback = true; continue; }
+        if (scan.take_flag("--safe-all")) { safe_all = true; continue; }
+        if (scan.take_flag("--dry-run")) { dry_run = true; continue; }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
     }
-    if (step_out_path.empty()) {
-        std::cerr << "error preprocess_requires_out_step: preprocess requires --out-step\n";
+    if (step_out_path.empty() && !dry_run) {
+        std::cerr << "error preprocess_requires_out_step: preprocess requires --out-step (omit only with --dry-run)\n";
         return EXIT_FAILURE;
+    }
+    // --safe-all implies the safe removal policy unless one is given
+    // explicitly. Hole fills stay opt-in per
+    // HOLE_FILL_IMPLEMENTATION_PLAN.md (fills are modeling decisions,
+    // not safe ops).
+    if (safe_all && apply_removal_confidence.empty()) {
+        apply_removal_confidence = "high";
     }
 
     cad2csg::DecompositionPolicy policy;
@@ -1587,12 +2268,41 @@ int run_preprocess_command(int argc, char** argv) {
     }
     const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input_path);
 
+    // --safe-all extends preprocess with a leading auto-fit pass over
+    // spline faces that meet --max-deviation. This is the only place
+    // we touch face geometry; the rest of preprocess still operates
+    // on whole solids. Skipped in --dry-run mode -- we just count.
+    std::size_t auto_fit_applied = 0;
+    std::size_t auto_fit_seen = 0;
+    if (safe_all && !dry_run) {
+        cad2csg::AutoFitCommandResult af =
+            cad2csg::auto_fit_splines_with_summary(
+                *session, document_id,
+                /*has_max_deviation=*/false, /*max_deviation=*/0.0,
+                cad2csg::ReportIdMode::local);
+        auto_fit_applied = af.summary.applied;
+        auto_fit_seen = af.summary.spline_faces_seen;
+        std::cerr << "preprocess: auto-fit replaced " << auto_fit_applied
+                  << "/" << auto_fit_seen << " spline faces"
+                  << " (over-budget=" << af.summary.skipped_over_budget
+                  << ", no-fit=" << af.summary.skipped_no_fit << ")\n";
+    } else if (safe_all && dry_run) {
+        cad2csg::CommandResult analyse =
+            cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
+        for (const cad2csg::AnalyzedFace& f : analyse.report.faces) {
+            if (f.needs_spline_replacement) ++auto_fit_seen;
+        }
+        std::cerr << "preprocess [dry-run]: would auto-fit up to "
+                  << auto_fit_seen << " spline faces\n";
+    }
+
+    std::size_t removed = 0;
+    std::size_t removal_candidates_total = 0;
     if (!apply_removal_confidence.empty()) {
         cad2csg::RemovalProposal removals =
             cad2csg::suggest_removals(*session,
                                       document_id,
                                       cad2csg::ReportIdMode::local);
-        std::size_t removed = 0;
         for (const cad2csg::RemovalCandidate& candidate : removals.candidates) {
             const bool allowed = candidate.confidence == "high"
                 || (apply_removal_confidence == "medium"
@@ -1600,6 +2310,8 @@ int run_preprocess_command(int argc, char** argv) {
             if (!allowed || candidate.suggested_action == "manual") {
                 continue;
             }
+            ++removal_candidates_total;
+            if (dry_run) continue;
             cad2csg::CommandResult r =
                 cad2csg::remove_solid(*session,
                                       candidate.solid_id,
@@ -1608,9 +2320,16 @@ int run_preprocess_command(int argc, char** argv) {
                 ++removed;
             }
         }
-        std::cerr << "preprocess: removed " << removed
-                  << " component(s) from removal candidates"
-                  << " (policy=" << apply_removal_confidence << ")\n";
+        if (dry_run) {
+            std::cerr << "preprocess [dry-run]: would remove "
+                      << removal_candidates_total
+                      << " component(s) (policy=" << apply_removal_confidence
+                      << ")\n";
+        } else {
+            std::cerr << "preprocess: removed " << removed
+                      << " component(s) from removal candidates"
+                      << " (policy=" << apply_removal_confidence << ")\n";
+        }
     }
 
     cad2csg::CommandResult analysis =
@@ -1635,54 +2354,334 @@ int run_preprocess_command(int argc, char** argv) {
     std::size_t succeeded = 0;
     std::size_t needs_decision = 0;
     std::size_t other_failure = 0;
-    for (const std::string& id : targets) {
-        ++attempted;
-        cad2csg::CommandResult r =
-            cad2csg::auto_decompose_bsp(*session, id,
-                                        static_cast<int>(max_depth_value),
-                                        policy,
-                                        cad2csg::ReportIdMode::local,
-                                        /*defer_analysis=*/true);
-        if (r.ok) {
-            ++succeeded;
-        } else {
-            const bool stuck_on_confidence = std::any_of(
-                r.report.diagnostics.begin(), r.report.diagnostics.end(),
-                [](const cad2csg::Diagnostic& d) {
-                    return d.code == "auto_decompose_bsp_needs_decision";
-                });
-            if (stuck_on_confidence) ++needs_decision;
-            else ++other_failure;
+    if (dry_run) {
+        std::cerr << "preprocess [dry-run]: would attempt BSP decomposition on "
+                  << targets.size() << " non-convex target(s)"
+                  << " (policy=" << policy_name
+                  << ", max-depth=" << max_depth_value << ")\n";
+    } else {
+        for (const std::string& id : targets) {
+            ++attempted;
+            cad2csg::CommandResult r =
+                cad2csg::auto_decompose_bsp(*session, id,
+                                            static_cast<int>(max_depth_value),
+                                            policy,
+                                            cad2csg::ReportIdMode::local,
+                                            /*defer_analysis=*/true);
+            if (r.ok) {
+                ++succeeded;
+            } else {
+                const bool stuck_on_confidence = std::any_of(
+                    r.report.diagnostics.begin(), r.report.diagnostics.end(),
+                    [](const cad2csg::Diagnostic& d) {
+                        return d.code == "auto_decompose_bsp_needs_decision";
+                    });
+                if (stuck_on_confidence) ++needs_decision;
+                else ++other_failure;
+            }
         }
     }
 
-    std::cerr << "preprocess: " << succeeded << "/" << attempted
-              << " selected non-convex solid(s) decomposed"
-              << " (selected=" << targets.size()
-              << ", available=" << available_targets
-              << ", policy=" << policy_name
-              << ", max-depth=" << max_depth_value
-              << ", max-splits=" << max_splits_value << ")\n";
-    if (needs_decision > 0) {
-        std::cerr << "  " << needs_decision
-                  << " stopped on low-confidence candidates.\n";
-    }
-    if (other_failure > 0) {
-        std::cerr << "  " << other_failure
-                  << " failed for other reasons; see report diagnostics.\n";
+    if (!dry_run) {
+        std::cerr << "preprocess: " << succeeded << "/" << attempted
+                  << " selected non-convex solid(s) decomposed"
+                  << " (selected=" << targets.size()
+                  << ", available=" << available_targets
+                  << ", policy=" << policy_name
+                  << ", max-depth=" << max_depth_value
+                  << ", max-splits=" << max_splits_value << ")\n";
+        if (needs_decision > 0) {
+            std::cerr << "  " << needs_decision
+                      << " stopped on low-confidence candidates.\n";
+        }
+        if (other_failure > 0) {
+            std::cerr << "  " << other_failure
+                      << " failed for other reasons; see report diagnostics.\n";
+        }
     }
 
+    // --dry-run never mutates beyond what we already counted; emit the
+    // closing summary (if --safe-all) and exit.
+    if (dry_run) {
+        if (safe_all) {
+            std::cerr << "preprocess [safe-all] summary: would auto-fit "
+                      << auto_fit_seen << " spline face(s), remove "
+                      << removal_candidates_total << " component(s), "
+                      << "decompose " << targets.size()
+                      << " non-convex target(s)\n";
+        }
+        return EXIT_SUCCESS;
+    }
+
+    // Run export BEFORE the final analyze so performance counters
+    // (export_step_ms) accumulate before we serialize the report.
     cad2csg::CommandResult step_result =
         cad2csg::export_document_step(*session, document_id, step_out_path,
                                       cad2csg::ReportIdMode::local);
 
+    // Re-analyze once so the closing summary and the on-disk report
+    // both reflect the final post-mutation state; this also picks up
+    // the export_step_ms accumulated by the call above.
+    cad2csg::CommandResult final_analysis =
+        cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
+
+    // Closing "what's left for you" summary. After all safe ops, count
+    // solids that still need attention. This is the user-facing answer
+    // to "what does --safe-all leave behind?".
+    if (safe_all) {
+        std::size_t still_needs = 0;
+        std::size_t still_decisions = 0;
+        for (const cad2csg::AnalyzedSolid& s : final_analysis.report.solids) {
+            if (s.exact_csg_supported) continue;
+            ++still_needs;
+            if (s.needs_user_decision) ++still_decisions;
+        }
+        std::cerr << "preprocess [safe-all] summary: "
+                  << "auto-fit=" << auto_fit_applied
+                  << ", removed=" << removed
+                  << ", decomposed=" << succeeded
+                  << "; remaining=" << still_needs
+                  << " solid(s) need attention (" << still_decisions
+                  << " require user decisions)\n";
+    }
+
     if (!report_path.empty()
-        && cad2csg::write_report_json(step_result.report, report_path) != 0) {
+        && write_report_or_stdout(final_analysis.report, report_path) != 0) {
         std::cerr << "error report_write_failed: " << report_path << '\n';
         return EXIT_FAILURE;
     }
 
     return step_result.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+// `propose` and `apply` are the noun-first front door for the
+// proposal/apply idiom (WS6 of UX_AND_FEATURES_IMPLEMENTATION_PLAN.md).
+// They dispatch by <kind> to the existing session calls (the engine
+// surfaces are unchanged) so old recipes/scripts continue to work.
+
+int run_propose_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "propose");
+    if (argc < 4) {
+        std::cerr << "error propose_missing_args: "
+                  << "usage: propose <kind> <target?> input.step [options]\n";
+        return EXIT_FAILURE;
+    }
+    const std::string kind = argv[2];
+
+    // Parse positional args by kind. decompose/surface require a target
+    // (solid:N or face:N.M); removal and hole-fill take none.
+    std::string target_id;
+    std::string input_path;
+    int opts_start = 0;
+    if (kind == "decompose" || kind == "surface") {
+        if (argc < 5) {
+            std::cerr << "error propose_missing_args: "
+                      << "propose " << kind << " needs <target> input.step\n";
+            return EXIT_FAILURE;
+        }
+        target_id = argv[3];
+        input_path = argv[4];
+        opts_start = 5;
+    } else if (kind == "removal" || kind == "hole-fill") {
+        input_path = argv[3];
+        opts_start = 4;
+    } else {
+        std::cerr << "error propose_unknown_kind: '" << kind
+                  << "' (expected decompose|surface|removal|hole-fill)\n";
+        return EXIT_FAILURE;
+    }
+
+    std::string report_path;
+    cad2csg::HoleFillOptions hole_options;
+    OptScanner scan(argc, argv, opts_start);
+    while (!scan.done()) {
+        if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--host", &hole_options.host_solid_id)) continue;
+        if (scan.take_string("--near-removed",
+                             &hole_options.near_removed_solid_id)) continue;
+        if (scan.take_double("--max-radius",
+                             &hole_options.max_radius,
+                             &hole_options.has_max_radius)) continue;
+        if (scan.take_double("--max-volume-fraction",
+                             &hole_options.max_volume_fraction,
+                             &hole_options.has_max_volume_fraction)) continue;
+        if (scan.take_size("--max-candidates",
+                           &hole_options.max_candidates)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        return EXIT_FAILURE;
+    }
+
+    cad2csg::ConversionOptions options;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    const cad2csg::DocumentId document_id =
+        cad2csg::load_step(*session, input_path);
+
+    if (kind == "decompose") {
+        cad2csg::DecompositionProposal p =
+            cad2csg::propose_decomposition(*session, target_id,
+                                            cad2csg::ReportIdMode::local);
+        if (!report_path.empty()) {
+            if (write_decomp_proposal_or_stdout(p, report_path) != 0) {
+                std::cerr << "error report_write_failed: " << report_path << '\n';
+                return EXIT_FAILURE;
+            }
+        } else {
+            std::cout << cad2csg::decomposition_proposal_json_string(p);
+        }
+        std::cerr << "propose decompose: " << p.candidates.size()
+                  << " candidate(s), best: "
+                  << (p.best_candidate_id.empty() ? "-" : p.best_candidate_id)
+                  << ", ok: " << (p.ok ? "true" : "false") << '\n';
+        return p.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (kind == "surface") {
+        cad2csg::SurfaceReplacementProposal p =
+            cad2csg::propose_surface_replacement(*session, target_id,
+                                                  cad2csg::ReportIdMode::local);
+        if (!report_path.empty()) {
+            if (write_surface_proposal_or_stdout(p, report_path) != 0) {
+                std::cerr << "error report_write_failed: " << report_path << '\n';
+                return EXIT_FAILURE;
+            }
+        } else {
+            std::cout << cad2csg::surface_replacement_proposal_json_string(p);
+        }
+        std::cerr << "propose surface: " << p.candidates.size()
+                  << " candidate(s), best: "
+                  << (p.best_candidate_id.empty() ? "-" : p.best_candidate_id)
+                  << ", ok: " << (p.ok ? "true" : "false") << '\n';
+        return p.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (kind == "removal") {
+        cad2csg::RemovalProposal p =
+            cad2csg::suggest_removals(*session, document_id,
+                                       cad2csg::ReportIdMode::local);
+        if (!report_path.empty()) {
+            if (write_removal_proposal_or_stdout(p, report_path) != 0) {
+                std::cerr << "error report_write_failed: " << report_path << '\n';
+                return EXIT_FAILURE;
+            }
+        } else {
+            std::cout << cad2csg::removal_proposal_json_string(p);
+        }
+        std::cerr << "propose removal: " << p.candidates.size()
+                  << " candidate(s), high-confidence: " << p.high_confidence_count
+                  << ", ok: " << (p.ok ? "true" : "false") << '\n';
+        return p.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    // kind == "hole-fill"
+    cad2csg::HoleFillProposal p =
+        cad2csg::propose_hole_fills(*session, document_id, hole_options,
+                                     cad2csg::ReportIdMode::local);
+    if (!report_path.empty()) {
+        if (write_hole_fill_proposal_or_stdout(p, report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+            return EXIT_FAILURE;
+        }
+    } else {
+        std::cout << cad2csg::hole_fill_proposal_json_string(p);
+    }
+    std::cerr << "propose hole-fill: " << p.candidates.size()
+              << " candidate(s), ok: " << (p.ok ? "true" : "false") << '\n';
+    return p.ok ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int run_apply_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "apply");
+    if (argc < 5) {
+        std::cerr << "error apply_missing_args: "
+                  << "usage: apply <kind> <target> input.step --out out.i [options]\n";
+        return EXIT_FAILURE;
+    }
+    const std::string kind = argv[2];
+    const std::string target_id = argv[3];
+    const std::string input_path = argv[4];
+
+    std::string output_path;
+    std::string report_path;
+    std::string log_path;
+    std::string candidate_id;
+    OptScanner scan(argc, argv, 5);
+    while (!scan.done()) {
+        if (scan.take_string("--out", &output_path)) continue;
+        if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--log", &log_path)) continue;
+        if (scan.take_string("--candidate", &candidate_id)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        return EXIT_FAILURE;
+    }
+    if (output_path.empty()) {
+        std::cerr << "error apply_requires_out: apply requires --out output.i\n";
+        return EXIT_FAILURE;
+    }
+    const bool needs_candidate =
+        (kind == "decompose" || kind == "surface" || kind == "hole-fill");
+    if (needs_candidate && candidate_id.empty()) {
+        std::cerr << "error apply_requires_candidate: "
+                  << "apply " << kind << " needs --candidate candidate:N\n";
+        return EXIT_FAILURE;
+    }
+
+    cad2csg::ConversionOptions options;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    if (!log_path.empty()) {
+        try {
+            cad2csg::attach_decision_log(*session, log_path, input_path);
+        } catch (const std::exception& e) {
+            std::cerr << "error decision_log_open_failed: " << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    const cad2csg::DocumentId document_id =
+        cad2csg::load_step(*session, input_path);
+
+    cad2csg::CommandResult action_result;
+    if (kind == "decompose") {
+        action_result = cad2csg::apply_decomposition_candidate(
+            *session, target_id, candidate_id, cad2csg::ReportIdMode::local);
+    } else if (kind == "surface") {
+        action_result = cad2csg::apply_surface_replacement_candidate(
+            *session, target_id, candidate_id, cad2csg::ReportIdMode::local);
+    } else if (kind == "removal") {
+        action_result = cad2csg::remove_solid(
+            *session, target_id, cad2csg::ReportIdMode::local);
+    } else if (kind == "hole-fill") {
+        action_result = cad2csg::fill_hole(
+            *session, document_id, candidate_id, cad2csg::ReportIdMode::local);
+    } else {
+        std::cerr << "error apply_unknown_kind: '" << kind
+                  << "' (expected decompose|surface|removal|hole-fill)\n";
+        return EXIT_FAILURE;
+    }
+
+    if (!action_result.ok) {
+        // Same pattern as run_simplify_command: if --report was given,
+        // write the post-action report so the caller can see what
+        // changed and what's still blocked. See the longer comment in
+        // run_simplify_command for the rationale.
+        print_diagnostics(action_result.report);
+        if (!report_path.empty()
+            && write_report_or_stdout(action_result.report, report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+        }
+        return EXIT_FAILURE;
+    }
+
+    cad2csg::CommandResult emit_result =
+        cad2csg::emit_document(*session, document_id, output_path,
+                                cad2csg::ReportIdMode::local);
+    print_diagnostics(emit_result.report);
+    print_summary(emit_result.report);
+
+    if (!report_path.empty()
+        && write_report_or_stdout(emit_result.report, report_path) != 0) {
+        std::cerr << "error report_write_failed: " << report_path << '\n';
+        return EXIT_FAILURE;
+    }
+    if (!emit_result.report.ok() || emit_result.report.solids_converted == 0) {
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
 }
 
 int run_default_convert(int argc, char** argv) {
@@ -1712,6 +2711,7 @@ int run_default_convert(int argc, char** argv) {
 }
 
 int run_replay_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "replay");
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1743,6 +2743,7 @@ int run_replay_command(int argc, char** argv) {
 }
 
 int run_compact_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "compact");
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1766,6 +2767,7 @@ int run_compact_command(int argc, char** argv) {
 }
 
 int run_dump_assembly_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "dump-assembly");
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1906,6 +2908,7 @@ void print_assembly_node_tree(
 }
 
 int run_inspect_tree_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "inspect-tree");
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1983,6 +2986,11 @@ int run_inspect_tree_command(int argc, char** argv) {
 }
 
 int run_lua_command(int argc, char** argv) {
+    if (argc >= 3
+        && (std::strcmp(argv[2], "--help") == 0
+            || std::strcmp(argv[2], "-h") == 0)) {
+        return print_verb_help_and_exit(argv[0], "lua");
+    }
     if (argc < 3) {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -2006,7 +3014,25 @@ int main(int argc, char** argv) {
     }
 
     const std::string verb = argv[1];
+
+    // help / --help / -h: print global usage on stdout (exit 0). With a
+    // second arg, treat it as a verb name and print that verb's help.
+    if (verb == "help" || verb == "--help" || verb == "-h") {
+        if (argc >= 3) {
+            const VerbHelp* v = lookup_verb_help(argv[2]);
+            if (!v) {
+                std::cerr << "error unknown_verb: " << argv[2] << '\n';
+                return EXIT_FAILURE;
+            }
+            print_verb_help(std::cout, argv[0], *v);
+            return EXIT_SUCCESS;
+        }
+        print_global_usage(std::cout, argv[0]);
+        return EXIT_SUCCESS;
+    }
+
     if (verb == "inspect") return run_inspect_command(argc, argv);
+    if (verb == "explain") return run_explain_command(argc, argv);
     if (verb == "decision-pack") return run_decision_pack_command(argc, argv);
     if (verb == "dump-assembly") return run_dump_assembly_command(argc, argv);
     if (verb == "inspect-tree") return run_inspect_tree_command(argc, argv);
@@ -2021,9 +3047,26 @@ int main(int argc, char** argv) {
     if (verb == "volume")  return run_volume_command(argc, argv);
     if (verb == "simplify") return run_simplify_command(argc, argv);
     if (verb == "auto-fit") return run_auto_fit_command(argc, argv);
+    if (verb == "propose") return run_propose_command(argc, argv);
+    if (verb == "apply") return run_apply_command(argc, argv);
     if (verb == "lua") return run_lua_command(argc, argv);
     if (verb == "viewer-check") return run_viewer_check_command();
     if (verb == "view") return run_view_command(argc, argv);
+
+    // Fall-through: distinguish typo'd verbs from the bare two-arg
+    // convert form (`input.step output.i`). Treat argv[1] as a path
+    // only if it looks like one (.step/.stp suffix, contains /, or
+    // exists on disk); otherwise report the typo with a did-you-mean.
+    if (!is_step_path_like(argv[1])) {
+        std::cerr << "error unknown_command: '" << argv[1] << "'";
+        const char* suggestion = suggest_verb(argv[1]);
+        if (suggestion) {
+            std::cerr << " (did you mean '" << suggestion << "'?)";
+        }
+        std::cerr << "\n";
+        std::cerr << "Run `" << argv[0] << " help` to list verbs.\n";
+        return 2;
+    }
 
     return run_default_convert(argc, argv);
 }

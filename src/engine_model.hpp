@@ -87,6 +87,12 @@ struct FaceReplacement {
 struct CadModel {
     std::string source_path;
     TopoDS_Shape root;
+    // STEP length unit captured at import. Empty `length_unit` means
+    // the importer could not determine the unit; downstream code
+    // should treat the values as being in OCCT's native units (mm) but
+    // still surface the ambiguity in the report.
+    std::string length_unit;
+    double length_unit_to_mm = 1.0;
     std::vector<Diagnostic> diagnostics;
     std::vector<std::string> removed_solid_ids;
     std::vector<SyntheticBody> synthetic_bodies;

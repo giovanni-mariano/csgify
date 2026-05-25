@@ -604,6 +604,8 @@ AnalysisReport analyze_model(const CadModel& model,
     AnalysisReport report;
     report.diagnostics = model.diagnostics;
     report.assembly = model.assembly;
+    report.length_unit = model.length_unit;
+    report.length_unit_to_mm = model.length_unit_to_mm;
 
     if (model.root.IsNull()) {
         return report;

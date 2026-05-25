@@ -457,11 +457,28 @@ struct ConversionOptions {
     bool require_convex_cells = true;
     bool try_planar_decomposition = true;
     bool split_union_cells = true;
+    // Unit overrides applied at STEP import. Per docs/PHILOSOPHY.md
+    // ("make failure visible"), the default is report-only: the
+    // importer captures the declared STEP unit but does not silently
+    // rescale geometry. The user opts into rescaling explicitly via
+    // --normalize-units, and the change is recorded in the decision
+    // log when one is attached.
+    std::string unit_override;        // assert the source unit (no rescale)
+    double unit_scale_to_mm_override = 0.0;  // assert scale (no rescale)
+    std::string normalize_to_unit;    // actually rescale geometry to this unit
 };
 
 struct ConversionReport {
     std::string document_id;
     std::string source_path;
+    // STEP length unit metadata. `length_unit` is a short label
+    // ("mm", "cm", "m", "in", "ft", ...); `length_unit_to_mm` is the
+    // factor that converts a value in `length_unit` to millimetres.
+    // Default 1.0 / "mm" matches OCCT's internal representation: when
+    // STEP units are unknown the model stays in OCCT's native units
+    // and no rescaling happens.
+    std::string length_unit;
+    double length_unit_to_mm = 1.0;
     std::vector<Diagnostic> diagnostics;
     std::size_t solids_seen = 0;
     std::size_t solids_converted = 0;
