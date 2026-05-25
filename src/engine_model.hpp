@@ -59,6 +59,9 @@ struct SyntheticBody {
     double top_radius = 0.0;
     std::string left_id;
     std::string right_id;
+    std::string role;
+    std::string host_solid_id;
+    std::string source_solid_id;
     int material_id = 1;
     double density = 0.0;
     bool emit_as_cell = true;
@@ -159,10 +162,38 @@ bool decompose_solid_by_face(CadModel& model,
                              const std::string& face_id,
                              const ConversionOptions& options = {});
 
+// Split a solid (or decomposed piece) with an explicit infinite plane.
+// Used by the BSP loop when the chosen candidate is a synthetic
+// bbox-axis plane that does not correspond to any face on the target.
+bool decompose_solid_by_plane(CadModel& model,
+                              const std::string& solid_id,
+                              const Vec3& origin,
+                              const Vec3& normal,
+                              const ConversionOptions& options = {});
+
+// Split a solid with multiple planes applied simultaneously. All planes
+// are handed to a single BRepAlgoAPI_Splitter call, so the operation
+// produces every resulting piece in one shot. Useful when one cut alone
+// would not bisect a part with several parallel concavities.
+bool decompose_solid_by_planes(CadModel& model,
+                               const std::string& solid_id,
+                               const std::vector<PlaneSpec>& planes,
+                               const ConversionOptions& options = {});
+
 DecompositionProposal propose_decomposition_candidates(
     const CadModel& model,
     const std::string& solid_id,
     const ConversionOptions& options = {});
+
+DecompositionProposal propose_bsp_decomposition_candidates(
+    const CadModel& model,
+    const std::string& solid_id,
+    const ConversionOptions& options = {});
+
+bool decomposition_target_exact_csg_supported(const CadModel& model,
+                                             const std::string& solid_id,
+                                             const ConversionOptions& options,
+                                             bool* found_out);
 
 std::string add_synthetic_box(CadModel& model,
                               const BBox& bbox,

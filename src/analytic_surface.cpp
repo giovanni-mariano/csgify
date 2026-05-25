@@ -80,6 +80,23 @@ std::string surface_type_name(GeomAbs_SurfaceType type) {
     return "unknown";
 }
 
+std::string surface_support_kind_name(GeomAbs_SurfaceType type) {
+    switch (type) {
+    case GeomAbs_Plane: return "plane";
+    case GeomAbs_Cylinder: return "cylinder";
+    case GeomAbs_Cone: return "cone";
+    case GeomAbs_Sphere: return "sphere";
+    case GeomAbs_Torus: return "torus";
+    case GeomAbs_BezierSurface: return "bezier";
+    case GeomAbs_BSplineSurface: return "bspline";
+    case GeomAbs_SurfaceOfRevolution: return "surface_of_revolution";
+    case GeomAbs_SurfaceOfExtrusion: return "surface_of_extrusion";
+    case GeomAbs_OffsetSurface: return "offset";
+    case GeomAbs_OtherSurface: return "unknown";
+    }
+    return "unknown";
+}
+
 bool surface_type_is_spline(GeomAbs_SurfaceType type) {
     return type == GeomAbs_BSplineSurface || type == GeomAbs_BezierSurface;
 }

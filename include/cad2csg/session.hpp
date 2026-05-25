@@ -99,6 +99,17 @@ CommandResult replace_face_with_fit(Session& session,
                                     double max_deviation,
                                     ReportIdMode id_mode = ReportIdMode::scoped);
 
+SurfaceReplacementProposal propose_surface_replacement(
+    Session& session,
+    const std::string& face_shape_id,
+    ReportIdMode id_mode = ReportIdMode::scoped);
+
+CommandResult apply_surface_replacement_candidate(
+    Session& session,
+    const std::string& face_shape_id,
+    const std::string& candidate_id,
+    ReportIdMode id_mode = ReportIdMode::scoped);
+
 CommandResult auto_fit_splines(Session& session,
                                const DocumentId& document_id,
                                bool has_max_deviation,
@@ -114,10 +125,35 @@ CommandResult decompose_by_face(Session& session,
                                 const std::string& face_shape_id,
                                 ReportIdMode id_mode = ReportIdMode::scoped);
 
+CommandResult decompose_by_plane(Session& session,
+                                 const std::string& solid_shape_id,
+                                 const Vec3& origin,
+                                 const Vec3& normal,
+                                 ReportIdMode id_mode = ReportIdMode::scoped);
+
+CommandResult decompose_by_planes(Session& session,
+                                  const std::string& solid_shape_id,
+                                  const std::vector<PlaneSpec>& planes,
+                                  ReportIdMode id_mode = ReportIdMode::scoped);
+
 DecompositionProposal propose_decomposition(
     Session& session,
     const std::string& solid_shape_id,
     ReportIdMode id_mode = ReportIdMode::scoped);
+
+RemovalProposal suggest_removals(Session& session,
+                                 const DocumentId& document_id,
+                                 ReportIdMode id_mode = ReportIdMode::scoped);
+
+HoleFillProposal propose_hole_fills(Session& session,
+                                    const DocumentId& document_id,
+                                    const HoleFillOptions& hole_options = {},
+                                    ReportIdMode id_mode = ReportIdMode::scoped);
+
+CommandResult fill_hole(Session& session,
+                        const DocumentId& document_id,
+                        const std::string& candidate_id,
+                        ReportIdMode id_mode = ReportIdMode::scoped);
 
 CommandResult apply_decomposition_candidate(
     Session& session,
@@ -125,11 +161,19 @@ CommandResult apply_decomposition_candidate(
     const std::string& candidate_id,
     ReportIdMode id_mode = ReportIdMode::scoped);
 
+// Batched callers (decompose-apply) that invoke auto_decompose_bsp once
+// per target can pass defer_analysis=true to skip the trailing full
+// analyze_model() pass. The BSP loop still uses the cheap
+// decomposition_target_exact_csg_supported query internally to decide
+// when each piece is convex; only the final report-shaped analyze is
+// what gets deferred. The caller is then responsible for running one
+// `analyze` at the end before emit/export.
 CommandResult auto_decompose_bsp(Session& session,
                                  const std::string& shape_id,
                                  int max_depth = 4,
                                  const DecompositionPolicy& policy = {},
-                                 ReportIdMode id_mode = ReportIdMode::scoped);
+                                 ReportIdMode id_mode = ReportIdMode::scoped,
+                                 bool defer_analysis = false);
 
 CommandResult emit_document(Session& session,
                             const DocumentId& document_id,
@@ -161,6 +205,11 @@ AutoFitCommandResult auto_fit_splines_with_summary(
 const ConversionReport& last_report(const Session& session);
 
 const DecompositionProposal& last_decomposition_proposal(const Session& session);
+
+const HoleFillProposal& last_hole_fill_proposal(const Session& session);
+
+const SurfaceReplacementProposal& last_surface_replacement_proposal(
+    const Session& session);
 
 std::size_t document_count(const Session& session);
 

@@ -52,6 +52,8 @@ std::string category_for(const std::string& op) {
     if (op == "remove_solid") return "solid";
     if (op == "decompose_planar") return "solid";
     if (op == "decompose_by_face") return "solid";
+    if (op == "decompose_by_plane") return "solid";
+    if (op == "decompose_by_planes") return "solid";
     if (op == "apply_decomposition_candidate") return "solid";
     if (op == "apply_replacement_operation") return "solid";
     if (op == "apply_checked_replacement_operation") return "solid";
@@ -299,8 +301,92 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
             << lua_escape(it->second->as_string()) << "\")\n";
         return true;
     }
+    if (d.op == "decompose_by_plane") {
+        const char* keys[] = {
+            "origin_x", "origin_y", "origin_z",
+            "normal_x", "normal_y", "normal_z",
+        };
+        double values[6] = {};
+        for (int i = 0; i < 6; ++i) {
+            auto it = d.params.find(keys[i]);
+            if (it == d.params.end() || it->second->kind != JsonKind::number) {
+                std::cerr << "recipe: missing '" << keys[i]
+                          << "' param on decompose_by_plane\n";
+                return false;
+            }
+            values[i] = it->second->as_number();
+        }
+        emit_comment(out, d);
+        out << "s:decompose_by_plane(" << quoted_id
+            << ", " << values[0] << ", " << values[1] << ", " << values[2]
+            << ", " << values[3] << ", " << values[4] << ", " << values[5]
+            << ")\n";
+        return true;
+    }
+    if (d.op == "decompose_by_planes") {
+        auto count_it = d.params.find("plane_count");
+        if (count_it == d.params.end()
+            || count_it->second->kind != JsonKind::number) {
+            std::cerr << "recipe: missing 'plane_count' param on decompose_by_planes\n";
+            return false;
+        }
+        const int plane_count = static_cast<int>(count_it->second->as_number());
+        emit_comment(out, d);
+        out << "s:decompose_by_planes(" << quoted_id << ", {\n";
+        for (int i = 0; i < plane_count; ++i) {
+            const std::string idx = std::to_string(i);
+            const std::string keys[] = {
+                "plane_" + idx + "_ox", "plane_" + idx + "_oy",
+                "plane_" + idx + "_oz", "plane_" + idx + "_nx",
+                "plane_" + idx + "_ny", "plane_" + idx + "_nz",
+            };
+            double values[6] = {};
+            for (int k = 0; k < 6; ++k) {
+                auto it = d.params.find(keys[k]);
+                if (it == d.params.end()
+                    || it->second->kind != JsonKind::number) {
+                    std::cerr << "recipe: missing '" << keys[k]
+                              << "' param on decompose_by_planes\n";
+                    return false;
+                }
+                values[k] = it->second->as_number();
+            }
+            out << "  { origin = {" << values[0] << ", " << values[1]
+                << ", " << values[2] << "}, normal = {" << values[3]
+                << ", " << values[4] << ", " << values[5] << "} }";
+            if (i + 1 < plane_count) out << ",";
+            out << "\n";
+        }
+        out << "})\n";
+        return true;
+    }
     if (d.op == "apply_decomposition_candidate") {
         auto it = d.params.find("face_id");
+        if (it == d.params.end()) {
+            const char* keys[] = {
+                "origin_x", "origin_y", "origin_z",
+                "normal_x", "normal_y", "normal_z",
+            };
+            double values[6] = {};
+            bool has_plane = true;
+            for (int i = 0; i < 6; ++i) {
+                auto pit = d.params.find(keys[i]);
+                if (pit == d.params.end()
+                    || pit->second->kind != JsonKind::number) {
+                    has_plane = false;
+                    break;
+                }
+                values[i] = pit->second->as_number();
+            }
+            if (has_plane) {
+                emit_comment(out, d);
+                out << "s:decompose_by_plane(" << quoted_id
+                    << ", " << values[0] << ", " << values[1] << ", " << values[2]
+                    << ", " << values[3] << ", " << values[4] << ", " << values[5]
+                    << ")\n";
+                return true;
+            }
+        }
         if (it == d.params.end() || it->second->kind != JsonKind::string) {
             std::cerr << "recipe: missing 'face_id' param on apply_decomposition_candidate\n";
             return false;

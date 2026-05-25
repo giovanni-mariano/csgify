@@ -51,6 +51,7 @@ struct AnalyticSurface {
 };
 
 std::string surface_type_name(GeomAbs_SurfaceType type);
+std::string surface_support_kind_name(GeomAbs_SurfaceType type);
 bool surface_type_is_spline(GeomAbs_SurfaceType type);
 bool surface_type_needs_emitter(GeomAbs_SurfaceType type);
 

@@ -24,8 +24,12 @@ mcnp_out="$outdir/out.i"
 step_out="$outdir/review.step"
 log_out="$outdir/decisions.json"
 report_out="$outdir/report.json"
+pre_step_out="$outdir/preprocess.step"
+pre_report_out="$outdir/preprocess.json"
+removal_report_out="$outdir/removals.json"
 
-rm -f "$mcnp_out" "$step_out" "$log_out" "$report_out"
+rm -f "$mcnp_out" "$step_out" "$log_out" "$report_out" \
+      "$pre_step_out" "$pre_report_out" "$removal_report_out"
 
 "$exe" decompose-apply "$step_in" --out "$mcnp_out" \
     --log "$log_out" --out-step "$step_out" --report "$report_out" \
@@ -62,6 +66,52 @@ PY
 # Volume must be preserved across the decomposition.
 "$exe" volume "$step_in" --compare "$step_out" --rel-tol 1e-6 >/dev/null 2>&1 \
     || fail "decomposition did not preserve volume within rel-tol 1e-6"
+
+"$exe" preprocess "$fixtures/rails.stp" \
+    --out-step "$pre_step_out" \
+    --apply-removal-candidates high \
+    --max-targets 1 --max-splits 1 --max-depth 1 \
+    --report "$pre_report_out" >/dev/null 2>&1 \
+    || fail "bounded preprocess returned non-zero"
+[[ -s "$pre_step_out" ]]   || fail "bounded preprocess STEP not produced"
+[[ -s "$pre_report_out" ]] || fail "bounded preprocess report not produced"
+python3 - "$pre_report_out" <<'PY' || exit 1
+import json, sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+perf = report.get("performance")
+if not perf:
+    print("missing performance block", file=sys.stderr)
+    sys.exit(1)
+for key in ("load_step_ms", "analyze_ms", "propose_ms", "export_step_ms"):
+    if perf.get(key, 0) <= 0:
+        print(f"expected positive {key}, got {perf.get(key)}", file=sys.stderr)
+        sys.exit(1)
+if perf.get("candidates_evaluated", 0) <= 0:
+    print("expected candidates_evaluated > 0", file=sys.stderr)
+    sys.exit(1)
+PY
+
+"$exe" remove-suggest "$fixtures/rails.stp" \
+    --report "$removal_report_out" >/dev/null 2>&1 \
+    || fail "remove-suggest returned non-zero on rails fixture"
+python3 - "$removal_report_out" <<'PY' || exit 1
+import json, sys
+
+proposal = json.load(open(sys.argv[1], encoding="utf-8"))
+if not proposal.get("ok"):
+    print("expected removal proposal ok", file=sys.stderr)
+    sys.exit(1)
+if not proposal.get("candidates"):
+    print("expected at least one removal candidate", file=sys.stderr)
+    sys.exit(1)
+first = proposal["candidates"][0]
+for key in ("solid_id", "reason_codes", "blockers", "confidence",
+            "suggested_action", "volume_fraction"):
+    if key not in first:
+        print(f"missing {key} in removal candidate", file=sys.stderr)
+        sys.exit(1)
+PY
 
 # When given a model with no non-convex solids, decompose-apply should
 # succeed without doing anything destructive and still emit the deck.

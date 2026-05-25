@@ -9,6 +9,7 @@
 #include <string>
 
 #include <BRepAlgoAPI_Cut.hxx>
+#include <BRep_Builder.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBuilderAPI_MakeWire.hxx>
@@ -91,6 +92,23 @@ TopoDS_Shape make_tilted_torus() {
     return BRepPrimAPI_MakeTorus(axis, major_radius, minor_radius).Shape();
 }
 
+TopoDS_Shape make_bolt_hole() {
+    TopoDS_Shape block = BRepPrimAPI_MakeBox(10.0, 10.0, 4.0).Shape();
+    gp_Ax2 hole_axis(gp_Pnt(5.0, 5.0, -1.0), gp_Dir(0.0, 0.0, 1.0));
+    TopoDS_Shape cutter = BRepPrimAPI_MakeCylinder(hole_axis, 1.0, 6.0).Shape();
+    TopoDS_Shape host = BRepAlgoAPI_Cut(block, cutter).Shape();
+
+    gp_Ax2 bolt_axis(gp_Pnt(5.0, 5.0, -0.5), gp_Dir(0.0, 0.0, 1.0));
+    TopoDS_Shape bolt = BRepPrimAPI_MakeCylinder(bolt_axis, 0.75, 5.0).Shape();
+
+    TopoDS_Compound compound;
+    BRep_Builder builder;
+    builder.MakeCompound(compound);
+    builder.Add(compound, host);
+    builder.Add(compound, bolt);
+    return compound;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -113,6 +131,7 @@ int main(int argc, char** argv) {
         {"spline_face.step", make_nurbs_cylinder()},
         {"spline_cone.step", make_nurbs_cone()},
         {"tilted_torus.step", make_tilted_torus()},
+        {"bolt_hole.step", make_bolt_hole()},
     };
 
     for (const Item& item : items) {

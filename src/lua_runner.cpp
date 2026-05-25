@@ -7,6 +7,7 @@
 #include <iostream>
 #include <new>
 #include <string>
+#include <vector>
 
 #if CAD2CSG_ENABLE_LUA
 
@@ -79,6 +80,13 @@ void push_bbox_table(lua_State* L, const BBox& bbox) {
     lua_setfield(L, -2, "max");
 }
 
+void push_vec3_table(lua_State* L, const Vec3& value) {
+    lua_newtable(L);
+    lua_pushnumber(L, value.x); lua_rawseti(L, -2, 1);
+    lua_pushnumber(L, value.y); lua_rawseti(L, -2, 2);
+    lua_pushnumber(L, value.z); lua_rawseti(L, -2, 3);
+}
+
 void push_diagnostic_table(lua_State* L, const Diagnostic& diagnostic) {
     lua_newtable(L);
     set_string_field(L, "severity", severity_lua_name(diagnostic.severity));
@@ -104,6 +112,7 @@ void push_solid_table(lua_State* L, const AnalyzedSolid& solid) {
     set_boolean_field(L, "exact_csg_supported", solid.exact_csg_supported);
     set_boolean_field(L, "needs_decomposition", solid.needs_decomposition);
     set_boolean_field(L, "needs_spline_replacement", solid.needs_spline_replacement);
+    set_boolean_field(L, "needs_surface_replacement", solid.needs_surface_replacement);
     set_boolean_field(L, "needs_user_decision", solid.needs_user_decision);
 
     lua_newtable(L);
@@ -122,12 +131,14 @@ void push_face_table(lua_State* L, const AnalyzedFace& face) {
     set_string_field(L, "hierarchy_path", face.hierarchy_path);
     set_string_field(L, "solid_id", face.solid_id);
     set_string_field(L, "surface_type", face.surface_type);
+    set_string_field(L, "support_kind", face.support_kind);
     set_integer_field(L, "index", face.index);
     set_number_field(L, "area", face.area);
     push_bbox_table(L, face.bbox);
     lua_setfield(L, -2, "bbox");
     set_boolean_field(L, "exact_csg_supported", face.exact_csg_supported);
     set_boolean_field(L, "needs_spline_replacement", face.needs_spline_replacement);
+    set_boolean_field(L, "needs_surface_replacement", face.needs_surface_replacement);
     set_boolean_field(L, "needs_emitter", face.needs_emitter);
 }
 
@@ -155,6 +166,7 @@ void push_decomposition_candidate_piece_table(
     set_boolean_field(L, "exact_csg_supported", piece.exact_csg_supported);
     set_boolean_field(L, "needs_decomposition", piece.needs_decomposition);
     set_boolean_field(L, "needs_spline_replacement", piece.needs_spline_replacement);
+    set_boolean_field(L, "needs_surface_replacement", piece.needs_surface_replacement);
     set_boolean_field(L, "needs_user_decision", piece.needs_user_decision);
 }
 
@@ -168,6 +180,21 @@ void push_decomposition_candidate_table(lua_State* L,
     set_string_field(L, "surface_type", candidate.surface_type);
     set_string_field(L, "tool_kind", candidate.tool_kind);
     set_string_field(L, "reason", candidate.reason);
+    set_boolean_field(L, "plane_valid", candidate.plane_valid);
+    push_vec3_table(L, candidate.plane_origin);
+    lua_setfield(L, -2, "plane_origin");
+    push_vec3_table(L, candidate.plane_normal);
+    lua_setfield(L, -2, "plane_normal");
+    lua_newtable(L);
+    for (std::size_t i = 0; i < candidate.planes.size(); ++i) {
+        lua_newtable(L);
+        push_vec3_table(L, candidate.planes[i].origin);
+        lua_setfield(L, -2, "origin");
+        push_vec3_table(L, candidate.planes[i].normal);
+        lua_setfield(L, -2, "normal");
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "planes");
     set_boolean_field(L, "usable", candidate.usable);
     set_string_field(L, "confidence", candidate.confidence);
     set_number_field(L, "score", candidate.score);
@@ -229,6 +256,252 @@ void push_decomposition_proposal_table(lua_State* L,
     lua_setfield(L, -2, "diagnostics");
 }
 
+void push_string_array(lua_State* L, const std::vector<std::string>& values) {
+    lua_newtable(L);
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        lua_pushstring(L, values[i].c_str());
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+}
+
+void push_decision_metric_table(lua_State* L, const DecisionMetric& metric) {
+    lua_newtable(L);
+    set_string_field(L, "name", metric.name);
+    set_number_field(L, "value", metric.value);
+    set_string_field(L, "unit", metric.unit);
+}
+
+void push_decision_metrics_table(lua_State* L,
+                                 const std::vector<DecisionMetric>& metrics) {
+    lua_newtable(L);
+    for (std::size_t i = 0; i < metrics.size(); ++i) {
+        push_decision_metric_table(L, metrics[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+}
+
+void push_decision_candidate_view_table(lua_State* L,
+                                        const DecisionCandidateView& candidate) {
+    lua_newtable(L);
+    set_string_field(L, "id", candidate.id);
+    set_string_field(L, "action", candidate.action);
+    set_string_field(L, "confidence", candidate.confidence);
+    set_string_field(L, "reason", candidate.reason);
+    push_decision_metrics_table(L, candidate.metrics);
+    lua_setfield(L, -2, "metrics");
+}
+
+void push_decision_request_table(lua_State* L,
+                                 const DecisionRequest& request) {
+    lua_newtable(L);
+    set_string_field(L, "id", request.id);
+    set_string_field(L, "kind", request.kind);
+    set_string_field(L, "target_id", request.target_id);
+    set_string_field(L, "reason", request.reason);
+    set_string_field(L, "recommended_action", request.recommended_action);
+    set_string_field(L, "summary", request.summary);
+    push_decision_metrics_table(L, request.metrics);
+    lua_setfield(L, -2, "metrics");
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < request.candidates.size(); ++i) {
+        push_decision_candidate_view_table(L, request.candidates[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "candidates");
+}
+
+void push_removal_candidate_table(lua_State* L,
+                                  const RemovalCandidate& candidate) {
+    lua_newtable(L);
+    set_string_field(L, "id", candidate.id);
+    set_string_field(L, "solid_id", candidate.solid_id);
+    set_string_field(L, "label", candidate.label);
+    set_string_field(L, "name", candidate.name);
+    set_string_field(L, "hierarchy_path", candidate.hierarchy_path);
+    set_number_field(L, "volume", candidate.volume);
+    set_number_field(L, "volume_fraction", candidate.volume_fraction);
+    push_bbox_table(L, candidate.bbox);
+    lua_setfield(L, -2, "bbox");
+    set_number_field(L, "bbox_diagonal_fraction",
+                     candidate.bbox_diagonal_fraction);
+    push_string_array(L, candidate.reason_codes);
+    lua_setfield(L, -2, "reason_codes");
+    push_string_array(L, candidate.blockers);
+    lua_setfield(L, -2, "blockers");
+    set_string_field(L, "confidence", candidate.confidence);
+    set_number_field(L, "score", candidate.score);
+    set_string_field(L, "suggested_action", candidate.suggested_action);
+}
+
+void push_removal_proposal_table(lua_State* L,
+                                 const RemovalProposal& proposal) {
+    lua_newtable(L);
+    set_boolean_field(L, "ok", proposal.ok);
+    set_number_field(L, "total_volume", proposal.total_volume);
+    set_integer_field(L, "high_confidence_count",
+                      proposal.high_confidence_count);
+    set_number_field(L, "high_confidence_volume",
+                     proposal.high_confidence_volume);
+    set_number_field(L, "high_confidence_volume_fraction",
+                     proposal.high_confidence_volume_fraction);
+    set_string_field(L, "json", removal_proposal_json_string(proposal));
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
+        push_removal_candidate_table(L, proposal.candidates[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "candidates");
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        push_diagnostic_table(L, proposal.diagnostics[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "diagnostics");
+}
+
+const char* hole_fill_kind_lua_name(HoleFillKind kind) {
+    switch (kind) {
+    case HoleFillKind::cylindrical_through: return "cylindrical_through";
+    case HoleFillKind::cylindrical_blind: return "cylindrical_blind";
+    case HoleFillKind::coaxial_stack: return "coaxial_stack";
+    case HoleFillKind::planar_wire_patch: return "planar_wire_patch";
+    case HoleFillKind::unknown: return "unknown";
+    }
+    return "unknown";
+}
+
+void push_hole_fill_candidate_table(lua_State* L,
+                                    const HoleFillCandidate& candidate) {
+    lua_newtable(L);
+    set_string_field(L, "id", candidate.id);
+    set_string_field(L, "host_solid_id", candidate.host_solid_id);
+    push_string_array(L, candidate.seed_removed_solid_ids);
+    lua_setfield(L, -2, "seed_removed_solid_ids");
+    push_string_array(L, candidate.face_ids);
+    lua_setfield(L, -2, "face_ids");
+    set_string_field(L, "kind", hole_fill_kind_lua_name(candidate.kind));
+    push_vec3_table(L, candidate.axis_origin);
+    lua_setfield(L, -2, "axis_origin");
+    push_vec3_table(L, candidate.axis_direction);
+    lua_setfield(L, -2, "axis_direction");
+    push_vec3_table(L, candidate.base);
+    lua_setfield(L, -2, "base");
+    push_vec3_table(L, candidate.height);
+    lua_setfield(L, -2, "height");
+    set_number_field(L, "radius", candidate.radius);
+    set_number_field(L, "top_radius", candidate.top_radius);
+    set_number_field(L, "length", candidate.length);
+    set_number_field(L, "plug_volume", candidate.plug_volume);
+    set_number_field(L, "host_volume", candidate.host_volume);
+    set_number_field(L, "plug_volume_fraction_of_host",
+                     candidate.plug_volume_fraction_of_host);
+    set_number_field(L, "estimated_host_overlap_fraction",
+                     candidate.estimated_host_overlap_fraction);
+    set_number_field(L, "estimated_other_overlap_fraction",
+                     candidate.estimated_other_overlap_fraction);
+    set_string_field(L, "confidence", candidate.confidence);
+    set_number_field(L, "score", candidate.score);
+    push_string_array(L, candidate.reason_codes);
+    lua_setfield(L, -2, "reason_codes");
+    push_string_array(L, candidate.blockers);
+    lua_setfield(L, -2, "blockers");
+    set_string_field(L, "suggested_action", candidate.suggested_action);
+}
+
+void push_hole_fill_proposal_table(lua_State* L,
+                                   const HoleFillProposal& proposal) {
+    lua_newtable(L);
+    set_boolean_field(L, "ok", proposal.ok);
+    set_string_field(L, "json", hole_fill_proposal_json_string(proposal));
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
+        push_hole_fill_candidate_table(L, proposal.candidates[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "candidates");
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.decision_requests.size(); ++i) {
+        push_decision_request_table(L, proposal.decision_requests[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "decision_requests");
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        push_diagnostic_table(L, proposal.diagnostics[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "diagnostics");
+}
+
+void push_surface_replacement_candidate_table(
+    lua_State* L,
+    const SurfaceReplacementCandidate& candidate) {
+    lua_newtable(L);
+    set_string_field(L, "id", candidate.id);
+    set_string_field(L, "face_id", candidate.face_id);
+    set_string_field(L, "owner_target_id", candidate.owner_target_id);
+    set_string_field(L, "kind", candidate.kind);
+    set_string_field(L, "action", candidate.action);
+    set_string_field(L, "confidence", candidate.confidence);
+    set_string_field(L, "reason", candidate.reason);
+    set_boolean_field(L, "exact", candidate.exact);
+    set_boolean_field(L, "usable", candidate.usable);
+    set_number_field(L, "score", candidate.score);
+    set_number_field(L, "max_deviation", candidate.max_deviation);
+    set_number_field(L, "rms_deviation", candidate.rms_deviation);
+    set_number_field(L, "relative_max_deviation",
+                     candidate.relative_max_deviation);
+    set_number_field(L, "owner_relative_volume_delta",
+                     candidate.owner_relative_volume_delta);
+    set_integer_field(L, "segment_count", candidate.segment_count);
+    push_vec3_table(L, candidate.origin);
+    lua_setfield(L, -2, "origin");
+    push_vec3_table(L, candidate.direction);
+    lua_setfield(L, -2, "direction");
+    set_number_field(L, "radius", candidate.radius);
+    set_number_field(L, "half_angle", candidate.half_angle);
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < candidate.diagnostics.size(); ++i) {
+        push_diagnostic_table(L, candidate.diagnostics[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "diagnostics");
+}
+
+void push_surface_replacement_proposal_table(
+    lua_State* L,
+    const SurfaceReplacementProposal& proposal) {
+    lua_newtable(L);
+    set_boolean_field(L, "ok", proposal.ok);
+    set_string_field(L, "face_id", proposal.face_id);
+    set_string_field(L, "owner_target_id", proposal.owner_target_id);
+    set_string_field(L, "support_kind", proposal.support_kind);
+    set_string_field(L, "best_candidate_id", proposal.best_candidate_id);
+    set_string_field(L, "json",
+                     surface_replacement_proposal_json_string(proposal));
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
+        push_surface_replacement_candidate_table(L, proposal.candidates[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "candidates");
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        push_diagnostic_table(L, proposal.diagnostics[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "diagnostics");
+}
+
 void push_report_table(lua_State* L, const ConversionReport& report) {
     lua_newtable(L);
     set_boolean_field(L, "ok", report.ok());
@@ -269,6 +542,13 @@ void push_report_table(lua_State* L, const ConversionReport& report) {
         lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
     }
     lua_setfield(L, -2, "assembly");
+
+    lua_newtable(L);
+    for (std::size_t i = 0; i < report.decision_requests.size(); ++i) {
+        push_decision_request_table(L, report.decision_requests[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "decision_requests");
 }
 
 int push_command_result(lua_State* L, const CommandResult& result) {
@@ -333,6 +613,60 @@ ReplacementLimits replacement_limits_from_lua(lua_State* L, int index) {
     return limits;
 }
 
+HoleFillOptions hole_fill_options_from_lua(lua_State* L, int index) {
+    HoleFillOptions options;
+    if (!lua_istable(L, index)) {
+        return options;
+    }
+    lua_getfield(L, index, "host");
+    if (!lua_isnil(L, -1)) {
+        options.host_solid_id = luaL_checkstring(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, index, "host_solid_id");
+    if (!lua_isnil(L, -1)) {
+        options.host_solid_id = luaL_checkstring(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, index, "near_removed");
+    if (!lua_isnil(L, -1)) {
+        options.near_removed_solid_id = luaL_checkstring(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, index, "near_removed_solid_id");
+    if (!lua_isnil(L, -1)) {
+        options.near_removed_solid_id = luaL_checkstring(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, index, "max_radius");
+    if (!lua_isnil(L, -1)) {
+        options.has_max_radius = true;
+        options.max_radius = luaL_checknumber(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, index, "max_volume_fraction");
+    if (!lua_isnil(L, -1)) {
+        options.has_max_volume_fraction = true;
+        options.max_volume_fraction = luaL_checknumber(L, -1);
+    }
+    lua_pop(L, 1);
+
+    lua_getfield(L, index, "max_candidates");
+    if (!lua_isnil(L, -1)) {
+        const lua_Integer n = luaL_checkinteger(L, -1);
+        if (n > 0) {
+            options.max_candidates = static_cast<std::size_t>(n);
+        }
+    }
+    lua_pop(L, 1);
+    return options;
+}
+
 bool optional_deviation_from_lua(lua_State* L,
                                  int index,
                                  bool* has_max_deviation,
@@ -391,6 +725,36 @@ int l_analyze_table(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* document_id = luaL_checkstring(L, 2);
     return push_command_result_table(L, analyze(*s->session, document_id));
+}
+
+int l_suggest_removals(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    const RemovalProposal proposal = suggest_removals(*s->session, document_id);
+    push_removal_proposal_table(L, proposal);
+    return 1;
+}
+
+int l_propose_hole_fills(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    HoleFillOptions options;
+    if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
+        options = hole_fill_options_from_lua(L, 3);
+    }
+    const HoleFillProposal proposal =
+        propose_hole_fills(*s->session, document_id, options);
+    push_hole_fill_proposal_table(L, proposal);
+    return 1;
+}
+
+int l_fill_hole(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    const char* candidate_id = luaL_checkstring(L, 3);
+    return push_command_result_table(
+        L,
+        fill_hole(*s->session, document_id, candidate_id));
 }
 
 int l_remove_solid(lua_State* L) {
@@ -492,6 +856,26 @@ int l_replace_face_with_fit(lua_State* L) {
                               max_deviation));
 }
 
+int l_propose_surface_replacement(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* face_id = luaL_checkstring(L, 2);
+    const SurfaceReplacementProposal proposal =
+        propose_surface_replacement(*s->session, face_id);
+    push_surface_replacement_proposal_table(L, proposal);
+    return 1;
+}
+
+int l_apply_surface_replacement_candidate(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* face_id = luaL_checkstring(L, 2);
+    const char* candidate_id = luaL_checkstring(L, 3);
+    return push_command_result(
+        L,
+        apply_surface_replacement_candidate(*s->session,
+                                            face_id,
+                                            candidate_id));
+}
+
 int l_decompose_planar(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* shape_id = luaL_checkstring(L, 2);
@@ -503,6 +887,50 @@ int l_decompose_by_face(lua_State* L) {
     const char* solid_id = luaL_checkstring(L, 2);
     const char* face_id = luaL_checkstring(L, 3);
     return push_command_result(L, decompose_by_face(*s->session, solid_id, face_id));
+}
+
+int l_decompose_by_plane(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* solid_id = luaL_checkstring(L, 2);
+    Vec3 origin{luaL_checknumber(L, 3),
+                luaL_checknumber(L, 4),
+                luaL_checknumber(L, 5)};
+    Vec3 normal{luaL_checknumber(L, 6),
+                luaL_checknumber(L, 7),
+                luaL_checknumber(L, 8)};
+    return push_command_result(L, decompose_by_plane(*s->session,
+                                                     solid_id,
+                                                     origin,
+                                                     normal));
+}
+
+int l_decompose_by_planes(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* solid_id = luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TTABLE);
+    const lua_Integer n = luaL_len(L, 3);
+    std::vector<PlaneSpec> planes;
+    planes.reserve(static_cast<std::size_t>(n));
+    for (lua_Integer i = 1; i <= n; ++i) {
+        lua_rawgeti(L, 3, i);
+        luaL_checktype(L, -1, LUA_TTABLE);
+        lua_getfield(L, -1, "origin");
+        luaL_checktype(L, -1, LUA_TTABLE);
+        lua_getfield(L, -2, "normal");
+        luaL_checktype(L, -1, LUA_TTABLE);
+        PlaneSpec spec;
+        lua_rawgeti(L, -2, 1); spec.origin.x = luaL_checknumber(L, -1); lua_pop(L, 1);
+        lua_rawgeti(L, -2, 2); spec.origin.y = luaL_checknumber(L, -1); lua_pop(L, 1);
+        lua_rawgeti(L, -2, 3); spec.origin.z = luaL_checknumber(L, -1); lua_pop(L, 1);
+        lua_rawgeti(L, -1, 1); spec.normal.x = luaL_checknumber(L, -1); lua_pop(L, 1);
+        lua_rawgeti(L, -1, 2); spec.normal.y = luaL_checknumber(L, -1); lua_pop(L, 1);
+        lua_rawgeti(L, -1, 3); spec.normal.z = luaL_checknumber(L, -1); lua_pop(L, 1);
+        lua_pop(L, 3);
+        planes.push_back(spec);
+    }
+    return push_command_result(L, decompose_by_planes(*s->session,
+                                                      solid_id,
+                                                      planes));
 }
 
 int l_propose_decomposition(lua_State* L) {
@@ -555,6 +983,12 @@ int l_auto_decompose_bsp(lua_State* L) {
             lua_getfield(L, 3, "min_piece_volume_fraction");
             if (!lua_isnil(L, -1)) {
                 policy.min_piece_volume_fraction = luaL_checknumber(L, -1);
+            }
+            lua_pop(L, 1);
+            lua_getfield(L, 3, "max_splits_per_target");
+            if (!lua_isnil(L, -1)) {
+                policy.max_splits_per_target =
+                    static_cast<std::size_t>(luaL_checkinteger(L, -1));
             }
             lua_pop(L, 1);
         } else if (!lua_isnil(L, 3)) {
@@ -665,6 +1099,12 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "analyze");
     lua_pushcfunction(L, l_analyze_table);
     lua_setfield(L, -2, "analyze_table");
+    lua_pushcfunction(L, l_suggest_removals);
+    lua_setfield(L, -2, "suggest_removals");
+    lua_pushcfunction(L, l_propose_hole_fills);
+    lua_setfield(L, -2, "propose_hole_fills");
+    lua_pushcfunction(L, l_fill_hole);
+    lua_setfield(L, -2, "fill_hole");
     lua_pushcfunction(L, l_remove_solid);
     lua_setfield(L, -2, "remove_solid");
     lua_pushcfunction(L, l_replace_solid);
@@ -681,10 +1121,18 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "replace_solid_with_fitted_cone");
     lua_pushcfunction(L, l_replace_face_with_fit);
     lua_setfield(L, -2, "replace_face_with_fit");
+    lua_pushcfunction(L, l_propose_surface_replacement);
+    lua_setfield(L, -2, "propose_surface_replacement");
+    lua_pushcfunction(L, l_apply_surface_replacement_candidate);
+    lua_setfield(L, -2, "apply_surface_replacement_candidate");
     lua_pushcfunction(L, l_decompose_planar);
     lua_setfield(L, -2, "decompose_planar");
     lua_pushcfunction(L, l_decompose_by_face);
     lua_setfield(L, -2, "decompose_by_face");
+    lua_pushcfunction(L, l_decompose_by_plane);
+    lua_setfield(L, -2, "decompose_by_plane");
+    lua_pushcfunction(L, l_decompose_by_planes);
+    lua_setfield(L, -2, "decompose_by_planes");
     lua_pushcfunction(L, l_propose_decomposition);
     lua_setfield(L, -2, "propose_decomposition");
     lua_pushcfunction(L, l_apply_decomposition_candidate);

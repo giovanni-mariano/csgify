@@ -49,6 +49,16 @@ PY
 
 run_inspect box.step "$outdir/box.json"
 assert_codes "$outdir/box.json" ""
+python3 - "$outdir/box.json" <<'PY'
+import json
+import sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "decision_requests" in report, "report must expose decision_requests"
+assert report["decision_requests"] == [], report["decision_requests"]
+PY
+if [ "$?" -ne 0 ]; then
+    fail "box decision_requests contract validation failed"
+fi
 "$exe" "$fixtures/box.step" "$outdir/box.i" >/dev/null 2>&1 \
     || fail "box.step failed to convert"
 
@@ -68,15 +78,50 @@ import sys
 proposal = json.load(open(sys.argv[1], encoding="utf-8"))
 fallbacks = [c for c in proposal["candidates"]
              if c["reason"] == "bbox_axis_fallback"]
-assert len(fallbacks) == 3, proposal["candidates"]
+# 3 single-axis + 1 multi-axis multi-tool variant
+assert len(fallbacks) == 4, proposal["candidates"]
 assert all(c["usable"] for c in fallbacks), fallbacks
 assert all(c["confidence"] != "high" for c in fallbacks), fallbacks
+assert all("plane_valid" in c for c in fallbacks), fallbacks
+assert all("plane_origin" in c for c in fallbacks), fallbacks
+assert all("plane_normal" in c for c in fallbacks), fallbacks
+assert all("planes" in c for c in fallbacks), fallbacks
 assert {c["tool_kind"] for c in fallbacks} == {
-    "bbox_plane_x", "bbox_plane_y", "bbox_plane_z"
+    "bbox_plane_x", "bbox_plane_y", "bbox_plane_z", "bbox_planes_xyz",
 }, fallbacks
+# The multi-tool variant should produce more pieces than any single-axis
+# cut on a sphere (8 vs 2).
+multi = [c for c in fallbacks if c["tool_kind"] == "bbox_planes_xyz"]
+assert len(multi) == 1, multi
+assert multi[0]["piece_count"] > max(
+    c["piece_count"] for c in fallbacks
+    if c["tool_kind"] != "bbox_planes_xyz"
+), fallbacks
+assert len(multi[0]["planes"]) == 3, multi[0]
 PY
 if [ "$?" -ne 0 ]; then
     fail "bbox fallback proposal contract validation failed"
+fi
+
+"$exe" simplify "$fixtures/sphere.step" \
+    --apply-decomposition-candidate solid:1 \
+    --out "$outdir/sphere_apply_bbox_candidate.i" \
+    --candidate candidate:3 \
+    --report "$outdir/sphere_apply_bbox_candidate.json" >/dev/null 2>&1 \
+    || fail "apply-decomposition-candidate failed for bbox plane candidate"
+
+python3 - "$outdir/sphere_apply_bbox_candidate.json" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+summary = report["summary"]
+assert summary["solids_converted"] == 2, summary
+codes = {d["code"] for d in report["diagnostics"]}
+assert "plane_decomposition" in codes, codes
+PY
+if [ "$?" -ne 0 ]; then
+    fail "bbox candidate application contract validation failed"
 fi
 
 run_inspect cylinder.step "$outdir/cylinder.json"
@@ -88,6 +133,20 @@ assert_codes "$outdir/cylinder.json" ""
 
 run_inspect l_shape.step "$outdir/l_shape.json"
 assert_codes "$outdir/l_shape.json" "nonconvex_solid_requires_decomposition"
+python3 - "$outdir/l_shape.json" <<'PY'
+import json
+import sys
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+requests = report["decision_requests"]
+decomp = [r for r in requests
+          if r["kind"] == "decomposition" and r["target_id"] == "solid:1"]
+assert len(decomp) == 1, requests
+assert decomp[0]["recommended_action"] == "decompose-suggest", decomp[0]
+assert decomp[0]["candidates"], decomp[0]
+PY
+if [ "$?" -ne 0 ]; then
+    fail "l_shape decision_requests contract validation failed"
+fi
 
 "$exe" decompose-suggest "$fixtures/l_shape.step" solid:1 \
     --report "$outdir/l_shape_proposals.json" >/dev/null 2>&1 \
@@ -222,6 +281,13 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 
 splines = [face for face in report["faces"] if face["surface_type"] == "bspline"]
 assert splines, "expected at least one bspline face"
+
+requests = report["decision_requests"]
+spline_requests = [r for r in requests if r["kind"] == "spline_replacement"]
+assert len(spline_requests) == len(splines), requests
+assert any(r["recommended_action"] == "replace_face_with_cylinder"
+           for r in spline_requests), spline_requests
+assert all(r["candidates"] for r in spline_requests), spline_requests
 
 # At least one face must fit cylinder near-exactly (curved side of NURBS
 # cylinder) and at least one must fit plane near-exactly (a planar cap).

@@ -35,4 +35,15 @@ std::vector<TopoDS_Solid> split_solid_by_plane(const TopoDS_Solid& solid,
                                                std::size_t solid_index,
                                                const std::string& label);
 
+// Multi-tool plane splitter. Hands every plane in `planes` to OCCT's
+// splitter as a single tool list so the operation produces all pieces
+// in one call. The single-plane variant above is a special case but
+// kept separate for clarity in the dispatcher.
+std::vector<TopoDS_Solid> split_solid_by_planes(const TopoDS_Solid& solid,
+                                                const std::vector<gp_Pln>& planes,
+                                                const ConversionOptions& options,
+                                                ConversionReport& report,
+                                                std::size_t solid_index,
+                                                const std::string& label);
+
 } // namespace cad2csg::detail

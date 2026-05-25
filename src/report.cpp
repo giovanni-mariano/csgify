@@ -270,6 +270,77 @@ void write_bbox_json(std::ostream& out, const BBox& bbox, const std::string& ind
     out << indent << "}";
 }
 
+void write_decision_metric_json(std::ostream& out,
+                                const DecisionMetric& metric,
+                                const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"name\": \"" << json_escape(metric.name) << "\",\n";
+    out << indent << "  \"value\": " << std::setprecision(17)
+        << metric.value << ",\n";
+    out << indent << "  \"unit\": \"" << json_escape(metric.unit) << "\"\n";
+    out << indent << "}";
+}
+
+void write_decision_metrics_json(std::ostream& out,
+                                 const std::vector<DecisionMetric>& metrics,
+                                 const std::string& indent) {
+    out << "[\n";
+    for (std::size_t i = 0; i < metrics.size(); ++i) {
+        out << indent << "  ";
+        write_decision_metric_json(out, metrics[i], indent + "  ");
+        if (i + 1 < metrics.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << indent << "]";
+}
+
+void write_decision_candidate_view_json(
+    std::ostream& out,
+    const DecisionCandidateView& candidate,
+    const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"id\": \"" << json_escape(candidate.id) << "\",\n";
+    out << indent << "  \"action\": \"" << json_escape(candidate.action) << "\",\n";
+    out << indent << "  \"confidence\": \""
+        << json_escape(candidate.confidence) << "\",\n";
+    out << indent << "  \"reason\": \"" << json_escape(candidate.reason) << "\",\n";
+    out << indent << "  \"metrics\": ";
+    write_decision_metrics_json(out, candidate.metrics, indent + "  ");
+    out << "\n";
+    out << indent << "}";
+}
+
+void write_decision_request_json(std::ostream& out,
+                                 const DecisionRequest& request,
+                                 const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"id\": \"" << json_escape(request.id) << "\",\n";
+    out << indent << "  \"kind\": \"" << json_escape(request.kind) << "\",\n";
+    out << indent << "  \"target_id\": \""
+        << json_escape(request.target_id) << "\",\n";
+    out << indent << "  \"reason\": \"" << json_escape(request.reason) << "\",\n";
+    out << indent << "  \"recommended_action\": \""
+        << json_escape(request.recommended_action) << "\",\n";
+    out << indent << "  \"summary\": \"" << json_escape(request.summary) << "\",\n";
+    out << indent << "  \"metrics\": ";
+    write_decision_metrics_json(out, request.metrics, indent + "  ");
+    out << ",\n";
+    out << indent << "  \"candidates\": [\n";
+    for (std::size_t i = 0; i < request.candidates.size(); ++i) {
+        out << indent << "    ";
+        write_decision_candidate_view_json(out, request.candidates[i],
+                                           indent + "    ");
+        if (i + 1 < request.candidates.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << indent << "  ]\n";
+    out << indent << "}";
+}
+
 std::string diagnostic_shape_id(const Diagnostic& diagnostic) {
     if (!diagnostic.shape_id.empty()) {
         return diagnostic.shape_id;
@@ -327,6 +398,26 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
     out << "    \"analytic_faces\": " << report.analytic_faces << ",\n";
     out << "    \"spline_faces\": " << report.spline_faces << ",\n";
     out << "    \"total_volume\": " << std::setprecision(17) << report.total_volume << "\n";
+    out << "  },\n";
+    out << "  \"performance\": {\n";
+    out << "    \"load_step_ms\": " << std::setprecision(17)
+        << report.performance.load_step_ms << ",\n";
+    out << "    \"analyze_ms\": " << std::setprecision(17)
+        << report.performance.analyze_ms << ",\n";
+    out << "    \"propose_ms\": " << std::setprecision(17)
+        << report.performance.propose_ms << ",\n";
+    out << "    \"split_ms\": " << std::setprecision(17)
+        << report.performance.split_ms << ",\n";
+    out << "    \"emit_ms\": " << std::setprecision(17)
+        << report.performance.emit_ms << ",\n";
+    out << "    \"export_step_ms\": " << std::setprecision(17)
+        << report.performance.export_step_ms << ",\n";
+    out << "    \"candidates_evaluated\": "
+        << report.performance.candidates_evaluated << ",\n";
+    out << "    \"splitter_calls\": "
+        << report.performance.splitter_calls << ",\n";
+    out << "    \"pieces_produced\": "
+        << report.performance.pieces_produced << "\n";
     out << "  },\n";
     out << "  \"solid_volumes\": [\n";
     for (std::size_t i = 0; i < report.solid_volumes.size(); ++i) {
@@ -401,6 +492,8 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
             << (solid.needs_decomposition ? "true" : "false") << ",\n";
         out << "      \"needs_spline_replacement\": "
             << (solid.needs_spline_replacement ? "true" : "false") << ",\n";
+        out << "      \"needs_surface_replacement\": "
+            << (solid.needs_surface_replacement ? "true" : "false") << ",\n";
         out << "      \"needs_user_decision\": "
             << (solid.needs_user_decision ? "true" : "false") << ",\n";
         out << "      \"faces\": [";
@@ -429,6 +522,7 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         out << "      \"solid_id\": \"" << json_escape(face.solid_id) << "\",\n";
         out << "      \"index\": " << face.index << ",\n";
         out << "      \"surface_type\": \"" << json_escape(face.surface_type) << "\",\n";
+        out << "      \"support_kind\": \"" << json_escape(face.support_kind) << "\",\n";
         out << "      \"area\": " << std::setprecision(17) << face.area << ",\n";
         out << "      \"bbox\": ";
         write_bbox_json(out, face.bbox, "      ");
@@ -437,6 +531,8 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
             << (face.exact_csg_supported ? "true" : "false") << ",\n";
         out << "      \"needs_spline_replacement\": "
             << (face.needs_spline_replacement ? "true" : "false") << ",\n";
+        out << "      \"needs_surface_replacement\": "
+            << (face.needs_surface_replacement ? "true" : "false") << ",\n";
         out << "      \"needs_emitter\": "
             << (face.needs_emitter ? "true" : "false") << ",\n";
         out << "      \"spline_fits\": ";
@@ -468,6 +564,8 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
             << (piece.needs_decomposition ? "true" : "false") << ",\n";
         out << "      \"needs_spline_replacement\": "
             << (piece.needs_spline_replacement ? "true" : "false") << ",\n";
+        out << "      \"needs_surface_replacement\": "
+            << (piece.needs_surface_replacement ? "true" : "false") << ",\n";
         out << "      \"needs_user_decision\": "
             << (piece.needs_user_decision ? "true" : "false") << "\n";
         out << "    }";
@@ -490,6 +588,16 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         out << "      \"path\": \"" << json_escape(node.path) << "\"\n";
         out << "    }";
         if (i + 1 < report.assembly.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"decision_requests\": [\n";
+    for (std::size_t i = 0; i < report.decision_requests.size(); ++i) {
+        out << "    ";
+        write_decision_request_json(out, report.decision_requests[i], "    ");
+        if (i + 1 < report.decision_requests.size()) {
             out << ",";
         }
         out << "\n";
@@ -559,6 +667,8 @@ void write_decomposition_candidate_piece_json(
         << (piece.needs_decomposition ? "true" : "false") << ",\n";
     out << indent << "  \"needs_spline_replacement\": "
         << (piece.needs_spline_replacement ? "true" : "false") << ",\n";
+    out << indent << "  \"needs_surface_replacement\": "
+        << (piece.needs_surface_replacement ? "true" : "false") << ",\n";
     out << indent << "  \"needs_user_decision\": "
         << (piece.needs_user_decision ? "true" : "false") << "\n";
     out << indent << "}";
@@ -602,6 +712,28 @@ void write_decomposition_candidate_json(
         << json_escape(candidate.tool_kind) << "\",\n";
     out << indent << "  \"reason\": \""
         << json_escape(candidate.reason) << "\",\n";
+    out << indent << "  \"plane_valid\": "
+        << (candidate.plane_valid ? "true" : "false") << ",\n";
+    out << indent << "  \"plane_origin\": ";
+    write_vec3_json(out, candidate.plane_origin);
+    out << ",\n";
+    out << indent << "  \"plane_normal\": ";
+    write_vec3_json(out, candidate.plane_normal);
+    out << ",\n";
+    out << indent << "  \"planes\": [\n";
+    for (std::size_t i = 0; i < candidate.planes.size(); ++i) {
+        const PlaneSpec& p = candidate.planes[i];
+        out << indent << "    {\"origin\": ";
+        write_vec3_json(out, p.origin);
+        out << ", \"normal\": ";
+        write_vec3_json(out, p.normal);
+        out << "}";
+        if (i + 1 < candidate.planes.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << indent << "  ],\n";
     out << indent << "  \"usable\": "
         << (candidate.usable ? "true" : "false") << ",\n";
     out << indent << "  \"confidence\": \""
@@ -690,6 +822,287 @@ void write_decomposition_proposal_json_stream(
     out << "}\n";
 }
 
+void write_string_array_json(std::ostream& out,
+                             const std::vector<std::string>& values) {
+    out << "[";
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        out << "\"" << json_escape(values[i]) << "\"";
+        if (i + 1 < values.size()) {
+            out << ", ";
+        }
+    }
+    out << "]";
+}
+
+void write_removal_candidate_json(std::ostream& out,
+                                  const RemovalCandidate& candidate,
+                                  const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"id\": \"" << json_escape(candidate.id) << "\",\n";
+    out << indent << "  \"solid_id\": \""
+        << json_escape(candidate.solid_id) << "\",\n";
+    out << indent << "  \"label\": \"" << json_escape(candidate.label) << "\",\n";
+    out << indent << "  \"name\": \"" << json_escape(candidate.name) << "\",\n";
+    out << indent << "  \"hierarchy_path\": \""
+        << json_escape(candidate.hierarchy_path) << "\",\n";
+    out << indent << "  \"volume\": " << std::setprecision(17)
+        << candidate.volume << ",\n";
+    out << indent << "  \"volume_fraction\": " << std::setprecision(17)
+        << candidate.volume_fraction << ",\n";
+    out << indent << "  \"bbox\": ";
+    write_bbox_json(out, candidate.bbox, indent + "  ");
+    out << ",\n";
+    out << indent << "  \"bbox_diagonal_fraction\": " << std::setprecision(17)
+        << candidate.bbox_diagonal_fraction << ",\n";
+    out << indent << "  \"reason_codes\": ";
+    write_string_array_json(out, candidate.reason_codes);
+    out << ",\n";
+    out << indent << "  \"blockers\": ";
+    write_string_array_json(out, candidate.blockers);
+    out << ",\n";
+    out << indent << "  \"confidence\": \""
+        << json_escape(candidate.confidence) << "\",\n";
+    out << indent << "  \"score\": " << std::setprecision(17)
+        << candidate.score << ",\n";
+    out << indent << "  \"suggested_action\": \""
+        << json_escape(candidate.suggested_action) << "\"\n";
+    out << indent << "}";
+}
+
+void write_removal_proposal_json_stream(std::ostream& out,
+                                        const RemovalProposal& proposal) {
+    out << "{\n";
+    out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
+    out << "  \"total_volume\": " << std::setprecision(17)
+        << proposal.total_volume << ",\n";
+    out << "  \"high_confidence_count\": "
+        << proposal.high_confidence_count << ",\n";
+    out << "  \"high_confidence_volume\": " << std::setprecision(17)
+        << proposal.high_confidence_volume << ",\n";
+    out << "  \"high_confidence_volume_fraction\": " << std::setprecision(17)
+        << proposal.high_confidence_volume_fraction << ",\n";
+    out << "  \"candidates\": [\n";
+    for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
+        out << "    ";
+        write_removal_candidate_json(out, proposal.candidates[i], "    ");
+        if (i + 1 < proposal.candidates.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"diagnostics\": [\n";
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        out << "    ";
+        write_diagnostic_json(out, proposal.diagnostics[i], "    ");
+        if (i + 1 < proposal.diagnostics.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+const char* hole_fill_kind_json_name(HoleFillKind kind) {
+    switch (kind) {
+    case HoleFillKind::cylindrical_through:
+        return "cylindrical_through";
+    case HoleFillKind::cylindrical_blind:
+        return "cylindrical_blind";
+    case HoleFillKind::coaxial_stack:
+        return "coaxial_stack";
+    case HoleFillKind::planar_wire_patch:
+        return "planar_wire_patch";
+    case HoleFillKind::unknown:
+        return "unknown";
+    }
+    return "unknown";
+}
+
+void write_hole_fill_candidate_json(std::ostream& out,
+                                    const HoleFillCandidate& candidate,
+                                    const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"id\": \"" << json_escape(candidate.id) << "\",\n";
+    out << indent << "  \"host_solid_id\": \""
+        << json_escape(candidate.host_solid_id) << "\",\n";
+    out << indent << "  \"seed_removed_solid_ids\": ";
+    write_string_array_json(out, candidate.seed_removed_solid_ids);
+    out << ",\n";
+    out << indent << "  \"face_ids\": ";
+    write_string_array_json(out, candidate.face_ids);
+    out << ",\n";
+    out << indent << "  \"kind\": \""
+        << hole_fill_kind_json_name(candidate.kind) << "\",\n";
+    out << indent << "  \"axis_origin\": ";
+    write_vec3_json(out, candidate.axis_origin);
+    out << ",\n";
+    out << indent << "  \"axis_direction\": ";
+    write_vec3_json(out, candidate.axis_direction);
+    out << ",\n";
+    out << indent << "  \"base\": ";
+    write_vec3_json(out, candidate.base);
+    out << ",\n";
+    out << indent << "  \"height\": ";
+    write_vec3_json(out, candidate.height);
+    out << ",\n";
+    out << indent << "  \"radius\": " << std::setprecision(17)
+        << candidate.radius << ",\n";
+    out << indent << "  \"top_radius\": " << std::setprecision(17)
+        << candidate.top_radius << ",\n";
+    out << indent << "  \"length\": " << std::setprecision(17)
+        << candidate.length << ",\n";
+    out << indent << "  \"plug_volume\": " << std::setprecision(17)
+        << candidate.plug_volume << ",\n";
+    out << indent << "  \"host_volume\": " << std::setprecision(17)
+        << candidate.host_volume << ",\n";
+    out << indent << "  \"plug_volume_fraction_of_host\": "
+        << std::setprecision(17)
+        << candidate.plug_volume_fraction_of_host << ",\n";
+    out << indent << "  \"estimated_host_overlap_fraction\": "
+        << std::setprecision(17)
+        << candidate.estimated_host_overlap_fraction << ",\n";
+    out << indent << "  \"estimated_other_overlap_fraction\": "
+        << std::setprecision(17)
+        << candidate.estimated_other_overlap_fraction << ",\n";
+    out << indent << "  \"confidence\": \""
+        << json_escape(candidate.confidence) << "\",\n";
+    out << indent << "  \"score\": " << std::setprecision(17)
+        << candidate.score << ",\n";
+    out << indent << "  \"reason_codes\": ";
+    write_string_array_json(out, candidate.reason_codes);
+    out << ",\n";
+    out << indent << "  \"blockers\": ";
+    write_string_array_json(out, candidate.blockers);
+    out << ",\n";
+    out << indent << "  \"suggested_action\": \""
+        << json_escape(candidate.suggested_action) << "\"\n";
+    out << indent << "}";
+}
+
+void write_hole_fill_proposal_json_stream(std::ostream& out,
+                                          const HoleFillProposal& proposal) {
+    out << "{\n";
+    out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
+    out << "  \"candidates\": [\n";
+    for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
+        out << "    ";
+        write_hole_fill_candidate_json(out, proposal.candidates[i], "    ");
+        if (i + 1 < proposal.candidates.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"decision_requests\": [\n";
+    for (std::size_t i = 0; i < proposal.decision_requests.size(); ++i) {
+        out << "    ";
+        write_decision_request_json(out, proposal.decision_requests[i], "    ");
+        if (i + 1 < proposal.decision_requests.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"diagnostics\": [\n";
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        out << "    ";
+        write_diagnostic_json(out, proposal.diagnostics[i], "    ");
+        if (i + 1 < proposal.diagnostics.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
+void write_surface_replacement_candidate_json(
+    std::ostream& out,
+    const SurfaceReplacementCandidate& candidate,
+    const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"id\": \"" << json_escape(candidate.id) << "\",\n";
+    out << indent << "  \"face_id\": \"" << json_escape(candidate.face_id) << "\",\n";
+    out << indent << "  \"owner_target_id\": \""
+        << json_escape(candidate.owner_target_id) << "\",\n";
+    out << indent << "  \"kind\": \"" << json_escape(candidate.kind) << "\",\n";
+    out << indent << "  \"action\": \"" << json_escape(candidate.action) << "\",\n";
+    out << indent << "  \"confidence\": \""
+        << json_escape(candidate.confidence) << "\",\n";
+    out << indent << "  \"reason\": \"" << json_escape(candidate.reason) << "\",\n";
+    out << indent << "  \"exact\": " << (candidate.exact ? "true" : "false") << ",\n";
+    out << indent << "  \"usable\": " << (candidate.usable ? "true" : "false") << ",\n";
+    out << indent << "  \"score\": " << std::setprecision(17)
+        << candidate.score << ",\n";
+    out << indent << "  \"max_deviation\": " << std::setprecision(17)
+        << candidate.max_deviation << ",\n";
+    out << indent << "  \"rms_deviation\": " << std::setprecision(17)
+        << candidate.rms_deviation << ",\n";
+    out << indent << "  \"relative_max_deviation\": " << std::setprecision(17)
+        << candidate.relative_max_deviation << ",\n";
+    out << indent << "  \"owner_relative_volume_delta\": " << std::setprecision(17)
+        << candidate.owner_relative_volume_delta << ",\n";
+    out << indent << "  \"segment_count\": " << candidate.segment_count << ",\n";
+    out << indent << "  \"origin\": ";
+    write_vec3_json(out, candidate.origin);
+    out << ",\n";
+    out << indent << "  \"direction\": ";
+    write_vec3_json(out, candidate.direction);
+    out << ",\n";
+    out << indent << "  \"radius\": " << std::setprecision(17)
+        << candidate.radius << ",\n";
+    out << indent << "  \"half_angle\": " << std::setprecision(17)
+        << candidate.half_angle << ",\n";
+    out << indent << "  \"diagnostics\": [\n";
+    for (std::size_t i = 0; i < candidate.diagnostics.size(); ++i) {
+        out << indent << "    ";
+        write_diagnostic_json(out, candidate.diagnostics[i], indent + "    ");
+        if (i + 1 < candidate.diagnostics.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << indent << "  ]\n";
+    out << indent << "}";
+}
+
+void write_surface_replacement_proposal_json_stream(
+    std::ostream& out,
+    const SurfaceReplacementProposal& proposal) {
+    out << "{\n";
+    out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
+    out << "  \"face_id\": \"" << json_escape(proposal.face_id) << "\",\n";
+    out << "  \"owner_target_id\": \""
+        << json_escape(proposal.owner_target_id) << "\",\n";
+    out << "  \"support_kind\": \""
+        << json_escape(proposal.support_kind) << "\",\n";
+    out << "  \"best_candidate_id\": \""
+        << json_escape(proposal.best_candidate_id) << "\",\n";
+    out << "  \"candidates\": [\n";
+    for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
+        out << "    ";
+        write_surface_replacement_candidate_json(out, proposal.candidates[i], "    ");
+        if (i + 1 < proposal.candidates.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"diagnostics\": [\n";
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        out << "    ";
+        write_diagnostic_json(out, proposal.diagnostics[i], "    ");
+        if (i + 1 < proposal.diagnostics.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ]\n";
+    out << "}\n";
+}
+
 } // namespace
 
 int write_decomposition_proposal_json(const DecompositionProposal& proposal,
@@ -705,6 +1118,56 @@ int write_decomposition_proposal_json(const DecompositionProposal& proposal,
 std::string decomposition_proposal_json_string(const DecompositionProposal& proposal) {
     std::ostringstream out;
     write_decomposition_proposal_json_stream(out, proposal);
+    return out.str();
+}
+
+int write_removal_proposal_json(const RemovalProposal& proposal,
+                                const std::string& output_path) {
+    std::ofstream out(output_path);
+    if (!out) {
+        return -1;
+    }
+    write_removal_proposal_json_stream(out, proposal);
+    return out ? 0 : -1;
+}
+
+std::string removal_proposal_json_string(const RemovalProposal& proposal) {
+    std::ostringstream out;
+    write_removal_proposal_json_stream(out, proposal);
+    return out.str();
+}
+
+int write_hole_fill_proposal_json(const HoleFillProposal& proposal,
+                                  const std::string& output_path) {
+    std::ofstream out(output_path);
+    if (!out) {
+        return -1;
+    }
+    write_hole_fill_proposal_json_stream(out, proposal);
+    return out ? 0 : -1;
+}
+
+std::string hole_fill_proposal_json_string(const HoleFillProposal& proposal) {
+    std::ostringstream out;
+    write_hole_fill_proposal_json_stream(out, proposal);
+    return out.str();
+}
+
+int write_surface_replacement_proposal_json(
+    const SurfaceReplacementProposal& proposal,
+    const std::string& output_path) {
+    std::ofstream out(output_path);
+    if (!out) {
+        return -1;
+    }
+    write_surface_replacement_proposal_json_stream(out, proposal);
+    return out ? 0 : -1;
+}
+
+std::string surface_replacement_proposal_json_string(
+    const SurfaceReplacementProposal& proposal) {
+    std::ostringstream out;
+    write_surface_replacement_proposal_json_stream(out, proposal);
     return out.str();
 }
 

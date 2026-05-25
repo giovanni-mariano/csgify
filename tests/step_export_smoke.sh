@@ -35,6 +35,12 @@ solids=$("$exe" dump-assembly "$step_out" 2>/dev/null \
 [[ "$solids" -eq 1 ]] \
     || fail "expected 1 solid in simplified STEP, got $solids"
 
+assembly_dump="$outdir/simplified_assembly.txt"
+"$exe" dump-assembly "$step_out" >"$assembly_dump" 2>/dev/null \
+    || fail "could not re-import simplified STEP assembly"
+grep -q "replacement:bbox" "$assembly_dump" \
+    || fail "simplified STEP did not preserve replacement provenance name"
+
 # Volume must agree with the original within a generous tolerance (bbox
 # of a box is the box).
 "$exe" volume "$step_in" --compare "$step_out" --rel-tol 0.01 >/dev/null 2>&1 \
@@ -52,5 +58,21 @@ fi
 if [[ -s "$nothing_out" ]]; then
     fail "no STEP file should be written when nothing survives"
 fi
+
+# Decomposition pieces should carry source-name provenance into the
+# review STEP so users can identify them after opening the file in CAD.
+decomp_i="$outdir/l_shape_decomposed.i"
+decomp_step="$outdir/l_shape_decomposed.step"
+"$exe" decompose-apply "$fixtures/l_shape.step" \
+    --out "$decomp_i" --target solid:1 --max-targets 1 \
+    --out-step "$decomp_step" >/dev/null 2>&1 \
+    || fail "decompose-apply with --out-step returned non-zero"
+decomp_dump="$outdir/l_shape_decomposed_assembly.txt"
+"$exe" dump-assembly "$decomp_step" >"$decomp_dump" 2>/dev/null \
+    || fail "could not re-import decomposed STEP assembly"
+grep -q "piece:1" "$decomp_dump" \
+    || fail "decomposed STEP did not preserve piece:1 name"
+grep -q "piece:2" "$decomp_dump" \
+    || fail "decomposed STEP did not preserve piece:2 name"
 
 echo "step_export_smoke: ok"

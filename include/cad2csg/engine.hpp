@@ -40,6 +40,11 @@ struct Vec3 {
     double z = 0.0;
 };
 
+struct PlaneSpec {
+    Vec3 origin;
+    Vec3 normal;
+};
+
 struct SolidVolume {
     std::string shape_label;
     double volume = 0.0;
@@ -80,10 +85,12 @@ struct AnalyzedFace {
     std::string solid_id;
     std::size_t index = 0;
     std::string surface_type;
+    std::string support_kind;
     double area = 0.0;
     BBox bbox;
     bool exact_csg_supported = false;
     bool needs_spline_replacement = false;
+    bool needs_surface_replacement = false;
     bool needs_emitter = false;
     SplineFitCandidates spline_fits;
     std::string name;
@@ -178,6 +185,7 @@ struct AnalyzedSolid {
     bool exact_csg_supported = false;
     bool needs_decomposition = false;
     bool needs_spline_replacement = false;
+    bool needs_surface_replacement = false;
     bool needs_user_decision = false;
     std::vector<std::string> face_ids;
     std::string name;
@@ -195,6 +203,7 @@ struct AnalyzedDecomposedPiece {
     bool exact_csg_supported = false;
     bool needs_decomposition = false;
     bool needs_spline_replacement = false;
+    bool needs_surface_replacement = false;
     bool needs_user_decision = false;
 };
 
@@ -207,17 +216,39 @@ struct DecompositionCandidatePiece {
     bool exact_csg_supported = false;
     bool needs_decomposition = false;
     bool needs_spline_replacement = false;
+    bool needs_surface_replacement = false;
     bool needs_user_decision = false;
 };
 
 struct DecompositionCandidate {
     std::string id;
     std::string target_id;
+    // For face-derived candidates (tool_kind starts with `face_` or
+    // `torus_axis_plane`) this points to an existing face id on the
+    // target solid/piece. For synthetic-plane candidates (tool_kind
+    // `bbox_plane_x|y|z`) source_face_id is empty and the geometry is
+    // carried by plane_origin / plane_normal below.
     std::string source_face_id;
     std::string source_face_label;
     std::string surface_type;
     std::string tool_kind;
     std::string reason;
+    // Explicit plane parameters for synthetic-plane candidates. Valid
+    // when the dispatcher must construct the cutter from coordinates
+    // rather than from a face. plane_valid implies plane_origin and
+    // plane_normal are populated. Used for single-tool plane cuts; for
+    // multi-tool cuts (several planes applied simultaneously to one
+    // BRepAlgoAPI_Splitter call) see `planes` below.
+    bool plane_valid = false;
+    Vec3 plane_origin;
+    Vec3 plane_normal;
+    // Multi-tool plane cutter. When non-empty, the dispatcher routes
+    // through decompose_solid_by_planes which hands all of these to
+    // OCCT's splitter in one call. Higher first-cut yield on parts
+    // with multiple parallel concavities (rails, slotted brackets,
+    // E-shaped frames). plane_valid/plane_origin/plane_normal are
+    // ignored when this vector is non-empty.
+    std::vector<PlaneSpec> planes;
     bool usable = false;
     std::string confidence;
     double score = 0.0;
@@ -247,12 +278,148 @@ struct DecompositionProposal {
     std::vector<Diagnostic> diagnostics;
 };
 
+struct RemovalCandidate {
+    std::string id;
+    std::string solid_id;
+    std::string label;
+    std::string name;
+    std::string hierarchy_path;
+    double volume = 0.0;
+    double volume_fraction = 0.0;
+    BBox bbox;
+    double bbox_diagonal_fraction = 0.0;
+    std::vector<std::string> reason_codes;
+    std::vector<std::string> blockers;
+    std::string confidence;
+    double score = 0.0;
+    std::string suggested_action;
+};
+
+struct RemovalProposal {
+    bool ok = false;
+    std::vector<RemovalCandidate> candidates;
+    std::vector<Diagnostic> diagnostics;
+    double total_volume = 0.0;
+    double high_confidence_volume = 0.0;
+    double high_confidence_volume_fraction = 0.0;
+    std::size_t high_confidence_count = 0;
+};
+
+enum class HoleFillKind {
+    cylindrical_through,
+    cylindrical_blind,
+    coaxial_stack,
+    planar_wire_patch,
+    unknown,
+};
+
+struct HoleFillOptions {
+    std::string host_solid_id;
+    std::string near_removed_solid_id;
+    bool has_max_radius = false;
+    double max_radius = 0.0;
+    bool has_max_volume_fraction = false;
+    double max_volume_fraction = 0.0;
+    std::size_t max_candidates = 64;
+};
+
+struct HoleFillCandidate {
+    std::string id;
+    std::string host_solid_id;
+    std::vector<std::string> seed_removed_solid_ids;
+    std::vector<std::string> face_ids;
+    HoleFillKind kind = HoleFillKind::unknown;
+    Vec3 axis_origin;
+    Vec3 axis_direction;
+    Vec3 base;
+    Vec3 height;
+    double radius = 0.0;
+    double top_radius = 0.0;
+    double length = 0.0;
+    double plug_volume = 0.0;
+    double host_volume = 0.0;
+    double plug_volume_fraction_of_host = 0.0;
+    double estimated_host_overlap_fraction = 0.0;
+    double estimated_other_overlap_fraction = 0.0;
+    std::string confidence;
+    double score = 0.0;
+    std::vector<std::string> reason_codes;
+    std::vector<std::string> blockers;
+    std::string suggested_action;
+};
+
+struct DecisionMetric {
+    std::string name;
+    double value = 0.0;
+    std::string unit;
+};
+
+struct DecisionCandidateView {
+    std::string id;
+    std::string action;
+    std::string confidence;
+    std::string reason;
+    std::vector<DecisionMetric> metrics;
+};
+
+struct DecisionRequest {
+    std::string id;
+    std::string kind;
+    std::string target_id;
+    std::string reason;
+    std::string recommended_action;
+    std::string summary;
+    std::vector<DecisionMetric> metrics;
+    std::vector<DecisionCandidateView> candidates;
+};
+
+struct HoleFillProposal {
+    bool ok = false;
+    std::vector<HoleFillCandidate> candidates;
+    std::vector<DecisionRequest> decision_requests;
+    std::vector<Diagnostic> diagnostics;
+};
+
+struct SurfaceReplacementCandidate {
+    std::string id;
+    std::string face_id;
+    std::string owner_target_id;
+    std::string kind;
+    std::string action;
+    std::string confidence;
+    std::string reason;
+    bool exact = false;
+    bool usable = false;
+    double score = 0.0;
+    double max_deviation = 0.0;
+    double rms_deviation = 0.0;
+    double relative_max_deviation = 0.0;
+    double owner_relative_volume_delta = 0.0;
+    std::size_t segment_count = 0;
+    Vec3 origin;
+    Vec3 direction;
+    double radius = 0.0;
+    double half_angle = 0.0;
+    std::vector<Diagnostic> diagnostics;
+};
+
+struct SurfaceReplacementProposal {
+    bool ok = false;
+    std::string face_id;
+    std::string owner_target_id;
+    std::string support_kind;
+    std::string best_candidate_id;
+    std::vector<SurfaceReplacementCandidate> candidates;
+    std::vector<Diagnostic> diagnostics;
+};
+
 struct DecompositionPolicy {
     bool allow_high_confidence_face_auto = true;
     bool allow_bbox_fallback_auto = false;
     bool allow_medium_confidence_auto = false;
     double max_relative_delta = 1.0e-8;
     double min_piece_volume_fraction = 1.0e-8;
+    std::size_t max_splits_per_target = 16;
 };
 
 struct AssemblyNode {
@@ -263,6 +430,18 @@ struct AssemblyNode {
     std::string shape_id;
     std::string kind;
     std::string path;
+};
+
+struct PerformanceMetrics {
+    double load_step_ms = 0.0;
+    double analyze_ms = 0.0;
+    double propose_ms = 0.0;
+    double split_ms = 0.0;
+    double emit_ms = 0.0;
+    double export_step_ms = 0.0;
+    std::size_t candidates_evaluated = 0;
+    std::size_t splitter_calls = 0;
+    std::size_t pieces_produced = 0;
 };
 
 struct ConversionOptions {
@@ -298,6 +477,8 @@ struct ConversionReport {
     std::vector<AnalyzedFace> faces;
     std::vector<AnalyzedDecomposedPiece> decomposed_pieces;
     std::vector<AssemblyNode> assembly;
+    std::vector<DecisionRequest> decision_requests;
+    PerformanceMetrics performance;
 
     bool ok() const;
 };
@@ -324,5 +505,16 @@ std::string report_json_string(const ConversionReport& report);
 int write_decomposition_proposal_json(const DecompositionProposal& proposal,
                                       const std::string& output_path);
 std::string decomposition_proposal_json_string(const DecompositionProposal& proposal);
+int write_removal_proposal_json(const RemovalProposal& proposal,
+                                const std::string& output_path);
+std::string removal_proposal_json_string(const RemovalProposal& proposal);
+int write_hole_fill_proposal_json(const HoleFillProposal& proposal,
+                                  const std::string& output_path);
+std::string hole_fill_proposal_json_string(const HoleFillProposal& proposal);
+int write_surface_replacement_proposal_json(
+    const SurfaceReplacementProposal& proposal,
+    const std::string& output_path);
+std::string surface_replacement_proposal_json_string(
+    const SurfaceReplacementProposal& proposal);
 
 } // namespace cad2csg

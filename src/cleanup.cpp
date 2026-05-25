@@ -631,6 +631,225 @@ bool decompose_solid_by_face(CadModel& model,
     return true;
 }
 
+bool decompose_solid_by_plane(CadModel& model,
+                              const std::string& solid_id_str,
+                              const Vec3& origin,
+                              const Vec3& normal,
+                              const ConversionOptions& options) {
+    using namespace cad2csg::detail;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, solid_id_str, &target)) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "decomposition_target_not_found",
+            "Requested decomposition target ID was not found.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    const double nx = normal.x, ny = normal.y, nz = normal.z;
+    const double n_mag = std::sqrt(nx * nx + ny * ny + nz * nz);
+    if (n_mag <= kEps) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "invalid_plane_normal",
+            "Decomposition plane normal must be non-zero.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    const gp_Pnt origin_pnt(origin.x, origin.y, origin.z);
+    const gp_Dir normal_dir(nx, ny, nz);
+    const gp_Pln plane(origin_pnt, normal_dir);
+
+    ConversionReport decomposition_report;
+    std::vector<TopoDS_Solid> pieces =
+        split_solid_by_plane(target.solid, plane, options, decomposition_report,
+                             target.report_index, solid_id_str);
+    for (const Diagnostic& diagnostic : decomposition_report.diagnostics) {
+        model.diagnostics.push_back(diagnostic);
+    }
+    if (pieces.empty()) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "plane_decomposition_failed",
+            "Directed plane decomposition did not produce usable pieces.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    GProp_GProps original_props;
+    BRepGProp::VolumeProperties(target.solid, original_props);
+    const double original_volume = std::abs(original_props.Mass());
+    double pieces_volume = 0.0;
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps piece_props;
+        BRepGProp::VolumeProperties(piece, piece_props);
+        pieces_volume += std::abs(piece_props.Mass());
+    }
+
+    const double absolute_delta = std::abs(pieces_volume - original_volume);
+    double relative_delta = 0.0;
+    if (original_volume > kEps) {
+        relative_delta = absolute_delta / original_volume;
+    }
+
+    std::ostringstream msg;
+    msg << "Directed plane decomposition using "
+        << "origin=(" << std::setprecision(10)
+        << origin.x << "," << origin.y << "," << origin.z << ") "
+        << "normal=(" << normal.x << "," << normal.y << "," << normal.z << ") "
+        << "produced " << pieces.size()
+        << " pieces. original_volume=" << original_volume
+        << " pieces_volume=" << pieces_volume
+        << " relative_delta=" << relative_delta;
+    model.diagnostics.push_back({
+        relative_delta <= 1.0e-6 ? DiagnosticSeverity::info : DiagnosticSeverity::warning,
+        "plane_decomposition",
+        msg.str(),
+        solid_id_str
+    });
+
+    if (target.is_piece) {
+        target.piece->active = false;
+    } else {
+        remove_solid(model, solid_id_str);
+    }
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps piece_props;
+        BRepGProp::VolumeProperties(piece, piece_props);
+
+        DecomposedSolidPiece decomposed;
+        decomposed.id = next_decomposed_piece_id(model);
+        decomposed.label = decomposed.id + "/from_" + solid_id_str;
+        decomposed.source_solid_id = solid_id_str;
+        decomposed.solid = piece;
+        decomposed.volume = std::abs(piece_props.Mass());
+        decomposed.active = true;
+        model.decomposed_pieces.push_back(decomposed);
+    }
+    return true;
+}
+
+bool decompose_solid_by_planes(CadModel& model,
+                               const std::string& solid_id_str,
+                               const std::vector<PlaneSpec>& planes,
+                               const ConversionOptions& options) {
+    using namespace cad2csg::detail;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, solid_id_str, &target)) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "decomposition_target_not_found",
+            "Requested decomposition target ID was not found.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    if (planes.empty()) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "no_planes_supplied",
+            "Multi-plane decomposition requires at least one plane.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    std::vector<gp_Pln> occ_planes;
+    occ_planes.reserve(planes.size());
+    for (std::size_t i = 0; i < planes.size(); ++i) {
+        const PlaneSpec& p = planes[i];
+        const double n_mag = std::sqrt(p.normal.x * p.normal.x
+                                       + p.normal.y * p.normal.y
+                                       + p.normal.z * p.normal.z);
+        if (n_mag <= kEps) {
+            model.diagnostics.push_back({
+                DiagnosticSeverity::error,
+                "invalid_plane_normal",
+                "Multi-plane decomposition: at least one plane has a "
+                "near-zero normal.",
+                solid_id_str
+            });
+            return false;
+        }
+        const gp_Pnt origin_pnt(p.origin.x, p.origin.y, p.origin.z);
+        const gp_Dir normal_dir(p.normal.x, p.normal.y, p.normal.z);
+        occ_planes.emplace_back(origin_pnt, normal_dir);
+    }
+
+    ConversionReport decomposition_report;
+    std::vector<TopoDS_Solid> pieces =
+        split_solid_by_planes(target.solid, occ_planes, options,
+                              decomposition_report,
+                              target.report_index, solid_id_str);
+    for (const Diagnostic& diagnostic : decomposition_report.diagnostics) {
+        model.diagnostics.push_back(diagnostic);
+    }
+    if (pieces.empty()) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "planes_decomposition_failed",
+            "Multi-plane decomposition did not produce usable pieces.",
+            solid_id_str
+        });
+        return false;
+    }
+
+    GProp_GProps original_props;
+    BRepGProp::VolumeProperties(target.solid, original_props);
+    const double original_volume = std::abs(original_props.Mass());
+    double pieces_volume = 0.0;
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps piece_props;
+        BRepGProp::VolumeProperties(piece, piece_props);
+        pieces_volume += std::abs(piece_props.Mass());
+    }
+
+    const double absolute_delta = std::abs(pieces_volume - original_volume);
+    double relative_delta = 0.0;
+    if (original_volume > kEps) {
+        relative_delta = absolute_delta / original_volume;
+    }
+
+    std::ostringstream msg;
+    msg << "Multi-plane decomposition using " << planes.size()
+        << " planes produced " << pieces.size()
+        << " pieces. original_volume=" << std::setprecision(10) << original_volume
+        << " pieces_volume=" << pieces_volume
+        << " relative_delta=" << relative_delta;
+    model.diagnostics.push_back({
+        relative_delta <= 1.0e-6 ? DiagnosticSeverity::info : DiagnosticSeverity::warning,
+        "planes_decomposition",
+        msg.str(),
+        solid_id_str
+    });
+
+    if (target.is_piece) {
+        target.piece->active = false;
+    } else {
+        remove_solid(model, solid_id_str);
+    }
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps piece_props;
+        BRepGProp::VolumeProperties(piece, piece_props);
+
+        DecomposedSolidPiece decomposed;
+        decomposed.id = next_decomposed_piece_id(model);
+        decomposed.label = decomposed.id + "/from_" + solid_id_str;
+        decomposed.source_solid_id = solid_id_str;
+        decomposed.solid = piece;
+        decomposed.volume = std::abs(piece_props.Mass());
+        decomposed.active = true;
+        model.decomposed_pieces.push_back(decomposed);
+    }
+    return true;
+}
+
 namespace {
 
 constexpr double kProposalVolumeTolerance = 1.0e-6;
@@ -750,10 +969,14 @@ bool has_clear_score_dominance(const std::vector<DecompositionCandidate>& candid
 
 } // namespace
 
-DecompositionProposal propose_decomposition_candidates(
+DecompositionProposal propose_decomposition_candidates_impl(
     const CadModel& model,
     const std::string& solid_id_str,
-    const ConversionOptions& options) {
+    const ConversionOptions& options,
+    bool convexity_failure_face_only,
+    bool longest_bbox_axis_only,
+    bool include_multi_bbox_fallback,
+    bool lazy_first_usable) {
     using namespace cad2csg::detail;
     DecompositionProposal proposal;
     proposal.target_id = solid_id_str;
@@ -836,6 +1059,7 @@ DecompositionProposal propose_decomposition_candidates(
             summary.exact_csg_supported = analyzed.exact_csg_supported;
             summary.needs_decomposition = analyzed.needs_decomposition;
             summary.needs_spline_replacement = analyzed.needs_spline_replacement;
+            summary.needs_surface_replacement = analyzed.needs_surface_replacement;
             summary.needs_user_decision = analyzed.needs_user_decision;
             candidate.pieces.push_back(summary);
 
@@ -865,27 +1089,30 @@ DecompositionProposal propose_decomposition_candidates(
         score_decomposition_candidate(candidate);
     };
 
-    std::size_t face_index = 0;
     std::size_t candidate_index = 0;
-    for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
-        ++face_index;
+
+    // Helper: evaluate one face as a decomposition candidate. Runs the
+    // BRepAlgoAPI_Splitter call, scores the result, appends to the
+    // proposal. The split is the expensive step; the per-piece analysis
+    // inside finish_candidate is the second most expensive. Both run
+    // exactly once per call.
+    auto evaluate_face = [&](std::size_t face_idx, const TopoDS_Face& face) {
         ++candidate_index;
-        const TopoDS_Face face = TopoDS::Face(face_exp.Current());
         BRepAdaptor_Surface adaptor(face, false);
 
         DecompositionCandidate candidate;
         candidate.id = "candidate:" + std::to_string(candidate_index);
         candidate.target_id = solid_id_str;
         candidate.source_face_id = is_piece
-            ? solid_id_str + "/face:" + std::to_string(face_index)
-            : face_id(report_index, face_index);
+            ? solid_id_str + "/face:" + std::to_string(face_idx)
+            : face_id(report_index, face_idx);
         candidate.source_face_label = is_piece
-            ? solid_id_str + "/face[" + std::to_string(face_index) + "]"
-            : face_label(report_index, face_index);
+            ? solid_id_str + "/face[" + std::to_string(face_idx) + "]"
+            : face_label(report_index, face_idx);
         candidate.surface_type = surface_type_name(adaptor.GetType());
         candidate.tool_kind = split_tool_kind_for_surface(adaptor.GetType());
         candidate.reason = has_convexity_failure_face
-            && face_index == convexity_failure_face_index
+            && face_idx == convexity_failure_face_index
             ? "convexity_failure_face"
             : "existing_face";
         candidate.original_volume = original_volume;
@@ -893,20 +1120,89 @@ DecompositionProposal propose_decomposition_candidates(
         ConversionReport split_report;
         std::vector<TopoDS_Solid> pieces =
             split_solid_by_face(solid, face, options, split_report,
-                                report_index, face_index);
+                                report_index, face_idx);
         candidate.diagnostics = split_report.diagnostics;
         candidate.rejection_reason = first_diagnostic_reason(candidate.diagnostics);
         finish_candidate(candidate, pieces);
         proposal.candidates.push_back(std::move(candidate));
-    }
+    };
 
-    bool has_usable_face_candidate = false;
-    for (const DecompositionCandidate& candidate : proposal.candidates) {
-        if (candidate.usable) {
-            has_usable_face_candidate = true;
-            break;
+    auto has_usable_in_proposal = [&]() {
+        for (const DecompositionCandidate& c : proposal.candidates) {
+            if (c.usable) return true;
+        }
+        return false;
+    };
+
+    // High-confidence is the early-stop bar for the lazy path: any
+    // weaker candidate (medium / bbox-fallback) might be beaten by a
+    // not-yet-evaluated face. Only when *no* face produces high do we
+    // fall through to bbox; only when *no* bbox is usable do we give
+    // up. This preserves the baseline's "best candidate wins" semantics
+    // without paying for exhaustive evaluation on the common case.
+    auto has_high_confidence_in_proposal = [&]() {
+        for (const DecompositionCandidate& c : proposal.candidates) {
+            if (c.usable && c.confidence == "high") return true;
+        }
+        return false;
+    };
+
+    if (lazy_first_usable) {
+        // Priority order for the lazy path: convexity-failure face
+        // first (it's usually the natural cut), then remaining faces in
+        // TopExp order. Stop as soon as a *high-confidence* candidate
+        // is found — a merely-usable candidate isn't enough because a
+        // later face may produce a strictly better cut. When no high
+        // candidate exists we evaluate every face and fall through to
+        // the bbox fallback below, preserving the baseline's
+        // best-candidate-wins semantics for the hard cases. The
+        // exhaustive path keeps face-index order so candidate IDs stay
+        // stable for the agent-review workflow.
+        if (has_convexity_failure_face) {
+            std::size_t fi = 0;
+            for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
+                 face_exp.More(); face_exp.Next()) {
+                ++fi;
+                if (fi == convexity_failure_face_index) {
+                    evaluate_face(fi, TopoDS::Face(face_exp.Current()));
+                    break;
+                }
+            }
+        }
+        if (!has_high_confidence_in_proposal()
+            && !convexity_failure_face_only) {
+            std::size_t fi = 0;
+            for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
+                 face_exp.More(); face_exp.Next()) {
+                ++fi;
+                if (has_convexity_failure_face
+                    && fi == convexity_failure_face_index) {
+                    continue;  // already tried
+                }
+                evaluate_face(fi, TopoDS::Face(face_exp.Current()));
+                if (has_high_confidence_in_proposal()) {
+                    break;
+                }
+            }
+        }
+    } else {
+        // Exhaustive order: every face, by TopExp index. Candidate IDs
+        // are derived from this iteration so they match the documented
+        // face IDs (face:N.M ↔ candidate:M for solid:N's M-th face).
+        std::size_t fi = 0;
+        for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
+             face_exp.More(); face_exp.Next()) {
+            ++fi;
+            if (convexity_failure_face_only
+                && has_convexity_failure_face
+                && fi != convexity_failure_face_index) {
+                continue;
+            }
+            evaluate_face(fi, TopoDS::Face(face_exp.Current()));
         }
     }
+
+    const bool has_usable_face_candidate = has_usable_in_proposal();
 
     if (!has_usable_face_candidate) {
         const BBox bbox = bbox_from_shape(solid);
@@ -916,15 +1212,60 @@ DecompositionProposal propose_decomposition_candidates(
                 gp_Pnt point;
                 gp_Dir normal;
             };
-            const double cx = 0.5 * (bbox.xmin + bbox.xmax);
-            const double cy = 0.5 * (bbox.ymin + bbox.ymax);
-            const double cz = 0.5 * (bbox.zmin + bbox.zmax);
+            // Anchor the cutting planes at the volume centroid rather than
+            // the bbox center. For non-convex pieces with off-center mass,
+            // the bbox center can land outside the solid and produce
+            // zero-piece splits. The centroid stays inside the convex hull
+            // and is much more likely to actually bisect the part. The
+            // centroid is clamped to the bbox in case OCCT returns a
+            // value just outside numeric tolerance.
+            const gp_Pnt com = original_props.CentreOfMass();
+            const double cx = std::min(std::max(com.X(), bbox.xmin), bbox.xmax);
+            const double cy = std::min(std::max(com.Y(), bbox.ymin), bbox.ymax);
+            const double cz = std::min(std::max(com.Z(), bbox.zmin), bbox.zmax);
             const AxisFallback fallbacks[] = {
                 {"x", gp_Pnt(cx, cy, cz), gp_Dir(1.0, 0.0, 0.0)},
                 {"y", gp_Pnt(cx, cy, cz), gp_Dir(0.0, 1.0, 0.0)},
                 {"z", gp_Pnt(cx, cy, cz), gp_Dir(0.0, 0.0, 1.0)},
             };
+            const char* longest_axis = "x";
+            double longest_extent = bbox_dx(bbox);
+            if (bbox_dy(bbox) > longest_extent) {
+                longest_axis = "y";
+                longest_extent = bbox_dy(bbox);
+            }
+            if (bbox_dz(bbox) > longest_extent) {
+                longest_axis = "z";
+            }
+            // Priority order: longest bbox axis first, then the others.
+            // Lazy mode stops as soon as one axis split is usable, which
+            // turns the worst case from 3 splits to 1 on parts where any
+            // axis-aligned cut works.
+            std::vector<AxisFallback> ordered_fallbacks;
+            ordered_fallbacks.reserve(3);
             for (const AxisFallback& fallback : fallbacks) {
+                if (std::string(fallback.axis) == longest_axis) {
+                    ordered_fallbacks.push_back(fallback);
+                }
+            }
+            for (const AxisFallback& fallback : fallbacks) {
+                if (std::string(fallback.axis) != longest_axis) {
+                    ordered_fallbacks.push_back(fallback);
+                }
+            }
+
+            // The bbox section is already gated by "no usable face
+            // candidate" — so it only fires on hard pieces, and only 3
+            // splits are involved. We evaluate all 3 (no lazy stop) and
+            // let the final sort pick the best by score. The cost is
+            // bounded by 3 splitter calls; the coverage gain on parts
+            // where the longest axis isn't the right cut is worth it.
+            std::size_t bbox_attempts = 0;
+            for (const AxisFallback& fallback : ordered_fallbacks) {
+                if (longest_bbox_axis_only && bbox_attempts >= 1) {
+                    break;
+                }
+                ++bbox_attempts;
                 ++candidate_index;
                 DecompositionCandidate candidate;
                 candidate.id = "candidate:" + std::to_string(candidate_index);
@@ -933,12 +1274,59 @@ DecompositionProposal propose_decomposition_candidates(
                 candidate.tool_kind = std::string("bbox_plane_") + fallback.axis;
                 candidate.reason = "bbox_axis_fallback";
                 candidate.original_volume = original_volume;
+                candidate.plane_valid = true;
+                candidate.plane_origin = {fallback.point.X(),
+                                          fallback.point.Y(),
+                                          fallback.point.Z()};
+                candidate.plane_normal = {fallback.normal.X(),
+                                          fallback.normal.Y(),
+                                          fallback.normal.Z()};
 
                 ConversionReport split_report;
                 const gp_Pln plane(fallback.point, fallback.normal);
                 std::vector<TopoDS_Solid> pieces =
                     split_solid_by_plane(solid, plane, options, split_report,
                                          report_index, candidate.tool_kind);
+                candidate.diagnostics = split_report.diagnostics;
+                candidate.rejection_reason =
+                    first_diagnostic_reason(candidate.diagnostics);
+                finish_candidate(candidate, pieces);
+                proposal.candidates.push_back(std::move(candidate));
+            }
+
+            // Multi-tool variant: try all three axis-aligned planes at
+            // once. For parts with multiple parallel concavities (rails,
+            // slotted brackets, E-shaped frames) one cut at a time is
+            // not enough; handing the whole set to BRepAlgoAPI_Splitter
+            // in a single call often produces 4+ usable pieces where
+            // any single plane would have failed to bisect.
+            if (include_multi_bbox_fallback) {
+                ++candidate_index;
+                DecompositionCandidate candidate;
+                candidate.id = "candidate:" + std::to_string(candidate_index);
+                candidate.target_id = solid_id_str;
+                candidate.surface_type = "plane";
+                candidate.tool_kind = "bbox_planes_xyz";
+                candidate.reason = "bbox_axis_fallback";
+                candidate.original_volume = original_volume;
+                candidate.planes.reserve(3);
+                std::vector<gp_Pln> occ_planes;
+                occ_planes.reserve(3);
+                for (const AxisFallback& fallback : fallbacks) {
+                    PlaneSpec spec;
+                    spec.origin = {fallback.point.X(), fallback.point.Y(),
+                                   fallback.point.Z()};
+                    spec.normal = {fallback.normal.X(), fallback.normal.Y(),
+                                   fallback.normal.Z()};
+                    candidate.planes.push_back(spec);
+                    occ_planes.emplace_back(fallback.point, fallback.normal);
+                }
+
+                ConversionReport split_report;
+                std::vector<TopoDS_Solid> pieces =
+                    split_solid_by_planes(solid, occ_planes, options,
+                                          split_report, report_index,
+                                          candidate.tool_kind);
                 candidate.diagnostics = split_report.diagnostics;
                 candidate.rejection_reason =
                     first_diagnostic_reason(candidate.diagnostics);
@@ -982,6 +1370,84 @@ DecompositionProposal propose_decomposition_candidates(
         solid_id_str
     });
     return proposal;
+}
+
+DecompositionProposal propose_decomposition_candidates(
+    const CadModel& model,
+    const std::string& solid_id_str,
+    const ConversionOptions& options) {
+    // Exhaustive: every face, every bbox axis, the multi-tool variant.
+    // Used by `decompose-suggest` where the caller (human or agent) wants
+    // to see all options.
+    return propose_decomposition_candidates_impl(model,
+                                                solid_id_str,
+                                                options,
+                                                /*convexity_failure_face_only=*/false,
+                                                /*longest_bbox_axis_only=*/false,
+                                                /*include_multi_bbox_fallback=*/true,
+                                                /*lazy_first_usable=*/false);
+}
+
+DecompositionProposal propose_bsp_decomposition_candidates(
+    const CadModel& model,
+    const std::string& solid_id_str,
+    const ConversionOptions& options) {
+    // BSP path: same candidate ladder as the exhaustive proposer, but
+    // lazy — stop as soon as a usable candidate is found. Priority order
+    // is convexity-failure face, then remaining faces, then bbox axes
+    // (longest first). The multi-tool variant is excluded; it was the
+    // runaway-prone candidate when auto-selected inside the BSP loop.
+    return propose_decomposition_candidates_impl(model,
+                                                solid_id_str,
+                                                options,
+                                                /*convexity_failure_face_only=*/false,
+                                                /*longest_bbox_axis_only=*/false,
+                                                /*include_multi_bbox_fallback=*/false,
+                                                /*lazy_first_usable=*/true);
+}
+
+bool decomposition_target_exact_csg_supported(const CadModel& model,
+                                             const std::string& solid_id_str,
+                                             const ConversionOptions& options,
+                                             bool* found_out) {
+    using namespace cad2csg::detail;
+
+    if (found_out) {
+        *found_out = false;
+    }
+
+    TopoDS_Solid solid;
+    std::size_t report_index = 0;
+    bool is_piece = false;
+    if (!find_decomposition_target(model, solid_id_str, &solid, &report_index, &is_piece)) {
+        return false;
+    }
+
+    if (found_out) {
+        *found_out = true;
+    }
+
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(solid, props);
+
+    DecomposedSolidPiece piece_record;
+    piece_record.id = solid_id_str;
+    piece_record.label = solid_id_str;
+    piece_record.source_solid_id = is_piece ? solid_id_str : std::string();
+    piece_record.solid = solid;
+    piece_record.volume = std::abs(props.Mass());
+    piece_record.active = true;
+
+    std::size_t piece_index = 0;
+    if (is_piece) {
+        parse_piece_id(solid_id_str, &piece_index);
+    } else {
+        piece_index = report_index;
+    }
+
+    const AnalyzedDecomposedPiece analyzed =
+        analyze_decomposed_piece(piece_record, piece_index, report_index, options);
+    return analyzed.exact_csg_supported;
 }
 
 std::string add_synthetic_box(CadModel& model,
@@ -1032,6 +1498,13 @@ std::string add_synthetic_cylinder(CadModel& model,
     body.base = base;
     body.height = height;
     body.radius = radius;
+    body.bbox.valid = true;
+    body.bbox.xmin = std::min(base.x, base.x + height.x) - radius;
+    body.bbox.ymin = std::min(base.y, base.y + height.y) - radius;
+    body.bbox.zmin = std::min(base.z, base.z + height.z) - radius;
+    body.bbox.xmax = std::max(base.x, base.x + height.x) + radius;
+    body.bbox.ymax = std::max(base.y, base.y + height.y) + radius;
+    body.bbox.zmax = std::max(base.z, base.z + height.z) + radius;
     body.material_id = material_id;
     body.density = density;
     model.synthetic_bodies.push_back(body);

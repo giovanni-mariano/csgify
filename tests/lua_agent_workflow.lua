@@ -18,11 +18,32 @@ end
 if type(report.assembly) ~= "table" or #report.assembly == 0 then
     error("expected report.assembly to be populated")
 end
+if type(report.decision_requests) ~= "table" then
+    error("expected report.decision_requests table")
+end
 if report.solids[1].id ~= work .. "/solid:1" then
     error("unexpected scoped solid id: " .. tostring(report.solids[1].id))
 end
 if report.assembly[1].shape_id ~= work .. "/solid:1" then
     error("unexpected assembly shape id: " .. tostring(report.assembly[1].shape_id))
+end
+
+local holes = s:propose_hole_fills(work, {
+    host = work .. "/solid:1",
+    max_radius = 5.0,
+    max_volume_fraction = 0.001
+})
+if not holes.ok then
+    error("expected hole-fill proposal contract to be ok")
+end
+if type(holes.candidates) ~= "table" then
+    error("expected hole-fill candidates table")
+end
+if type(holes.decision_requests) ~= "table" then
+    error("expected hole-fill decision_requests table")
+end
+if type(holes.diagnostics) ~= "table" then
+    error("expected hole-fill diagnostics table")
 end
 
 report, err = s:replace_solid(work .. "/solid:1", "bbox", {

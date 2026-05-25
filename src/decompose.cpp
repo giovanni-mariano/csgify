@@ -240,4 +240,44 @@ std::vector<TopoDS_Solid> split_solid_by_plane(const TopoDS_Solid& solid,
                         "Fallback plane decomposition did not produce multiple solid pieces.");
 }
 
+std::vector<TopoDS_Solid> split_solid_by_planes(const TopoDS_Solid& solid,
+                                                const std::vector<gp_Pln>& planes,
+                                                const ConversionOptions& options,
+                                                ConversionReport& report,
+                                                std::size_t solid_index,
+                                                const std::string& label) {
+    ++report.decomposition_attempts;
+
+    if (planes.empty()) {
+        add_diag(report, DiagnosticSeverity::warning, "decomposition_no_planes_tool",
+                 "Multi-plane decomposition was called with no planes.",
+                 label.empty() ? solid_label(solid_index) : label);
+        return {};
+    }
+
+    const double span = solid_box_span(solid);
+    const double half_size = std::max(1.0, span * 2.0);
+
+    NCollection_List<TopoDS_Shape> tools;
+    for (const gp_Pln& plane : planes) {
+        TopoDS_Shape cutter =
+            BRepBuilderAPI_MakeFace(plane, -half_size, half_size,
+                                    -half_size, half_size).Shape();
+        if (!cutter.IsNull()) {
+            tools.Append(cutter);
+        }
+    }
+    if (tools.IsEmpty()) {
+        add_diag(report, DiagnosticSeverity::warning, "decomposition_no_planes_tool",
+                 "No usable plane tools were built for multi-plane decomposition.",
+                 label.empty() ? solid_label(solid_index) : label);
+        return {};
+    }
+
+    return run_splitter(solid, tools, options, report, solid_index,
+                        "decomposition_by_planes_splitter_failed",
+                        "decomposition_by_planes_no_split",
+                        "Multi-plane decomposition did not produce multiple solid pieces.");
+}
+
 } // namespace cad2csg::detail

@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <BRepAdaptor_Surface.hxx>
@@ -38,6 +39,98 @@ const ShapeMetadata* find_solid_metadata(const CadModel& model, const std::strin
         }
     }
     return nullptr;
+}
+
+DecisionMetric metric(const std::string& name, double value, const std::string& unit = {}) {
+    DecisionMetric out;
+    out.name = name;
+    out.value = value;
+    out.unit = unit;
+    return out;
+}
+
+DecisionCandidateView candidate_view(const std::string& id,
+                                     const std::string& action,
+                                     const std::string& confidence,
+                                     const std::string& reason,
+                                     std::vector<DecisionMetric> metrics = {}) {
+    DecisionCandidateView candidate;
+    candidate.id = id;
+    candidate.action = action;
+    candidate.confidence = confidence;
+    candidate.reason = reason;
+    candidate.metrics = std::move(metrics);
+    return candidate;
+}
+
+const SplineFaceFit* best_spline_fit(const SplineFitCandidates& fits) {
+    const SplineFaceFit* best = nullptr;
+    auto consider = [&](const SplineFaceFit& fit) {
+        if (!fit.available) {
+            return;
+        }
+        if (!best || fit.relative_max_deviation < best->relative_max_deviation) {
+            best = &fit;
+        }
+    };
+    consider(fits.plane);
+    consider(fits.sphere);
+    consider(fits.cylinder);
+    consider(fits.cone);
+    return best;
+}
+
+std::string replacement_action_for_fit(SplineFitKind kind) {
+    switch (kind) {
+    case SplineFitKind::plane:
+        return "replace_face_with_plane";
+    case SplineFitKind::sphere:
+        return "replace_face_with_sphere";
+    case SplineFitKind::cylinder:
+        return "replace_face_with_cylinder";
+    case SplineFitKind::cone:
+        return "replace_face_with_cone";
+    case SplineFitKind::none:
+        break;
+    }
+    return "manual";
+}
+
+std::string fit_confidence(const SplineFaceFit& fit) {
+    if (!fit.available) {
+        return "none";
+    }
+    if (fit.relative_max_deviation <= 1.0e-8) {
+        return "high";
+    }
+    if (fit.relative_max_deviation <= 1.0e-4) {
+        return "medium";
+    }
+    return "low";
+}
+
+std::vector<DecisionCandidateView> spline_fit_candidates_for_face(
+    const SplineFitCandidates& fits) {
+    std::vector<DecisionCandidateView> out;
+    auto add = [&](const SplineFaceFit& fit) {
+        if (!fit.available) {
+            return;
+        }
+        const std::string kind = spline_fit_kind_name(fit.kind);
+        out.push_back(candidate_view(
+            "fit:" + kind,
+            replacement_action_for_fit(fit.kind),
+            fit_confidence(fit),
+            "analytic_fit",
+            {metric("max_deviation", fit.max_deviation),
+             metric("rms_deviation", fit.rms_deviation),
+             metric("relative_max_deviation", fit.relative_max_deviation)}));
+    };
+    add(fits.plane);
+    add(fits.sphere);
+    add(fits.cylinder);
+    add(fits.cone);
+    return out;
 }
 
 void inspect_solid(const TopoDS_Solid& solid,
@@ -91,35 +184,37 @@ void inspect_solid(const TopoDS_Solid& solid,
         BRepAdaptor_Surface adaptor(face, false);
         const GeomAbs_SurfaceType surface_type = adaptor.GetType();
         AnalyticSurface surface;
+        const FaceReplacement* replacement =
+            find_face_replacement(&model.face_replacements, solid_index, face_index);
         const bool exact_supported =
-            analytic_surface_from_face(face, solid_index, face_index, report, true, &surface);
+            analytic_surface_from_face(face,
+                                       solid_index,
+                                       face_index,
+                                       report,
+                                       true,
+                                       &surface,
+                                       &model.face_replacements);
         if (exact_supported) {
             ++report.analytic_faces;
         }
         analyzed_face.surface_type = surface_type_name(surface_type);
+        analyzed_face.support_kind = replacement
+            ? ("replacement_" + std::string(spline_fit_kind_name(replacement->kind)))
+            : surface_support_kind_name(surface_type);
         analyzed_face.exact_csg_supported = exact_supported;
-        analyzed_face.needs_spline_replacement = surface_type_is_spline(surface_type);
+        analyzed_face.needs_spline_replacement =
+            surface_type_is_spline(surface_type) && !replacement;
         analyzed_face.needs_emitter =
             !exact_supported && surface_type_needs_emitter(surface_type);
+        analyzed_face.needs_surface_replacement =
+            analyzed_face.needs_spline_replacement
+            || (!exact_supported && !analyzed_face.needs_emitter);
 
         if (analyzed_face.needs_spline_replacement) {
             analyzed_face.spline_fits = fit_spline_face(face);
             // Pick the best fit and append a hint to the freshly-emitted
             // unsupported_spline_face diagnostic for this face.
-            const SplineFitCandidates& f = analyzed_face.spline_fits;
-            const SplineFaceFit* best = nullptr;
-            auto consider = [&](const SplineFaceFit& fit) {
-                if (!fit.available) {
-                    return;
-                }
-                if (!best || fit.relative_max_deviation < best->relative_max_deviation) {
-                    best = &fit;
-                }
-            };
-            consider(f.plane);
-            consider(f.sphere);
-            consider(f.cylinder);
-            consider(f.cone);
+            const SplineFaceFit* best = best_spline_fit(analyzed_face.spline_fits);
             if (best && !report.diagnostics.empty()) {
                 Diagnostic& last = report.diagnostics.back();
                 if (last.code == "unsupported_spline_face"
@@ -138,9 +233,13 @@ void inspect_solid(const TopoDS_Solid& solid,
         analyzed_solid.face_count = analyzed_solid.face_ids.size();
         analyzed_solid.needs_spline_replacement =
             analyzed_solid.needs_spline_replacement || analyzed_face.needs_spline_replacement;
+        analyzed_solid.needs_surface_replacement =
+            analyzed_solid.needs_surface_replacement
+            || analyzed_face.needs_surface_replacement;
         analyzed_solid.needs_user_decision =
             analyzed_solid.needs_user_decision
             || analyzed_face.needs_spline_replacement
+            || analyzed_face.needs_surface_replacement
             || analyzed_face.needs_emitter
             || !analyzed_face.exact_csg_supported;
         report.faces.push_back(analyzed_face);
@@ -168,6 +267,7 @@ void inspect_solid(const TopoDS_Solid& solid,
     analyzed_solid.exact_csg_supported =
         !analyzed_solid.needs_decomposition
         && !analyzed_solid.needs_spline_replacement
+        && !analyzed_solid.needs_surface_replacement
         && !analyzed_solid.needs_user_decision;
     analyzed_solid.fitted_cylinder_replacement =
         fitted_cylinder_candidate(solid, analyzed_solid.volume);
@@ -176,6 +276,215 @@ void inspect_solid(const TopoDS_Solid& solid,
     analyzed_solid.fitted_cone_replacement =
         fitted_cone_candidate(solid, analyzed_solid.volume);
     report.solids.push_back(analyzed_solid);
+}
+
+void append_decision_requests(ConversionReport& report) {
+    std::vector<DecisionRequest> requests;
+
+    for (const AnalyzedSolid& solid : report.solids) {
+        if (solid.needs_decomposition) {
+            DecisionRequest request;
+            request.id = "decision:decomposition:" + solid.id;
+            request.kind = "decomposition";
+            request.target_id = solid.id;
+            request.reason = "nonconvex_or_not_single_cell_convertible";
+            request.recommended_action = "decompose-suggest";
+            request.summary =
+                "Solid needs decomposition before it can be emitted as valid CSG.";
+            request.metrics = {
+                metric("volume", solid.volume),
+                metric("volume_fraction", solid.volume_fraction),
+                metric("face_count", static_cast<double>(solid.face_count)),
+            };
+            request.candidates.push_back(candidate_view(
+                "action:decompose-suggest",
+                "decompose-suggest",
+                "review",
+                "Generate split candidates and ask the user only if no high-confidence candidate exists."));
+            requests.push_back(std::move(request));
+        }
+
+        if (solid.small_volume_candidate || solid.small_bbox_candidate
+            || solid.thin_plate_candidate || solid.long_body_candidate) {
+            DecisionRequest request;
+            request.id = "decision:semantic_cleanup:" + solid.id;
+            request.kind = "semantic_cleanup";
+            request.target_id = solid.id;
+            request.reason = "cleanup_candidate";
+            request.recommended_action = "remove-suggest";
+            request.summary =
+                "Solid has cleanup metrics that may indicate removable or simplifiable CAD detail.";
+            request.metrics = {
+                metric("volume", solid.volume),
+                metric("volume_fraction", solid.volume_fraction),
+                metric("bbox_diagonal_fraction", solid.bbox_diagonal_fraction),
+                metric("bbox_aspect_ratio", solid.bbox_aspect_ratio),
+            };
+            if (solid.small_volume_candidate) {
+                request.candidates.push_back(candidate_view(
+                    "action:review_remove_small_volume",
+                    "remove_solid",
+                    "review",
+                    "Small volume relative to the active model."));
+            }
+            if (solid.small_bbox_candidate) {
+                request.candidates.push_back(candidate_view(
+                    "action:review_remove_small_bbox",
+                    "remove_solid",
+                    "review",
+                    "Small bounding box relative to the active model."));
+            }
+            if (solid.thin_plate_candidate) {
+                request.candidates.push_back(candidate_view(
+                    "action:review_simplify_thin_plate",
+                    "replace_solid",
+                    "review",
+                    "Thin plate-like body may be removable or replaceable depending on neutronics intent."));
+            }
+            if (solid.long_body_candidate) {
+                request.candidates.push_back(candidate_view(
+                    "action:review_simplify_long_body",
+                    "replace_solid",
+                    "review",
+                    "Long thin body may be a rail, rod, wire, or support requiring human semantics."));
+            }
+            requests.push_back(std::move(request));
+        }
+
+        auto add_replacement_review =
+            [&](const std::string& id,
+                const std::string& action,
+                const ReplacementMetrics& metrics) {
+                if (!metrics.available) {
+                    return;
+                }
+                if (!solid.exact_csg_supported) {
+                    return;
+                }
+                constexpr double kReviewFloor = 1.0e-4;
+                if (metrics.relative_delta > kReviewFloor
+                    && metrics.relative_delta <= 0.05) {
+                    DecisionRequest request;
+                    request.id = "decision:replacement:" + solid.id + ":" + id;
+                    request.kind = "replacement";
+                    request.target_id = solid.id;
+                    request.reason = "low_delta_simplified_body_candidate";
+                    request.recommended_action = action;
+                    request.summary =
+                        "A simplified body has small volume delta and may be acceptable after visual review.";
+                    request.metrics = {
+                        metric("original_volume", solid.volume),
+                        metric("replacement_volume", metrics.volume),
+                        metric("absolute_delta", metrics.absolute_delta),
+                        metric("relative_delta", metrics.relative_delta),
+                        metric("fill_ratio", metrics.fill_ratio),
+                    };
+                    request.candidates.push_back(candidate_view(
+                        "action:" + action,
+                        action,
+                        metrics.relative_delta <= 0.01 ? "medium" : "low",
+                        "Volume-preserving simplified replacement candidate.",
+                        request.metrics));
+                    requests.push_back(std::move(request));
+                }
+            };
+        add_replacement_review("bbox", "replace_solid_bbox", solid.bbox_replacement);
+        add_replacement_review("bbox_cylinder", "replace_solid_bbox_cylinder",
+                               solid.bbox_cylinder_replacement);
+        add_replacement_review("fitted_cylinder", "replace_solid_fitted_cylinder",
+                               solid.fitted_cylinder_replacement.metrics);
+        add_replacement_review("fitted_sphere", "replace_solid_fitted_sphere",
+                               solid.fitted_sphere_replacement.metrics);
+        add_replacement_review("fitted_cone", "replace_solid_fitted_cone",
+                               solid.fitted_cone_replacement.metrics);
+    }
+
+    for (const AnalyzedFace& face : report.faces) {
+        if (face.needs_spline_replacement) {
+            DecisionRequest request;
+            request.id = "decision:spline_replacement:" + face.id;
+            request.kind = "spline_replacement";
+            request.target_id = face.id;
+            request.reason = "unsupported_spline_face";
+            const SplineFaceFit* best = best_spline_fit(face.spline_fits);
+            if (best) {
+                request.recommended_action = replacement_action_for_fit(best->kind);
+                request.summary = "Spline face has analytic fit candidates; visual review is needed unless the deviation budget is project-approved.";
+                request.metrics = {
+                    metric("area", face.area),
+                    metric("best_max_deviation", best->max_deviation),
+                    metric("best_rms_deviation", best->rms_deviation),
+                    metric("best_relative_max_deviation", best->relative_max_deviation),
+                };
+            } else {
+                request.recommended_action = "manual";
+                request.summary =
+                    "Spline face has no analytic fit candidate within the current fitter capabilities.";
+                request.metrics = {metric("area", face.area)};
+            }
+            request.candidates = spline_fit_candidates_for_face(face.spline_fits);
+            if (request.candidates.empty()) {
+                request.candidates.push_back(candidate_view(
+                    "action:manual", "manual", "review",
+                    "No analytic fit is available."));
+            }
+            requests.push_back(std::move(request));
+        } else if (face.needs_emitter || !face.exact_csg_supported) {
+            DecisionRequest request;
+            request.id = "decision:unsupported_surface:" + face.id;
+            request.kind = "unsupported_surface";
+            request.target_id = face.id;
+            request.reason = "unsupported_analytic_face";
+            request.recommended_action = "manual";
+            request.summary =
+                "Face is not currently supported by the emitter and needs an explicit treatment.";
+            request.metrics = {metric("area", face.area)};
+            request.candidates.push_back(candidate_view(
+                "action:add_emitter_or_replace",
+                "add_emitter_or_replace_surface",
+                "review",
+                "Implement emitter support, replace the face, or decompose the parent solid."));
+            requests.push_back(std::move(request));
+        }
+    }
+
+    for (const AnalyzedDecomposedPiece& piece : report.decomposed_pieces) {
+        if (piece.needs_decomposition || piece.needs_spline_replacement
+            || piece.needs_surface_replacement
+            || piece.needs_user_decision) {
+            DecisionRequest request;
+            request.id = "decision:piece_repair:" + piece.id;
+            request.kind = "piece_repair";
+            request.target_id = piece.id;
+            request.reason = "decomposed_piece_not_convertible";
+            request.recommended_action =
+                piece.needs_decomposition ? "decompose-suggest" : "manual";
+            request.summary =
+                "A decomposed piece still is not directly convertible to CSG.";
+            request.metrics = {
+                metric("volume", piece.volume),
+                metric("face_count", static_cast<double>(piece.face_count)),
+            };
+            request.candidates.push_back(candidate_view(
+                "action:repair_piece",
+                request.recommended_action,
+                "review",
+                "Continue decomposition, replace unsupported surfaces, or inspect manually."));
+            requests.push_back(std::move(request));
+        }
+    }
+
+    std::sort(requests.begin(), requests.end(),
+              [](const DecisionRequest& a, const DecisionRequest& b) {
+                  if (a.target_id != b.target_id) {
+                      return a.target_id < b.target_id;
+                  }
+                  if (a.kind != b.kind) {
+                      return a.kind < b.kind;
+                  }
+                  return a.id < b.id;
+              });
+    report.decision_requests = std::move(requests);
 }
 
 } // namespace
@@ -210,6 +519,9 @@ AnalyzedDecomposedPiece analyze_decomposed_piece(const DecomposedSolidPiece& pie
             if (surface_type_is_spline(adaptor.GetType())) {
                 analyzed.needs_spline_replacement = true;
             }
+            if (!surface_type_needs_emitter(adaptor.GetType())) {
+                analyzed.needs_surface_replacement = true;
+            }
         }
     }
 
@@ -229,11 +541,13 @@ AnalyzedDecomposedPiece analyze_decomposed_piece(const DecomposedSolidPiece& pie
     analyzed.exact_csg_supported =
         all_faces_supported
         && convex
-        && !analyzed.needs_spline_replacement;
+        && !analyzed.needs_spline_replacement
+        && !analyzed.needs_surface_replacement;
     analyzed.needs_user_decision =
         !analyzed.exact_csg_supported
         || analyzed.needs_decomposition
-        || analyzed.needs_spline_replacement;
+        || analyzed.needs_spline_replacement
+        || analyzed.needs_surface_replacement;
     return analyzed;
 }
 
@@ -344,6 +658,7 @@ AnalysisReport analyze_model(const CadModel& model,
     }
 
     finalize_cleanup_metrics(report, options);
+    append_decision_requests(report);
 
     if (report.solids_seen == 0) {
         add_diag(report, DiagnosticSeverity::error, "no_active_solids",

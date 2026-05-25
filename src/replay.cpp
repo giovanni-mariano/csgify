@@ -231,11 +231,85 @@ bool dispatch_solid_op(Session& session,
         if (!r.ok) *error_out = "decompose_by_face failed";
         return r.ok;
     }
+    if (op.op == "decompose_by_plane") {
+        if (!op.params || op.params->kind != JsonKind::object) {
+            *error_out = "missing params on decompose_by_plane";
+            return false;
+        }
+        const JsonValue* ox = op.params->get("origin_x");
+        const JsonValue* oy = op.params->get("origin_y");
+        const JsonValue* oz = op.params->get("origin_z");
+        const JsonValue* nx = op.params->get("normal_x");
+        const JsonValue* ny = op.params->get("normal_y");
+        const JsonValue* nz = op.params->get("normal_z");
+        if (!ox || !oy || !oz || !nx || !ny || !nz) {
+            *error_out = "missing plane parameters on decompose_by_plane";
+            return false;
+        }
+        const CommandResult r = decompose_by_plane(
+            session,
+            resolved_local_id,
+            Vec3{ox->as_number(), oy->as_number(), oz->as_number()},
+            Vec3{nx->as_number(), ny->as_number(), nz->as_number()},
+            ReportIdMode::local);
+        if (!r.ok) *error_out = "decompose_by_plane failed";
+        return r.ok;
+    }
+    if (op.op == "decompose_by_planes") {
+        if (!op.params || op.params->kind != JsonKind::object) {
+            *error_out = "missing params on decompose_by_planes";
+            return false;
+        }
+        const JsonValue* count = op.params->get("plane_count");
+        if (!count) {
+            *error_out = "missing plane_count on decompose_by_planes";
+            return false;
+        }
+        std::vector<PlaneSpec> planes;
+        const int plane_count = static_cast<int>(count->as_number());
+        for (int i = 0; i < plane_count; ++i) {
+            const std::string idx = std::to_string(i);
+            const JsonValue* ox = op.params->get("plane_" + idx + "_ox");
+            const JsonValue* oy = op.params->get("plane_" + idx + "_oy");
+            const JsonValue* oz = op.params->get("plane_" + idx + "_oz");
+            const JsonValue* nx = op.params->get("plane_" + idx + "_nx");
+            const JsonValue* ny = op.params->get("plane_" + idx + "_ny");
+            const JsonValue* nz = op.params->get("plane_" + idx + "_nz");
+            if (!ox || !oy || !oz || !nx || !ny || !nz) {
+                *error_out = "missing indexed plane parameter on decompose_by_planes";
+                return false;
+            }
+            planes.push_back({Vec3{ox->as_number(), oy->as_number(), oz->as_number()},
+                              Vec3{nx->as_number(), ny->as_number(), nz->as_number()}});
+        }
+        const CommandResult r = decompose_by_planes(session,
+                                                    resolved_local_id,
+                                                    planes,
+                                                    ReportIdMode::local);
+        if (!r.ok) *error_out = "decompose_by_planes failed";
+        return r.ok;
+    }
     if (op.op == "apply_decomposition_candidate") {
         std::string face_id;
         if (op.params && op.params->kind == JsonKind::object) {
             if (const JsonValue* v = op.params->get("face_id")) {
                 face_id = v->as_string();
+            }
+            const JsonValue* ox = op.params->get("origin_x");
+            const JsonValue* oy = op.params->get("origin_y");
+            const JsonValue* oz = op.params->get("origin_z");
+            const JsonValue* nx = op.params->get("normal_x");
+            const JsonValue* ny = op.params->get("normal_y");
+            const JsonValue* nz = op.params->get("normal_z");
+            if (ox && oy && oz && nx && ny && nz) {
+                const CommandResult r = decompose_by_plane(
+                    session,
+                    resolved_local_id,
+                    Vec3{ox->as_number(), oy->as_number(), oz->as_number()},
+                    Vec3{nx->as_number(), ny->as_number(), nz->as_number()},
+                    ReportIdMode::local);
+                if (!r.ok) *error_out = "apply_decomposition_candidate plane failed";
+                return r.ok;
             }
         }
         if (face_id.empty()) {

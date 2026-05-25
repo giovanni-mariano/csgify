@@ -10,6 +10,11 @@ set(CAD2CSG_LIBALEA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../libalea" CACHE PATH "Pa
 set(CAD2CSG_VENDOR_LUA_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/vendor/lua-5.5.0" CACHE PATH "Path to vendored Lua source tree")
 
 find_package(OpenCASCADE 8.0.0 EXACT REQUIRED)
+find_library(CAD2CSG_OCCT_TKOPENGL
+    NAMES TKOpenGl
+    PATHS "${OpenCASCADE_LIBRARY_DIR}"
+    NO_DEFAULT_PATH
+)
 
 option(CAD2CSG_ENABLE_LUA "Build the batch Lua runner from vendored Lua sources" ON)
 if(CAD2CSG_ENABLE_LUA)
@@ -64,12 +69,14 @@ add_library(cad2csg_engine
     src/analyze.cpp
     src/c_api.cpp
     src/cleanup.cpp
+    src/decision_pack.cpp
     src/decision_log.cpp
     src/decompose.cpp
     src/emit.cpp
     src/engine.cpp
     src/engine_internal.cpp
     src/fitted_candidates.cpp
+    src/hole_fill.cpp
     src/import.cpp
     src/lua_runner.cpp
     src/recipe.cpp
@@ -104,6 +111,28 @@ endif()
 
 add_executable(cad2csg src/main.cpp)
 target_link_libraries(cad2csg PRIVATE cad2csg_engine)
+if(CAD2CSG_OCCT_TKOPENGL)
+    find_library(CAD2CSG_OCCT_TKV3D
+        NAMES TKV3d
+        PATHS "${OpenCASCADE_LIBRARY_DIR}"
+        NO_DEFAULT_PATH
+    )
+    find_library(CAD2CSG_OCCT_TKSERVICE
+        NAMES TKService
+        PATHS "${OpenCASCADE_LIBRARY_DIR}"
+        NO_DEFAULT_PATH
+    )
+    target_sources(cad2csg PRIVATE src/viewer.cpp)
+    target_link_libraries(cad2csg PRIVATE
+        "${CAD2CSG_OCCT_TKOPENGL}"
+        "${CAD2CSG_OCCT_TKV3D}"
+        "${CAD2CSG_OCCT_TKSERVICE}"
+        X11
+    )
+    target_compile_definitions(cad2csg PRIVATE CAD2CSG_HAVE_TKOPENGL=1)
+else()
+    target_compile_definitions(cad2csg PRIVATE CAD2CSG_HAVE_TKOPENGL=0)
+endif()
 target_include_directories(cad2csg PRIVATE "${CAD2CSG_LIBALEA_ROOT}/include")
 set_target_properties(cad2csg PROPERTIES
     BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
@@ -172,6 +201,24 @@ if(BUILD_TESTING)
             "$<TARGET_FILE:cad2csg>"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
             "${CMAKE_CURRENT_BINARY_DIR}/decision-log-output"
+    )
+
+    add_test(
+        NAME cad2csg_decision_pack_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/decision_pack_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/decision-pack-output"
+    )
+
+    add_test(
+        NAME cad2csg_hole_fill_contract_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/hole_fill_contract_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/hole-fill-output"
     )
 
     add_test(
@@ -272,6 +319,24 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/box.step"
                 "${CMAKE_CURRENT_BINARY_DIR}/lua_agent_box.i"
                 "${CMAKE_CURRENT_BINARY_DIR}/lua_agent_report.json"
+        )
+        add_test(
+            NAME cad2csg_hole_fill_apply
+            COMMAND
+                "$<TARGET_FILE:cad2csg>"
+                lua
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/hole_fill_apply.lua"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/bolt_hole.step"
+                "${CMAKE_CURRENT_BINARY_DIR}/hole_fill_apply.i"
+        )
+        add_test(
+            NAME cad2csg_surface_replacement_apply
+            COMMAND
+                "$<TARGET_FILE:cad2csg>"
+                lua
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/surface_replacement_apply.lua"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/spline_face.step"
+                "${CMAKE_CURRENT_BINARY_DIR}/surface_replacement_apply.i"
         )
     endif()
 endif()
