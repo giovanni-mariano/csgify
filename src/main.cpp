@@ -1389,24 +1389,7 @@ int run_simplify_command(int argc, char** argv) {
                 has_max_deviation,
                 max_deviation,
                 cad2csg::ReportIdMode::local);
-            // `action_result.ok` from the session API is
-            // `op_succeeded && document.report.ok()`. When the
-            // requested face replacement applied cleanly but *other*
-            // faces of the same solid still carry error-severity
-            // diagnostics (e.g. unsupported_spline_face on a sibling),
-            // `report.ok()` returns false even though the targeted op
-            // worked. Distinguish the two cases by looking for the
-            // op's own `face_replacement_recorded` info diagnostic on
-            // the requested face id. If present, the action applied.
-            const bool op_recorded = std::any_of(
-                action_result.report.diagnostics.begin(),
-                action_result.report.diagnostics.end(),
-                [&](const cad2csg::Diagnostic& d) {
-                    return d.code == "face_replacement_recorded"
-                        && (d.shape_id == id
-                            || d.local_shape_id == id);
-                });
-            if (!action_result.ok && !op_recorded) {
+            if (!action_result.ok) {
                 const cad2csg::Diagnostic face_diag =
                     action_result.report.diagnostics.empty()
                         ? cad2csg::Diagnostic{}
@@ -1424,12 +1407,6 @@ int run_simplify_command(int argc, char** argv) {
                               << report_path << '\n';
                 }
                 return EXIT_FAILURE;
-            }
-            // Op applied but other model errors remain: keep action_result.ok
-            // truthful so the outer flow can still emit (and surface what's
-            // left via diagnostics + the on-disk report).
-            if (op_recorded) {
-                action_result.ok = true;
             }
             if (comma == std::string::npos) {
                 break;
@@ -1567,13 +1544,9 @@ int run_simplify_command(int argc, char** argv) {
     }
 
     if (!action_result.ok) {
-        // `action_result.ok` from finish_document_mutation is
-        // `op_succeeded && report.ok()`. The report may carry errors
-        // about *other* parts of the model (e.g., remaining spline
-        // faces) even when the requested action itself applied
-        // cleanly. When --report was requested, write the post-action
-        // report anyway so the caller can see what changed and what's
-        // still blocked. Exit code remains EXIT_FAILURE.
+        // The requested action did not apply. Write the post-action
+        // report if --report was given so the caller can see the
+        // failure diagnostics. Exit code is EXIT_FAILURE.
         print_diagnostics(action_result.report);
         if (!report_path.empty()
             && write_report_or_stdout(action_result.report, report_path) != 0) {
@@ -2655,10 +2628,8 @@ int run_apply_command(int argc, char** argv) {
     }
 
     if (!action_result.ok) {
-        // Same pattern as run_simplify_command: if --report was given,
-        // write the post-action report so the caller can see what
-        // changed and what's still blocked. See the longer comment in
-        // run_simplify_command for the rationale.
+        // Action did not apply; write the post-action report when
+        // --report was given so the caller sees the failure detail.
         print_diagnostics(action_result.report);
         if (!report_path.empty()
             && write_report_or_stdout(action_result.report, report_path) != 0) {

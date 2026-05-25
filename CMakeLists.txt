@@ -392,5 +392,14 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/spline_face.step"
                 "${CMAKE_CURRENT_BINARY_DIR}/surface_replacement_apply.i"
         )
+        add_test(
+            NAME cad2csg_lua_api_smoke
+            COMMAND
+                bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/lua_api_smoke.sh"
+                "$<TARGET_FILE:cad2csg>"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/lua_api.lua"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+                "${CMAKE_CURRENT_BINARY_DIR}/lua-api-output"
+        )
     endif()
 endif()

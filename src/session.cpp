@@ -611,7 +611,10 @@ CommandResult analyze(Session& session,
             ? scoped_report(document, local_report)
             : local_report;
         session.last_report_value = document.report;
-        return {document.report.ok(), document.report};
+        // analyze always succeeds at producing a report; result.ok means
+        // "analysis ran", not "the model is clean". Callers should check
+        // `report.ok()` or per-solid flags to decide what's needed next.
+        return {true, document.report};
     }
     return session_error(session,
                          "document_not_found",
@@ -667,6 +670,15 @@ CommandResult finish_document_mutation(Session& session,
                                        CadDocument& document,
                                        bool ok,
                                        ReportIdMode id_mode = ReportIdMode::scoped) {
+    // CommandResult.ok means "the requested operation applied" -- not
+    // "the model is now globally emit-ready". The post-mutation report
+    // is returned alongside so the caller can inspect `report.ok()` or
+    // walk diagnostics to decide whether further work is needed. This
+    // distinction matters whenever an op succeeds on its target but
+    // unrelated parts of the model still carry error-severity
+    // diagnostics (e.g., a spline face is replaced but the same solid
+    // has other spline faces left, or a solid is removed but a
+    // sibling still needs decomposition).
     const auto start = Clock::now();
     ConversionReport local_report = analyze_model(document.model, document.options);
     document.performance.analyze_ms += elapsed_ms(start);
@@ -675,7 +687,7 @@ CommandResult finish_document_mutation(Session& session,
         ? scoped_report(document, local_report)
         : local_report;
     session.last_report_value = document.report;
-    return {ok && document.report.ok(), document.report};
+    return {ok, document.report};
 }
 
 CommandResult mutate_solid(Session& session,
@@ -1021,9 +1033,9 @@ CommandResult apply_surface_replacement_candidate(
                                           max_deviation_budget)},
                             ok ? "applied" : "failed");
     }
-    CommandResult result = finish_document_mutation(session, *target.document, ok, id_mode);
-    result.ok = ok;
-    return result;
+    // finish_document_mutation now returns result.ok = ok ("op applied")
+    // rather than ok && report.ok(); no override needed here.
+    return finish_document_mutation(session, *target.document, ok, id_mode);
 }
 
 CommandResult auto_fit_splines(Session& session,

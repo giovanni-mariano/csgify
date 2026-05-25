@@ -25,12 +25,64 @@ constexpr const char* kSessionMeta = "cad2csg.session";
 struct LuaSession {
     SessionPtr session;
 
-    LuaSession() : session(create_session()) {}
+    explicit LuaSession(SessionPtr s) : session(std::move(s)) {}
 };
 
 LuaSession* check_session(lua_State* L, int index) {
     void* userdata = luaL_checkudata(L, index, kSessionMeta);
     return static_cast<LuaSession*>(userdata);
+}
+
+// Parse a ConversionOptions table. Recognized keys mirror the CLI
+// flags introduced in M2 (units, scale, normalize-units) plus the
+// existing engine tuning knobs. Unknown keys are silently ignored so
+// future fields can be added without breaking scripts.
+ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
+    ConversionOptions options;
+    if (lua_isnoneornil(L, index)) {
+        return options;
+    }
+    luaL_checktype(L, index, LUA_TTABLE);
+
+    auto take_string = [&](const char* key, std::string* out) {
+        lua_getfield(L, index, key);
+        if (lua_isstring(L, -1)) {
+            *out = lua_tostring(L, -1);
+        }
+        lua_pop(L, 1);
+    };
+    auto take_double = [&](const char* key, double* out) {
+        lua_getfield(L, index, key);
+        if (lua_isnumber(L, -1)) {
+            *out = lua_tonumber(L, -1);
+        }
+        lua_pop(L, 1);
+    };
+    auto take_bool = [&](const char* key, bool* out) {
+        lua_getfield(L, index, key);
+        if (!lua_isnil(L, -1)) {
+            *out = lua_toboolean(L, -1) != 0;
+        }
+        lua_pop(L, 1);
+    };
+
+    take_string("unit_override", &options.unit_override);
+    take_string("units",        &options.unit_override);
+    take_string("normalize_to_unit", &options.normalize_to_unit);
+    take_string("normalize_units",   &options.normalize_to_unit);
+    take_double("unit_scale_to_mm_override", &options.unit_scale_to_mm_override);
+    take_double("scale",                     &options.unit_scale_to_mm_override);
+    take_double("linear_tolerance",   &options.linear_tolerance);
+    take_double("angular_tolerance",  &options.angular_tolerance);
+    take_double("small_volume_fraction", &options.small_volume_fraction);
+    take_double("small_bbox_fraction",   &options.small_bbox_fraction);
+    take_double("thin_plate_ratio",      &options.thin_plate_ratio);
+    take_double("long_body_ratio",       &options.long_body_ratio);
+    take_bool("heal_shape",             &options.heal_shape);
+    take_bool("require_convex_cells",   &options.require_convex_cells);
+    take_bool("try_planar_decomposition", &options.try_planar_decomposition);
+    take_bool("split_union_cells",      &options.split_union_cells);
+    return options;
 }
 
 void set_string_field(lua_State* L, const char* key, const std::string& value) {
@@ -109,6 +161,17 @@ void push_solid_table(lua_State* L, const AnalyzedSolid& solid) {
     set_number_field(L, "volume_fraction", solid.volume_fraction);
     push_bbox_table(L, solid.bbox);
     lua_setfield(L, -2, "bbox");
+    set_number_field(L, "bbox_diagonal", solid.bbox_diagonal);
+    set_number_field(L, "bbox_diagonal_fraction", solid.bbox_diagonal_fraction);
+    set_number_field(L, "bbox_min_extent", solid.bbox_min_extent);
+    set_number_field(L, "bbox_mid_extent", solid.bbox_mid_extent);
+    set_number_field(L, "bbox_max_extent", solid.bbox_max_extent);
+    set_number_field(L, "bbox_aspect_ratio", solid.bbox_aspect_ratio);
+    set_boolean_field(L, "small_volume_candidate", solid.small_volume_candidate);
+    set_boolean_field(L, "small_bbox_candidate", solid.small_bbox_candidate);
+    set_boolean_field(L, "thin_plate_candidate", solid.thin_plate_candidate);
+    set_boolean_field(L, "long_body_candidate", solid.long_body_candidate);
+    set_integer_field(L, "face_count", solid.face_count);
     set_boolean_field(L, "exact_csg_supported", solid.exact_csg_supported);
     set_boolean_field(L, "needs_decomposition", solid.needs_decomposition);
     set_boolean_field(L, "needs_spline_replacement", solid.needs_spline_replacement);
@@ -121,6 +184,27 @@ void push_solid_table(lua_State* L, const AnalyzedSolid& solid) {
         lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
     }
     lua_setfield(L, -2, "faces");
+
+    // replacement_candidates mirrors the JSON report shape so Lua
+    // scripts can decide between bbox / cylinder / sphere / cone fits
+    // without re-parsing the JSON. Each metrics entry has
+    // available + volume + absolute_delta + relative_delta + fill_ratio.
+    auto push_metrics = [&](const char* key, const ReplacementMetrics& m) {
+        lua_newtable(L);
+        set_boolean_field(L, "available", m.available);
+        set_number_field(L, "volume", m.volume);
+        set_number_field(L, "absolute_delta", m.absolute_delta);
+        set_number_field(L, "relative_delta", m.relative_delta);
+        set_number_field(L, "fill_ratio", m.fill_ratio);
+        lua_setfield(L, -2, key);
+    };
+    lua_newtable(L);
+    push_metrics("bbox",           solid.bbox_replacement);
+    push_metrics("bbox_cylinder",  solid.bbox_cylinder_replacement);
+    push_metrics("fitted_cylinder", solid.fitted_cylinder_replacement.metrics);
+    push_metrics("fitted_sphere",  solid.fitted_sphere_replacement.metrics);
+    push_metrics("fitted_cone",    solid.fitted_cone_replacement.metrics);
+    lua_setfield(L, -2, "replacement_candidates");
 }
 
 void push_face_table(lua_State* L, const AnalyzedFace& face) {
@@ -140,6 +224,37 @@ void push_face_table(lua_State* L, const AnalyzedFace& face) {
     set_boolean_field(L, "needs_spline_replacement", face.needs_spline_replacement);
     set_boolean_field(L, "needs_surface_replacement", face.needs_surface_replacement);
     set_boolean_field(L, "needs_emitter", face.needs_emitter);
+}
+
+void push_decomposed_piece_table(lua_State* L,
+                                  const AnalyzedDecomposedPiece& piece) {
+    lua_newtable(L);
+    set_string_field(L, "id", piece.id);
+    set_string_field(L, "label", piece.label);
+    set_string_field(L, "source_solid_id", piece.source_solid_id);
+    set_integer_field(L, "index", piece.index);
+    set_number_field(L, "volume", piece.volume);
+    push_bbox_table(L, piece.bbox);
+    lua_setfield(L, -2, "bbox");
+    set_integer_field(L, "face_count", piece.face_count);
+    set_boolean_field(L, "exact_csg_supported", piece.exact_csg_supported);
+    set_boolean_field(L, "needs_decomposition", piece.needs_decomposition);
+    set_boolean_field(L, "needs_spline_replacement", piece.needs_spline_replacement);
+    set_boolean_field(L, "needs_surface_replacement", piece.needs_surface_replacement);
+    set_boolean_field(L, "needs_user_decision", piece.needs_user_decision);
+}
+
+void push_performance_table(lua_State* L, const PerformanceMetrics& perf) {
+    lua_newtable(L);
+    set_number_field(L, "load_step_ms", perf.load_step_ms);
+    set_number_field(L, "analyze_ms",   perf.analyze_ms);
+    set_number_field(L, "propose_ms",   perf.propose_ms);
+    set_number_field(L, "split_ms",     perf.split_ms);
+    set_number_field(L, "emit_ms",      perf.emit_ms);
+    set_number_field(L, "export_step_ms", perf.export_step_ms);
+    set_integer_field(L, "candidates_evaluated", perf.candidates_evaluated);
+    set_integer_field(L, "splitter_calls",       perf.splitter_calls);
+    set_integer_field(L, "pieces_produced",      perf.pieces_produced);
 }
 
 void push_assembly_table(lua_State* L, const AssemblyNode& node) {
@@ -510,10 +625,25 @@ void push_report_table(lua_State* L, const ConversionReport& report) {
     set_number_field(L, "total_volume", report.total_volume);
     set_integer_field(L, "solids_seen", report.solids_seen);
     set_integer_field(L, "solids_converted", report.solids_converted);
+    set_integer_field(L, "solids_requiring_decomposition",
+                      report.solids_requiring_decomposition);
+    set_integer_field(L, "decomposition_attempts", report.decomposition_attempts);
+    set_integer_field(L, "decomposition_pieces", report.decomposition_pieces);
     set_integer_field(L, "faces_seen", report.faces_seen);
     set_integer_field(L, "analytic_faces", report.analytic_faces);
     set_integer_field(L, "spline_faces", report.spline_faces);
     set_string_field(L, "json", report_json_string(report));
+
+    // Units block (M2 addition). length_unit_to_mm is the factor that
+    // converts a value in length_unit to millimetres. Defaults to
+    // ("", 1.0) when the STEP did not declare a unit.
+    lua_newtable(L);
+    set_string_field(L, "length_unit", report.length_unit);
+    set_number_field(L, "length_unit_to_mm", report.length_unit_to_mm);
+    lua_setfield(L, -2, "units");
+
+    push_performance_table(L, report.performance);
+    lua_setfield(L, -2, "performance");
 
     lua_newtable(L);
     for (std::size_t i = 0; i < report.diagnostics.size(); ++i) {
@@ -544,6 +674,13 @@ void push_report_table(lua_State* L, const ConversionReport& report) {
     lua_setfield(L, -2, "assembly");
 
     lua_newtable(L);
+    for (std::size_t i = 0; i < report.decomposed_pieces.size(); ++i) {
+        push_decomposed_piece_table(L, report.decomposed_pieces[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "decomposed_pieces");
+
+    lua_newtable(L);
     for (std::size_t i = 0; i < report.decision_requests.size(); ++i) {
         push_decision_request_table(L, report.decision_requests[i]);
         lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
@@ -551,16 +688,12 @@ void push_report_table(lua_State* L, const ConversionReport& report) {
     lua_setfield(L, -2, "decision_requests");
 }
 
-int push_command_result(lua_State* L, const CommandResult& result) {
-    if (!result.ok) {
-        lua_pushnil(L);
-        lua_pushstring(L, report_json_string(result.report).c_str());
-        return 2;
-    }
-    lua_pushstring(L, report_json_string(result.report).c_str());
-    return 1;
-}
-
+// All command-result bindings return a structured table (success) or
+// (nil, table) on failure. The table carries `ok`, `diagnostics`,
+// per-entity arrays AND a `json` field with the canonical JSON for
+// callers that prefer the JSON shape. Previously two variants existed
+// (a JSON-string returner and a table returner) which produced
+// inconsistent return shapes across the API; both are now the same.
 int push_command_result_table(lua_State* L, const CommandResult& result) {
     if (!result.ok) {
         lua_pushnil(L);
@@ -569,6 +702,38 @@ int push_command_result_table(lua_State* L, const CommandResult& result) {
     }
     push_report_table(L, result.report);
     return 1;
+}
+
+int push_command_result(lua_State* L, const CommandResult& result) {
+    return push_command_result_table(L, result);
+}
+
+// Push a ReplacementCommandResult. Shape is identical to
+// push_command_result_table but also attaches a `check` field on the
+// returned report table so callers can inspect the volume-guard
+// outcome (ok flag, metrics, diagnostic) without re-parsing
+// diagnostics.
+int push_replacement_command_result(lua_State* L,
+                                    const ReplacementCommandResult& result) {
+    const int nret = push_command_result_table(L, result.command);
+    // Top of stack is either the success table or, for (nil, table),
+    // the table at -1. Either way, augment the table at -1 with the
+    // check info.
+    lua_newtable(L);
+    set_boolean_field(L, "ok", result.check.ok);
+    // metrics
+    lua_newtable(L);
+    set_boolean_field(L, "available", result.check.metrics.available);
+    set_number_field(L, "volume", result.check.metrics.volume);
+    set_number_field(L, "absolute_delta", result.check.metrics.absolute_delta);
+    set_number_field(L, "relative_delta", result.check.metrics.relative_delta);
+    set_number_field(L, "fill_ratio", result.check.metrics.fill_ratio);
+    lua_setfield(L, -2, "metrics");
+    // diagnostic (may be empty)
+    push_diagnostic_table(L, result.check.diagnostic);
+    lua_setfield(L, -2, "diagnostic");
+    lua_setfield(L, -2, "check");
+    return nret;
 }
 
 SplineFitKind fit_kind_from_lua(lua_State* L, int index) {
@@ -700,8 +865,16 @@ int l_session_gc(lua_State* L) {
 }
 
 int l_new_session(lua_State* L) {
+    // Parse options and create the C++ session BEFORE allocating Lua
+    // userdata. If either step throws, Lua sees a normal error path
+    // and no half-constructed userdata can survive without its
+    // destructor running.
+    const ConversionOptions options = lua_gettop(L) >= 1
+                                          ? conversion_options_from_lua(L, 1)
+                                          : ConversionOptions{};
+    SessionPtr session = create_session(options);
     void* userdata = lua_newuserdata(L, sizeof(LuaSession));
-    new (userdata) LuaSession();
+    new (userdata) LuaSession(std::move(session));
     luaL_getmetatable(L, kSessionMeta);
     lua_setmetatable(L, -2);
     return 1;
@@ -710,8 +883,39 @@ int l_new_session(lua_State* L) {
 int l_load_step(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* path = luaL_checkstring(L, 2);
-    const DocumentId id = load_step(*s->session, path);
+    // Optional 3rd argument: a ConversionOptions table to override the
+    // session defaults for this document only (per the C++
+    // `options_override` parameter on load_step).
+    DocumentId id;
+    if (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) {
+        const ConversionOptions override = conversion_options_from_lua(L, 3);
+        id = load_step(*s->session, path, &override);
+    } else {
+        id = load_step(*s->session, path);
+    }
     lua_pushstring(L, id.c_str());
+    return 1;
+}
+
+// s:attach_decision_log(path[, step_hint])
+// Opens an append-only decision log. Throws a Lua error on failure.
+// Optional second argument is the STEP path hint stored in the log
+// manifest (defaults to empty -- the next load_step recording is
+// used as the hint for downstream replay).
+int l_attach_decision_log(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* path = luaL_checkstring(L, 2);
+    const char* hint = lua_gettop(L) >= 3 && !lua_isnil(L, 3)
+                           ? luaL_checkstring(L, 3)
+                           : "";
+    try {
+        attach_decision_log(*s->session, path, hint);
+    } catch (const std::exception& e) {
+        return luaL_error(L,
+                          "attach_decision_log failed: %s",
+                          e.what());
+    }
+    lua_pushboolean(L, 1);
     return 1;
 }
 
@@ -772,7 +976,7 @@ int l_replace_solid(lua_State* L) {
         const ReplacementLimits limits = replacement_limits_from_lua(L, 4);
         ReplacementCommandResult result =
             apply_checked_replacement_operation(*s->session, shape_id, op, limits);
-        return push_command_result(L, result.command);
+        return push_replacement_command_result(L, result);
     }
 
     return push_command_result(L, apply_replacement_operation(*s->session, shape_id, op));
@@ -793,15 +997,14 @@ int l_replace_solid_with_bbox_cylinder(lua_State* L) {
 int l_replace_solid_with_fitted_cylinder(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* shape_id = luaL_checkstring(L, 2);
-    ReplacementLimits limits;
     if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
-        limits = replacement_limits_from_lua(L, 3);
+        const ReplacementLimits limits = replacement_limits_from_lua(L, 3);
         ReplacementCommandResult result = apply_checked_replacement_operation(
             *s->session,
             shape_id,
             ReplacementOperation::fitted_cylinder,
             limits);
-        return push_command_result(L, result.command);
+        return push_replacement_command_result(L, result);
     }
     return push_command_result(L, replace_solid_with_fitted_cylinder(*s->session, shape_id));
 }
@@ -809,15 +1012,14 @@ int l_replace_solid_with_fitted_cylinder(lua_State* L) {
 int l_replace_solid_with_fitted_sphere(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* shape_id = luaL_checkstring(L, 2);
-    ReplacementLimits limits;
     if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
-        limits = replacement_limits_from_lua(L, 3);
+        const ReplacementLimits limits = replacement_limits_from_lua(L, 3);
         ReplacementCommandResult result = apply_checked_replacement_operation(
             *s->session,
             shape_id,
             ReplacementOperation::fitted_sphere,
             limits);
-        return push_command_result(L, result.command);
+        return push_replacement_command_result(L, result);
     }
     return push_command_result(L, replace_solid_with_fitted_sphere(*s->session, shape_id));
 }
@@ -825,15 +1027,14 @@ int l_replace_solid_with_fitted_sphere(lua_State* L) {
 int l_replace_solid_with_fitted_cone(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* shape_id = luaL_checkstring(L, 2);
-    ReplacementLimits limits;
     if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
-        limits = replacement_limits_from_lua(L, 3);
+        const ReplacementLimits limits = replacement_limits_from_lua(L, 3);
         ReplacementCommandResult result = apply_checked_replacement_operation(
             *s->session,
             shape_id,
             ReplacementOperation::fitted_cone,
             limits);
-        return push_command_result(L, result.command);
+        return push_replacement_command_result(L, result);
     }
     return push_command_result(L, replace_solid_with_fitted_cone(*s->session, shape_id));
 }
@@ -1056,6 +1257,22 @@ int l_emit(lua_State* L) {
     return push_command_result(L, emit_document(*s->session, document_id, output_path));
 }
 
+// s:export_step(doc, "simplified.step")
+// Writes the as-simplified geometry to STEP for visual review (the
+// CLI equivalent is --out-step). Original solids + decomposed pieces +
+// primitive synthetic bodies are emitted; boolean synthetic nodes are
+// emitted as bbox placeholders for now (same coverage as the C++
+// API).
+int l_export_step(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    const char* output_path = luaL_checkstring(L, 3);
+    return push_command_result(L,
+                               export_document_step(*s->session,
+                                                    document_id,
+                                                    output_path));
+}
+
 int l_report_json(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const std::string json = report_json_string(last_report(*s->session));
@@ -1095,6 +1312,8 @@ void register_session(lua_State* L) {
     lua_newtable(L);
     lua_pushcfunction(L, l_load_step);
     lua_setfield(L, -2, "load_step");
+    lua_pushcfunction(L, l_attach_decision_log);
+    lua_setfield(L, -2, "attach_decision_log");
     lua_pushcfunction(L, l_analyze);
     lua_setfield(L, -2, "analyze");
     lua_pushcfunction(L, l_analyze_table);
@@ -1145,6 +1364,8 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "compare_volumes");
     lua_pushcfunction(L, l_emit);
     lua_setfield(L, -2, "emit");
+    lua_pushcfunction(L, l_export_step);
+    lua_setfield(L, -2, "export_step");
     lua_pushcfunction(L, l_report_json);
     lua_setfield(L, -2, "report_json");
     lua_pushcfunction(L, l_report_table);
