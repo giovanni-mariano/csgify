@@ -13,6 +13,7 @@
 #include <BRepBndLib.hxx>
 #include <BRepAdaptor_Surface.hxx>
 #include <BRepBuilderAPI_MakeFace.hxx>
+#include <BRepTools.hxx>
 #include <BOPAlgo_Splitter.hxx>
 #include <Bnd_Box.hxx>
 #include <GeomAbs_SurfaceType.hxx>
@@ -28,6 +29,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Sphere.hxx>
+#include <gp_Vec.hxx>
 #include <gp_Torus.hxx>
 
 namespace cad2csg::detail {
@@ -44,7 +46,41 @@ gp_Dir perpendicular_direction(const gp_Dir& axis) {
     return gp_Dir(axis.XYZ().Crossed(y_axis.XYZ()));
 }
 
+// Re-anchor a plane at the projection of `anchor` onto it, keeping the same
+// geometric plane. A bounded cutter face built from this plane is centered
+// near `anchor` rather than at the plane's intrinsic Location -- essential at
+// large model coordinates, where the intrinsic origin can sit far outside the
+// target solid so a +/- half_size square never reaches it (the cut silently
+// produces no split).
+gp_Pnt solid_box_center(const TopoDS_Solid& solid) {
+    Bnd_Box box;
+    BRepBndLib::Add(solid, box);
+    if (box.IsVoid()) {
+        return gp_Pnt(0.0, 0.0, 0.0);
+    }
+    double xmin = 0.0, ymin = 0.0, zmin = 0.0;
+    double xmax = 0.0, ymax = 0.0, zmax = 0.0;
+    box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+    return gp_Pnt(0.5 * (xmin + xmax), 0.5 * (ymin + ymax), 0.5 * (zmin + zmax));
+}
+
+gp_Pln plane_anchored_at(const gp_Pln& plane, const gp_Pnt& anchor) {
+    const gp_Dir normal = plane.Axis().Direction();
+    const double d = gp_Vec(plane.Location(), anchor).Dot(gp_Vec(normal));
+    const gp_Pnt origin = anchor.Translated(gp_Vec(normal).Multiplied(-d));
+    return gp_Pln(origin, normal);
+}
+
+// Axial coordinate of `anchor` measured from a revolved surface's Location
+// along its axis -- used to center the V (axial) parameter range of a
+// cylinder/cone cutter on the target solid.
+double axial_coordinate(const gp_Pnt& location, const gp_Dir& axis,
+                        const gp_Pnt& anchor) {
+    return gp_Vec(location, anchor).Dot(gp_Vec(axis));
+}
+
 TopoDS_Shape make_supported_cutter(const TopoDS_Face& face,
+                                   const gp_Pnt& anchor,
                                    double half_size,
                                    ConversionReport& report,
                                    std::size_t solid_index,
@@ -53,22 +89,39 @@ TopoDS_Shape make_supported_cutter(const TopoDS_Face& face,
     const GeomAbs_SurfaceType type = surface.GetType();
     switch (type) {
     case GeomAbs_Plane:
-        return BRepBuilderAPI_MakeFace(surface.Plane(), -half_size, half_size,
+        return BRepBuilderAPI_MakeFace(plane_anchored_at(surface.Plane(), anchor),
+                                       -half_size, half_size,
                                        -half_size, half_size).Shape();
-    case GeomAbs_Cylinder:
-        return BRepBuilderAPI_MakeFace(surface.Cylinder(), 0.0, 2.0 * kPi,
-                                       -half_size, half_size).Shape();
-    case GeomAbs_Cone:
-        return BRepBuilderAPI_MakeFace(surface.Cone(), 0.0, 2.0 * kPi,
-                                       -half_size, half_size).Shape();
+    case GeomAbs_Cylinder: {
+        const gp_Cylinder cylinder = surface.Cylinder();
+        // Cylinder V parameter is the axial distance from Location, so center
+        // the V range on the anchor's axial coordinate.
+        const double v = axial_coordinate(cylinder.Location(),
+                                          cylinder.Axis().Direction(), anchor);
+        return BRepBuilderAPI_MakeFace(cylinder, 0.0, 2.0 * kPi,
+                                       v - half_size, v + half_size).Shape();
+    }
+    case GeomAbs_Cone: {
+        const gp_Cone cone = surface.Cone();
+        // Cone axial component of V is v*cos(semiAngle), so the V that reaches
+        // axial coordinate t is t/cos(semiAngle). Center the range there.
+        const double cos_a = std::max(1.0e-3, std::abs(std::cos(cone.SemiAngle())));
+        const double t = axial_coordinate(cone.Location(),
+                                          cone.Axis().Direction(), anchor);
+        const double v = t / cos_a;
+        const double dv = half_size / cos_a;
+        return BRepBuilderAPI_MakeFace(cone, 0.0, 2.0 * kPi,
+                                       v - dv, v + dv).Shape();
+    }
     case GeomAbs_Sphere:
+        // Closed surface -- position is intrinsic, no anchoring needed.
         return BRepBuilderAPI_MakeFace(surface.Sphere(), 0.0, 2.0 * kPi,
                                        -kPi / 2.0, kPi / 2.0).Shape();
     case GeomAbs_Torus: {
         const gp_Torus torus = surface.Torus();
         const gp_Dir axis = torus.Axis().Direction();
         const gp_Dir normal = perpendicular_direction(axis);
-        const gp_Pln plane(torus.Location(), normal);
+        const gp_Pln plane = plane_anchored_at(gp_Pln(torus.Location(), normal), anchor);
         return BRepBuilderAPI_MakeFace(plane, -half_size, half_size,
                                        -half_size, half_size).Shape();
     }
@@ -182,6 +235,57 @@ std::string surface_signature(const TopoDS_Face& face) {
     }
 }
 
+// For a *partial* cylinder/cone face (an arc that neither closes the full
+// circle nor is negligibly small), synthesize the bounding plane through the
+// two angular-extreme generators -- the "chord plane" containing the axis for
+// a cylinder, or the plane through the two extreme rulings and the apex for a
+// cone. This is the separating surface a swept arc needs when no planar CAD
+// face already bounds it (e.g. a fillet between two curved faces). The plane
+// is derived entirely from the face's own geometry, not invented. Appends a
+// bounded cutter to `tools` when one applies.
+void add_closure_planes_for_face(const TopoDS_Face& face,
+                                 double half_size,
+                                 NCollection_List<TopoDS_Shape>& tools) {
+    BRepAdaptor_Surface surface(face, false);
+    const GeomAbs_SurfaceType type = surface.GetType();
+    if (type != GeomAbs_Cylinder && type != GeomAbs_Cone) {
+        return;
+    }
+    Standard_Real u_min = 0.0, u_max = 0.0, v_min = 0.0, v_max = 0.0;
+    BRepTools::UVBounds(face, u_min, u_max, v_min, v_max);
+    const double angular_span = std::abs(u_max - u_min);
+    // Full revolutions are handled by the quadric cut; near-zero arcs are
+    // degenerate. Only partial arcs need a closure plane.
+    if (angular_span <= 0.05 || angular_span >= 2.0 * kPi - 0.05) {
+        return;
+    }
+    const double v_mid = 0.5 * (v_min + v_max);
+    const gp_Pnt p1 = surface.Value(u_min, v_mid);
+    const gp_Pnt p2 = surface.Value(u_max, v_mid);
+    if (p1.Distance(p2) < 1.0e-7) {
+        return;
+    }
+
+    gp_Vec normal;
+    if (type == GeomAbs_Cylinder) {
+        const gp_Dir axis = surface.Cylinder().Axis().Direction();
+        normal = gp_Vec(p1, p2).Crossed(gp_Vec(axis));
+    } else {
+        const gp_Pnt apex = surface.Cone().Apex();
+        normal = gp_Vec(p1, p2).Crossed(gp_Vec(p1, apex));
+    }
+    if (normal.Magnitude() < 1.0e-9) {
+        return;
+    }
+    const gp_Pln plane(p1, gp_Dir(normal));
+    const TopoDS_Shape cutter =
+        BRepBuilderAPI_MakeFace(plane, -half_size, half_size,
+                                -half_size, half_size).Shape();
+    if (!cutter.IsNull()) {
+        tools.Append(cutter);
+    }
+}
+
 } // namespace
 
 double solid_box_span(const TopoDS_Solid& solid) {
@@ -207,6 +311,7 @@ std::vector<TopoDS_Solid> split_solid_by_planar_faces(const TopoDS_Solid& solid,
 
     const double span = solid_box_span(solid);
     const double half_size = std::max(1.0, span * 2.0);
+    const gp_Pnt anchor = solid_box_center(solid);
 
     NCollection_List<TopoDS_Shape> tools;
     std::size_t face_index = 0;
@@ -222,7 +327,8 @@ std::vector<TopoDS_Solid> split_solid_by_planar_faces(const TopoDS_Solid& solid,
         }
 
         TopoDS_Shape cutting_face =
-            BRepBuilderAPI_MakeFace(surface.plane, -half_size, half_size,
+            BRepBuilderAPI_MakeFace(plane_anchored_at(surface.plane, anchor),
+                                    -half_size, half_size,
                                     -half_size, half_size).Shape();
         if (!cutting_face.IsNull()) {
             tools.Append(cutting_face);
@@ -250,6 +356,7 @@ std::vector<TopoDS_Solid> split_solid_by_all_surfaces(const TopoDS_Solid& solid,
 
     const double span = solid_box_span(solid);
     const double half_size = std::max(1.0, span * 2.0);
+    const gp_Pnt anchor = solid_box_center(solid);
 
     NCollection_List<TopoDS_Shape> tools;
     std::set<std::string> seen_surfaces;
@@ -262,7 +369,7 @@ std::vector<TopoDS_Solid> split_solid_by_all_surfaces(const TopoDS_Solid& solid,
             continue;  // already have a cutter for this surface
         }
         const TopoDS_Shape cutter =
-            make_supported_cutter(face, half_size, report, solid_index, face_index);
+            make_supported_cutter(face, anchor, half_size, report, solid_index, face_index);
         if (!cutter.IsNull()) {
             tools.Append(cutter);
         }
@@ -281,6 +388,33 @@ std::vector<TopoDS_Solid> split_solid_by_all_surfaces(const TopoDS_Solid& solid,
                         "Surface-driven subdivision did not produce multiple solid pieces.");
 }
 
+std::vector<TopoDS_Solid> split_solid_by_closure_planes(const TopoDS_Solid& solid,
+                                                        const ConversionOptions& options,
+                                                        ConversionReport& report,
+                                                        std::size_t solid_index) {
+    ++report.decomposition_attempts;
+
+    const double span = solid_box_span(solid);
+    const double half_size = std::max(1.0, span * 2.0);
+
+    NCollection_List<TopoDS_Shape> tools;
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
+        add_closure_planes_for_face(TopoDS::Face(face_exp.Current()), half_size, tools);
+    }
+
+    if (tools.IsEmpty()) {
+        add_diag(report, DiagnosticSeverity::warning, "shatter_no_closure_planes",
+                 "No partial curved faces yielded a closure plane.",
+                 solid_label(solid_index));
+        return {};
+    }
+
+    return run_splitter(solid, tools, options, report, solid_index,
+                        "shatter_closure_splitter_failed",
+                        "shatter_closure_no_split",
+                        "Closure-plane subdivision did not produce multiple solid pieces.");
+}
+
 std::vector<TopoDS_Solid> split_solid_by_face(const TopoDS_Solid& solid,
                                               const TopoDS_Face& face,
                                               const ConversionOptions& options,
@@ -291,10 +425,11 @@ std::vector<TopoDS_Solid> split_solid_by_face(const TopoDS_Solid& solid,
 
     const double span = solid_box_span(solid);
     const double half_size = std::max(1.0, span * 2.0);
+    const gp_Pnt anchor = solid_box_center(solid);
 
     NCollection_List<TopoDS_Shape> tools;
     TopoDS_Shape cutter =
-        make_supported_cutter(face, half_size, report, solid_index, face_index);
+        make_supported_cutter(face, anchor, half_size, report, solid_index, face_index);
     if (!cutter.IsNull()) {
         tools.Append(cutter);
     }
@@ -321,10 +456,12 @@ std::vector<TopoDS_Solid> split_solid_by_plane(const TopoDS_Solid& solid,
 
     const double span = solid_box_span(solid);
     const double half_size = std::max(1.0, span * 2.0);
+    const gp_Pnt anchor = solid_box_center(solid);
 
     NCollection_List<TopoDS_Shape> tools;
     TopoDS_Shape cutter =
-        BRepBuilderAPI_MakeFace(plane, -half_size, half_size,
+        BRepBuilderAPI_MakeFace(plane_anchored_at(plane, anchor),
+                                -half_size, half_size,
                                 -half_size, half_size).Shape();
     if (!cutter.IsNull()) {
         tools.Append(cutter);
@@ -359,11 +496,13 @@ std::vector<TopoDS_Solid> split_solid_by_planes(const TopoDS_Solid& solid,
 
     const double span = solid_box_span(solid);
     const double half_size = std::max(1.0, span * 2.0);
+    const gp_Pnt anchor = solid_box_center(solid);
 
     NCollection_List<TopoDS_Shape> tools;
     for (const gp_Pln& plane : planes) {
         TopoDS_Shape cutter =
-            BRepBuilderAPI_MakeFace(plane, -half_size, half_size,
+            BRepBuilderAPI_MakeFace(plane_anchored_at(plane, anchor),
+                                    -half_size, half_size,
                                     -half_size, half_size).Shape();
         if (!cutter.IsNull()) {
             tools.Append(cutter);

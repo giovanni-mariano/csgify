@@ -63,6 +63,56 @@ double AnalyticSurface::value_at(const gp_Pnt& point) const {
     return 0.0;
 }
 
+double AnalyticSurface::gradient_norm_at(const gp_Pnt& point) const {
+    switch (kind) {
+    case AnalyticSurfaceKind::plane:
+        // f = n.p - n.p0 with n a unit normal, so |grad f| = 1.
+        return 1.0;
+    case AnalyticSurfaceKind::sphere: {
+        // f = |p - c|^2 - r^2, grad f = 2 (p - c).
+        const gp_XYZ d = point.XYZ() - sphere.Location().XYZ();
+        return 2.0 * d.Modulus();
+    }
+    case AnalyticSurfaceKind::quadric: {
+        // f = a x^2 + b y^2 + c z^2 + d xy + e yz + f xz + g x + h y + i z + j
+        const double x = point.X();
+        const double y = point.Y();
+        const double z = point.Z();
+        const double gx = 2.0 * quadric.a * x + quadric.d * y + quadric.f * z + quadric.g;
+        const double gy = 2.0 * quadric.b * y + quadric.d * x + quadric.e * z + quadric.h;
+        const double gz = 2.0 * quadric.c * z + quadric.e * y + quadric.f * x + quadric.i;
+        return std::sqrt(gx * gx + gy * gy + gz * gz);
+    }
+    case AnalyticSurfaceKind::torus: {
+        // f = A^2 - 4 M^2 R, with A = D + M^2 - m^2, D = |d|^2,
+        // R = D - axial^2, d = p - center, axial = d.axis.
+        // grad f = 4 [ A d - 2 M^2 (d - axial axis) ].
+        const gp_XYZ axis = torus.Axis().Direction().XYZ();
+        const gp_XYZ d = point.XYZ() - torus.Location().XYZ();
+        const double axial = d.Dot(axis);
+        const double major = torus.MajorRadius();
+        const double minor = torus.MinorRadius();
+        const double big_a = d.SquareModulus() + major * major - minor * minor;
+        const gp_XYZ grad =
+            (d * big_a - (d - axis * axial) * (2.0 * major * major)) * 4.0;
+        return grad.Modulus();
+    }
+    }
+    return 0.0;
+}
+
+double AnalyticSurface::signed_distance_at(const gp_Pnt& point) const {
+    const double value = value_at(point);
+    const double grad = gradient_norm_at(point);
+    // Near a critical point (grad -> 0) the first-order estimate breaks down;
+    // fall back to the raw value rather than dividing by ~zero.
+    constexpr double kMinGrad = 1.0e-12;
+    if (grad <= kMinGrad) {
+        return value;
+    }
+    return value / grad;
+}
+
 std::string surface_type_name(GeomAbs_SurfaceType type) {
     switch (type) {
     case GeomAbs_Plane: return "plane";

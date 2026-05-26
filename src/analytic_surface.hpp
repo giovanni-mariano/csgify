@@ -47,7 +47,22 @@ struct AnalyticSurface {
     gp_Torus torus;
     QuadricCoefficients quadric;
 
+    // Algebraic value of the implicit surface function f(p). Zero on the
+    // surface, signed by side. NOTE: for non-planar kinds this is NOT a
+    // distance -- spheres/quadrics return length^2, tori length^4. Use
+    // signed_distance_at() when comparing against a length tolerance.
     double value_at(const gp_Pnt& point) const;
+
+    // Magnitude of the gradient of f at `point`, |grad f|. Computed
+    // analytically per kind (exact for plane and the degree-2 quadric kinds).
+    double gradient_norm_at(const gp_Pnt& point) const;
+
+    // First-order signed distance from `point` to the surface:
+    // f(p) / |grad f(p)|. Exact for planes, and to first order for the
+    // quadric kinds it is the geometric distance near the surface. This is
+    // the quantity that should be compared against a linear tolerance; raw
+    // value_at() is dimensionally inconsistent across surface kinds.
+    double signed_distance_at(const gp_Pnt& point) const;
 };
 
 std::string surface_type_name(GeomAbs_SurfaceType type);

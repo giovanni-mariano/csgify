@@ -34,6 +34,17 @@ std::vector<TopoDS_Solid> split_solid_by_all_surfaces(const TopoDS_Solid& solid,
                                                       ConversionReport& report,
                                                       std::size_t solid_index);
 
+// Cut a solid by closure planes synthesized from its partial cylinder/cone
+// faces (the axis/chord plane through each arc's angular-extreme generators).
+// Used as a deep fallback in shatter_solid when neither a targeted
+// failure-face cut nor the full surface arrangement subdivided a residual
+// piece -- i.e. when a swept arc has no planar CAD face bounding it. Returns
+// an empty vector when no partial curved face yields a plane.
+std::vector<TopoDS_Solid> split_solid_by_closure_planes(const TopoDS_Solid& solid,
+                                                        const ConversionOptions& options,
+                                                        ConversionReport& report,
+                                                        std::size_t solid_index);
+
 std::vector<TopoDS_Solid> split_solid_by_face(const TopoDS_Solid& solid,
                                               const TopoDS_Face& face,
                                               const ConversionOptions& options,

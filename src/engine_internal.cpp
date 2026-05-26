@@ -6,16 +6,22 @@
 #include <cmath>
 #include <sstream>
 
+#include <algorithm>
+#include <array>
+
 #include <BRepBndLib.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepGProp.hxx>
+#include <BRepGProp_Face.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopAbs_State.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Vertex.hxx>
+#include <gp_Vec.hxx>
 
 namespace cad2csg::detail {
 namespace {
@@ -283,11 +289,13 @@ bool find_interior_point(const TopoDS_Solid& solid,
                          const GProp_GProps& props,
                          double tolerance,
                          gp_Pnt* point_out) {
+    // 1. Centre of mass -- the common case for convex / near-convex solids.
     const gp_Pnt center = props.CentreOfMass();
     if (point_is_inside_or_on(solid, center, tolerance)) {
         *point_out = center;
         return true;
     }
+
     Bnd_Box box;
     BRepBndLib::Add(solid, box);
     if (box.IsVoid()) {
@@ -296,17 +304,73 @@ bool find_interior_point(const TopoDS_Solid& solid,
     double xmin = 0.0, ymin = 0.0, zmin = 0.0;
     double xmax = 0.0, ymax = 0.0, zmax = 0.0;
     box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
-    constexpr int steps = 5;
-    for (int ix = 1; ix < steps; ++ix) {
-        const double x = xmin + (xmax - xmin) * ix / steps;
-        for (int iy = 1; iy < steps; ++iy) {
-            const double y = ymin + (ymax - ymin) * iy / steps;
-            for (int iz = 1; iz < steps; ++iz) {
-                const double z = zmin + (zmax - zmin) * iz / steps;
-                const gp_Pnt candidate(x, y, z);
+    const double dx = xmax - xmin;
+    const double dy = ymax - ymin;
+    const double dz = zmax - zmin;
+
+    // 2. Inset from each face centroid along the inward normal. This is far
+    //    more reliable than a coarse grid for thin wedges and awkward
+    //    BOPAlgo-produced fragments: a face centroid is guaranteed on the
+    //    boundary, and a short step inward lands in the interior even when
+    //    the centre of mass falls outside a non-convex piece. We step by
+    //    fractions of the *smallest* nonzero bbox extent (the dimension that
+    //    governs how far we can go before exiting a thin piece), largest step
+    //    first so the returned point is as deep inside as possible -- and
+    //    therefore unambiguous for halfspace-sense selection.
+    std::array<double, 3> extents = {dx, dy, dz};
+    double min_ext = 0.0;
+    for (double e : extents) {
+        if (e > kEps && (min_ext == 0.0 || e < min_ext)) {
+            min_ext = e;
+        }
+    }
+    const double max_ext = std::max({dx, dy, dz, 1.0});
+    const double base = min_ext > kEps ? min_ext : max_ext;
+    const std::array<double, 5> fracs = {0.5, 0.25, 0.1, 0.05, 0.02};
+
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
+        const TopoDS_Face face = TopoDS::Face(face_exp.Current());
+        BRepGProp_Face face_prop(face);
+        Standard_Real u1 = 0.0, u2 = 0.0, v1 = 0.0, v2 = 0.0;
+        face_prop.Bounds(u1, u2, v1, v2);
+        if (u2 < u1 || v2 < v1) {
+            continue;
+        }
+        gp_Pnt face_point;
+        gp_Vec normal;
+        face_prop.Normal(0.5 * (u1 + u2), 0.5 * (v1 + v2), face_point, normal);
+        if (normal.Magnitude() <= kEps) {
+            continue;
+        }
+        normal.Normalize();
+        for (double frac : fracs) {
+            const double step = base * frac;
+            // Try both senses; one points into the solid.
+            for (int sign : {-1, 1}) {
+                const gp_Pnt candidate =
+                    face_point.Translated(normal.Multiplied(sign * step));
                 if (point_is_inside_or_on(solid, candidate, tolerance)) {
                     *point_out = candidate;
                     return true;
+                }
+            }
+        }
+    }
+
+    // 3. Bbox grid fallback, coarse then finer, for shapes the face inset
+    //    missed (e.g. a face whose centroid lies outside the solid).
+    for (int steps : {5, 9}) {
+        for (int ix = 1; ix < steps; ++ix) {
+            const double x = xmin + dx * ix / steps;
+            for (int iy = 1; iy < steps; ++iy) {
+                const double y = ymin + dy * iy / steps;
+                for (int iz = 1; iz < steps; ++iz) {
+                    const double z = zmin + dz * iz / steps;
+                    const gp_Pnt candidate(x, y, z);
+                    if (point_is_inside_or_on(solid, candidate, tolerance)) {
+                        *point_out = candidate;
+                        return true;
+                    }
                 }
             }
         }
@@ -345,10 +409,15 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
         if (count_faces) {
             ++report.analytic_faces;
         }
-        const double interior_value = surface.value_at(interior_point);
+        // Use a geometric (distance-normalized) value so the comparison
+        // against linear_tolerance is dimensionally correct for every surface
+        // kind -- raw value_at() returns length^2 for quadrics/spheres and
+        // length^4 for tori, which made the check spuriously fail on
+        // large-radius faces and triggered cuts that could not split.
+        const double interior_value = surface.signed_distance_at(interior_point);
         const int sense = interior_value <= options.linear_tolerance ? -1 : 1;
         for (const gp_Pnt& vertex : vertices) {
-            const double value = surface.value_at(vertex);
+            const double value = surface.signed_distance_at(vertex);
             const bool outside = sense < 0
                 ? value > options.linear_tolerance
                 : value < -options.linear_tolerance;
@@ -398,10 +467,15 @@ bool find_convexity_failure_face(const TopoDS_Solid& solid,
                                         &surface)) {
             continue;
         }
-        const double interior_value = surface.value_at(interior_point);
+        // Use a geometric (distance-normalized) value so the comparison
+        // against linear_tolerance is dimensionally correct for every surface
+        // kind -- raw value_at() returns length^2 for quadrics/spheres and
+        // length^4 for tori, which made the check spuriously fail on
+        // large-radius faces and triggered cuts that could not split.
+        const double interior_value = surface.signed_distance_at(interior_point);
         const int sense = interior_value <= options.linear_tolerance ? -1 : 1;
         for (const gp_Pnt& vertex : vertices) {
-            const double value = surface.value_at(vertex);
+            const double value = surface.signed_distance_at(vertex);
             const bool outside = sense < 0
                 ? value > options.linear_tolerance
                 : value < -options.linear_tolerance;

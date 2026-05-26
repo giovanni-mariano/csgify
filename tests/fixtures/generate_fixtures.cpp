@@ -199,6 +199,17 @@ TopoDS_Shape make_bolt_hole() {
 
 } // namespace
 
+// A 270-degree cylindrical sector. Its cross-section is a reflex (>180 deg)
+// pie wedge, so it cannot be written as inside-cylinder intersected with two
+// radial halfplanes (an intersection of two halfplanes spans at most 180 deg).
+// It therefore fails single-cell convex validation and only `shatter` can
+// emit it -- and only once a closure plane through the axis splits the arc
+// into two <=180-degree sectors. Exercises the Phase-5 closure-plane path.
+TopoDS_Shape make_cylinder_wedge_270() {
+    const double three_pi_over_two = 3.0 * 3.14159265358979323846 / 2.0;
+    return BRepPrimAPI_MakeCylinder(3.0, 5.0, three_pi_over_two).Shape();
+}
+
 int main(int argc, char** argv) {
     if (argc != 2) {
         std::cerr << "usage: generate_fixtures <output_dir>\n";
@@ -223,6 +234,7 @@ int main(int argc, char** argv) {
         {"four_solids.step", make_four_solids()},
         {"overlapping_boxes.step", make_overlapping_boxes()},
         {"l_with_inner_box.step", make_l_with_inner_box()},
+        {"cylinder_wedge_270.step", make_cylinder_wedge_270()},
     };
 
     for (const Item& item : items) {

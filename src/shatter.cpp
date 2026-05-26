@@ -26,6 +26,7 @@
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
+#include <TopoDS_Face.hxx>
 #include <TopoDS_Solid.hxx>
 #include <gp_Pnt.hxx>
 
@@ -92,6 +93,17 @@ bool shatter_solid(CadModel& model,
                                               &model.face_replacements);
     };
 
+    auto face_at = [](const TopoDS_Solid& solid, std::size_t index) -> TopoDS_Face {
+        std::size_t i = 0;
+        for (TopExp_Explorer exp(solid, TopAbs_FACE); exp.More(); exp.Next()) {
+            ++i;
+            if (i == index) {
+                return TopoDS::Face(exp.Current());
+            }
+        }
+        return TopoDS_Face();
+    };
+
     const int max_depth = options.shatter_max_depth > 0 ? options.shatter_max_depth : 8;
 
     struct WorkItem {
@@ -119,13 +131,34 @@ bool shatter_solid(CadModel& model,
             continue;
         }
 
-        ConversionReport scratch;
-        std::vector<TopoDS_Solid> pieces =
-            split_solid_by_all_surfaces(item.solid, options, scratch, solid_index);
+        // 1. Targeted cut by the convexity-failure face. The validator found a
+        //    vertex on the far side of this face's surface, so its extension
+        //    passes through the piece and is guaranteed to separate it -- and
+        //    one surface at a time yields cleaner pieces than a batch cut.
+        std::vector<TopoDS_Solid> pieces;
+        std::size_t fail_face = 0;
+        if (find_convexity_failure_face(item.solid, solid_index, options, &fail_face)) {
+            const TopoDS_Face face = face_at(item.solid, fail_face);
+            if (!face.IsNull()) {
+                ConversionReport scratch;
+                pieces = split_solid_by_face(item.solid, face, options, scratch,
+                                             solid_index, fail_face);
+            }
+        }
+        // 2. Fallback: the full surface arrangement at once.
         if (pieces.size() <= 1) {
-            // No progress: the solid's own surfaces could not reduce this
-            // piece further (e.g. a torus or spline-bounded region that needs
-            // surface replacement, not decomposition).
+            ConversionReport scratch;
+            pieces = split_solid_by_all_surfaces(item.solid, options, scratch, solid_index);
+        }
+        // 3. Deep fallback: closure planes synthesized from partial curved
+        //    faces, for a swept arc with no planar CAD face bounding it.
+        if (pieces.size() <= 1) {
+            ConversionReport scratch;
+            pieces = split_solid_by_closure_planes(item.solid, options, scratch, solid_index);
+        }
+        if (pieces.size() <= 1) {
+            // No cut subdivided this piece; it likely needs surface
+            // replacement (torus/spline) rather than decomposition.
             final_pieces.push_back(item.solid);
             ++residual_nonconvex;
             continue;
@@ -154,11 +187,15 @@ bool shatter_solid(CadModel& model,
         return false;
     }
 
-    // Drop degenerate sliver pieces produced by the splitter.
+    // Drop degenerate pieces: zero-volume slivers, and pieces with no findable
+    // interior point (which the emit stage could not convert anyway). Dropping
+    // removes material, so the volume guard below catches the case where too
+    // much was discarded and refuses to mutate.
     const double sliver_floor = original_volume * 1.0e-9;
     std::vector<TopoDS_Solid> kept;
     kept.reserve(final_pieces.size());
     double pieces_volume = 0.0;
+    std::size_t dropped_unmeshable = 0;
     for (const TopoDS_Solid& piece : final_pieces) {
         GProp_GProps props;
         BRepGProp::VolumeProperties(piece, props);
@@ -166,8 +203,20 @@ bool shatter_solid(CadModel& model,
         if (volume <= sliver_floor) {
             continue;
         }
+        gp_Pnt interior;
+        if (!find_interior_point(piece, props, options.linear_tolerance, &interior)) {
+            ++dropped_unmeshable;
+            continue;
+        }
         kept.push_back(piece);
         pieces_volume += volume;
+    }
+    if (dropped_unmeshable > 0) {
+        std::ostringstream dmsg;
+        dmsg << "Dropped " << dropped_unmeshable << " degenerate piece(s) with no "
+                "findable interior point; the volume guard below validates the loss.";
+        model.diagnostics.push_back({
+            DiagnosticSeverity::warning, "shatter_dropped_degenerate_piece", dmsg.str(), id});
     }
     if (kept.empty()) {
         model.diagnostics.push_back({

@@ -52,6 +52,36 @@ for s in r.get("solids", []):
         sys.exit(1)
 PY
 
+# --- 1b. a curved non-convex part: 270-degree cylindrical wedge -----------
+# Its cross-section is a reflex pie wedge, so it fails single-cell convex
+# validation; shatter must subdivide it into convex sectors, exactly.
+wedge="$fixtures/cylinder_wedge_270.step"
+wedge_mcnp="$outdir/wedge.i"
+wedge_report="$outdir/wedge.json"
+"$exe" simplify "$wedge" --shatter solid:1 --out "$wedge_mcnp" \
+    --report "$wedge_report" >/dev/null 2>&1 \
+    || fail "shatter on cylinder_wedge_270 returned non-zero"
+python3 - "$wedge_report" <<'PY' || exit 1
+import json, sys
+r = json.load(open(sys.argv[1]))
+pieces = r.get("decomposed_pieces", [])
+if len(pieces) < 2:
+    print(f"wedge: expected >=2 pieces, got {len(pieces)}", file=sys.stderr)
+    sys.exit(1)
+if not all(p.get("exact_csg_supported") for p in pieces):
+    print(f"wedge: not all pieces exact_csg_supported: {pieces}", file=sys.stderr)
+    sys.exit(1)
+codes = {d.get("code") for d in r.get("diagnostics", [])}
+if "shatter_residual_nonconvex" in codes:
+    print("wedge: unexpected residual after shatter", file=sys.stderr)
+    sys.exit(1)
+# Volume must be preserved exactly (the shatter diag reports relative_delta).
+sh = [d for d in r.get("diagnostics", []) if d.get("code") == "shatter"]
+if not sh:
+    print("wedge: missing shatter diagnostic", file=sys.stderr)
+    sys.exit(1)
+PY
+
 # --- 2. compact -> Lua recipe -> replay via `cad2csg lua` -----------------
 recipe="$outdir/recipe.lua"
 "$exe" compact "$log" --out "$recipe" >/dev/null 2>&1 \
