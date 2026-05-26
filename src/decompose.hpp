@@ -21,6 +21,19 @@ std::vector<TopoDS_Solid> split_solid_by_planar_faces(const TopoDS_Solid& solid,
                                                       ConversionReport& report,
                                                       std::size_t solid_index);
 
+// Cut a solid by the bounded cutter of EVERY one of its faces in a single
+// splitter call: planes stay planes; cylinders/cones/spheres become their
+// full quadric surface; tori become their axis plane. The result is the
+// solid intersected with the full arrangement of its own surfaces, so each
+// produced piece lies on one definite side of every surface. Cutters are
+// deduplicated by surface signature so coincident faces do not multiply the
+// tool list. Returns an empty vector (and a diagnostic) when no split is
+// produced. This is the geometric core of `shatter_solid`.
+std::vector<TopoDS_Solid> split_solid_by_all_surfaces(const TopoDS_Solid& solid,
+                                                      const ConversionOptions& options,
+                                                      ConversionReport& report,
+                                                      std::size_t solid_index);
+
 std::vector<TopoDS_Solid> split_solid_by_face(const TopoDS_Solid& solid,
                                               const TopoDS_Face& face,
                                               const ConversionOptions& options,

@@ -242,6 +242,23 @@ bool dispatch_solid_op(Session& session,
         if (!r.ok) *error_out = "decompose_planar failed";
         return r.ok;
     }
+    if (op.op == "shatter") {
+        int max_depth = 8;
+        bool allow_volume_drift = false;
+        if (op.params && op.params->kind == JsonKind::object) {
+            if (const JsonValue* v = op.params->get("max_depth")) {
+                max_depth = static_cast<int>(v->as_number(8.0));
+            }
+            if (const JsonValue* v = op.params->get("allow_volume_drift")) {
+                allow_volume_drift = v->as_bool(false);
+            }
+        }
+        const CommandResult r = shatter(session, resolved_local_id,
+                                        max_depth, allow_volume_drift,
+                                        ReportIdMode::local);
+        if (!r.ok) *error_out = "shatter failed";
+        return r.ok;
+    }
     if (op.op == "decompose_by_face") {
         std::string face_id;
         if (op.params && op.params->kind == JsonKind::object) {

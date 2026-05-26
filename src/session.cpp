@@ -1143,6 +1143,45 @@ CommandResult decompose_planar(Session& session,
                         "decompose_planar");
 }
 
+CommandResult shatter(Session& session,
+                      const std::string& shape_id,
+                      int max_depth,
+                      bool allow_volume_drift,
+                      ReportIdMode id_mode) {
+    ShapeTarget target = find_shape_target(session, shape_id);
+    const std::vector<DecisionParam> params = {
+        param_int("max_depth", max_depth),
+        param_bool("allow_volume_drift", allow_volume_drift),
+    };
+    if (!target.document) {
+        log_solid_op(session, nullptr, {}, shape_id, "shatter", params, false);
+        return shape_target_error(session, target, shape_id);
+    }
+
+    // shatter_max_depth / allow_shatter_volume_drift are call-scoped, so copy
+    // the document options and override rather than mutating the document.
+    ConversionOptions options = target.document->options;
+    if (max_depth > 0) {
+        options.shatter_max_depth = max_depth;
+    }
+    options.allow_shatter_volume_drift = allow_volume_drift;
+
+    const std::size_t before = target.document->model.decomposed_pieces.size();
+    const auto start = Clock::now();
+    const bool ok = shatter_solid(target.document->model,
+                                  target.local_shape_id,
+                                  options);
+    target.document->performance.split_ms += elapsed_ms(start);
+    target.document->performance.splitter_calls += 1;
+    if (target.document->model.decomposed_pieces.size() > before) {
+        target.document->performance.pieces_produced +=
+            target.document->model.decomposed_pieces.size() - before;
+    }
+    log_solid_op(session, target.document, target.local_shape_id, shape_id,
+                 "shatter", params, ok);
+    return finish_document_mutation(session, *target.document, ok, id_mode);
+}
+
 CommandResult decompose_by_face(Session& session,
                                 const std::string& solid_shape_id,
                                 const std::string& face_shape_id,

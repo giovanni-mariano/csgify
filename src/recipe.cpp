@@ -54,6 +54,7 @@ std::string category_for(const std::string& op) {
     if (op == "decompose_by_face") return "solid";
     if (op == "decompose_by_plane") return "solid";
     if (op == "decompose_by_planes") return "solid";
+    if (op == "shatter") return "solid";
     if (op == "apply_decomposition_candidate") return "solid";
     if (op == "apply_replacement_operation") return "solid";
     if (op == "apply_checked_replacement_operation") return "solid";
@@ -294,6 +295,21 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
     if (d.op == "decompose_planar") {
         emit_comment(out, d);
         out << "s:decompose_planar(" << quoted_id << ")\n";
+        return true;
+    }
+    if (d.op == "shatter") {
+        int max_depth = 8;
+        bool allow_drift = false;
+        if (auto it = d.params.find("max_depth"); it != d.params.end()) {
+            max_depth = static_cast<int>(it->second->as_number(8.0));
+        }
+        if (auto it = d.params.find("allow_volume_drift"); it != d.params.end()) {
+            allow_drift = it->second->as_bool(false);
+        }
+        emit_comment(out, d);
+        out << "s:shatter(" << quoted_id << ", { max_depth = " << max_depth
+            << ", allow_volume_drift = " << (allow_drift ? "true" : "false")
+            << " })\n";
         return true;
     }
     if (d.op == "decompose_by_face") {

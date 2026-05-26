@@ -83,6 +83,7 @@ add_library(cad2csg_engine
     src/replay.cpp
     src/report.cpp
     src/session.cpp
+    src/shatter.cpp
     src/spline_fit.cpp
     src/step_export.cpp
 )
@@ -255,6 +256,15 @@ if(BUILD_TESTING)
             "$<TARGET_FILE:cad2csg>"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
             "${CMAKE_CURRENT_BINARY_DIR}/decompose-output"
+    )
+
+    add_test(
+        NAME cad2csg_shatter_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/shatter_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/shatter-output"
     )
 
     add_test(

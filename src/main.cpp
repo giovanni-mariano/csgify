@@ -161,7 +161,7 @@ constexpr VerbHelp kVerbHelp[] = {
      "    --replace-solid-bbox            --replace-solid-bbox-cylinder\n"
      "    --replace-solid-fitted-cylinder --replace-solid-fitted-sphere\n"
      "    --replace-solid-fitted-cone     --decompose-planar\n"
-     "    --auto-decompose-bsp\n"
+     "    --auto-decompose-bsp            --shatter\n"
      "    --fill-hole\n"
      "    --apply-decomposition-candidate --candidate candidate:N\n"
      "    --decompose-by-face --by-face face:N.M\n"
@@ -174,9 +174,10 @@ constexpr VerbHelp kVerbHelp[] = {
      "    --max-abs-delta value          (solid replacement volume guard)\n"
      "    --max-rel-delta value          (solid replacement volume guard)\n"
      "    --max-deviation value          (face replacement distance guard)\n"
-     "    --max-depth value              (safe BSP auto-decomposition)\n"
+     "    --max-depth value              (safe BSP / shatter recursion bound)\n"
      "    --allow-bbox-fallback-auto\n"
      "    --allow-medium-confidence-auto\n"
+     "    --allow-shatter-volume-drift   (let shatter proceed past tolerance)\n"
      "    --report PATH                  (`-` for stdout)\n"
      "    --proposal-report PATH         (`-` for stdout)\n"
      "    --host solid:N                 (fill-hole proposal context)\n"
@@ -1297,6 +1298,8 @@ int run_simplify_command(int argc, char** argv) {
     bool has_max_deviation = false;
     double max_deviation = 0.0;
     bool allow_overlaps = false;
+    bool allow_shatter_volume_drift = false;
+    bool union_decomposed_pieces = false;
 
     OptScanner scan(argc, argv, 7);
     while (!scan.done()) {
@@ -1334,6 +1337,14 @@ int run_simplify_command(int argc, char** argv) {
             continue;
         }
         if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
+        if (scan.take_flag("--allow-shatter-volume-drift")) {
+            allow_shatter_volume_drift = true;
+            continue;
+        }
+        if (scan.take_flag("--union-decomposed-pieces")) {
+            union_decomposed_pieces = true;
+            continue;
+        }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1344,6 +1355,7 @@ int run_simplify_command(int argc, char** argv) {
 
     cad2csg::ConversionOptions options;
     if (allow_overlaps) options.allow_overlaps = true;
+    if (union_decomposed_pieces) options.union_decomposed_pieces = true;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -1477,6 +1489,22 @@ int run_simplify_command(int argc, char** argv) {
         }
         action_result = cad2csg::decompose_planar(
             *session, target_id, cad2csg::ReportIdMode::local);
+    } else if (action == "--shatter") {
+        if (has_volume_limits) {
+            std::cerr << "error replacement_limit_not_applicable: volume delta limits "
+                      << "apply to replacement commands, not shatter\n";
+            return EXIT_FAILURE;
+        }
+        if (max_depth_value < 0.0) {
+            std::cerr << "error invalid_max_depth: --max-depth must be non-negative\n";
+            return EXIT_FAILURE;
+        }
+        action_result = cad2csg::shatter(
+            *session,
+            target_id,
+            static_cast<int>(max_depth_value),
+            allow_shatter_volume_drift,
+            cad2csg::ReportIdMode::local);
     } else if (action == "--decompose-by-face") {
         if (has_volume_limits) {
             std::cerr << "error replacement_limit_not_applicable: volume delta limits "

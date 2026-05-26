@@ -163,6 +163,19 @@ bool decompose_solid_by_planar_faces(CadModel& model,
                                      const std::string& solid_id,
                                      const ConversionOptions& options = {});
 
+// Exhaustive surface-driven subdivision. Cuts the solid by the bounded
+// cutter of every one of its own faces, recursing (up to
+// options.shatter_max_depth) into any piece that still fails convex
+// halfspace validation, until every piece is a simple CSG cell. Suppresses
+// the original solid and stores the pieces as `piece:N` in
+// model.decomposed_pieces, exactly like decompose_solid_by_planar_faces.
+// Returns false (without mutating) if the solid cannot be reduced to simple
+// pieces or if volume drifts past tolerance and
+// options.allow_shatter_volume_drift is not set.
+bool shatter_solid(CadModel& model,
+                   const std::string& solid_id,
+                   const ConversionOptions& options = {});
+
 bool decompose_solid_by_face(CadModel& model,
                              const std::string& solid_id,
                              const std::string& face_id,

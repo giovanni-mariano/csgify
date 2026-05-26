@@ -10,6 +10,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -231,6 +232,34 @@ bool convert_solid(alea_system_t* sys,
 
     ++report.solids_converted;
     return true;
+}
+
+// Build the intersection-of-halfspaces node for a piece, without creating a
+// cell. Returns INVALID on any failure. Used by the union-emission path so a
+// group of pieces can be combined into one cell. Diagnostics go to the
+// caller's report (which is a scratch report during the union trial).
+alea_node_id_t build_piece_intersection_node(
+        alea_system_t* sys,
+        const TopoDS_Solid& solid,
+        const gp_Pnt& interior_point,
+        std::size_t solid_index,
+        ConversionReport& report,
+        const std::vector<FaceReplacement>* replacements) {
+    std::vector<alea_node_id_t> nodes;
+    std::size_t face_index = 0;
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
+        ++face_index;
+        alea_node_id_t node = ALEA_NODE_ID_INVALID;
+        if (!add_face_halfspace(sys, TopoDS::Face(face_exp.Current()), interior_point,
+                                solid_index, face_index, report, &node, replacements)) {
+            return ALEA_NODE_ID_INVALID;
+        }
+        nodes.push_back(node);
+    }
+    if (nodes.empty()) {
+        return ALEA_NODE_ID_INVALID;
+    }
+    return alea_intersection_n(sys, nodes.data(), nodes.size());
 }
 
 alea_node_id_t oriented_halfspace(alea_system_t* sys,
@@ -466,6 +495,114 @@ bool emit_synthetic_body(alea_system_t* sys,
     return true;
 }
 
+// Emit the model's decomposed pieces. By default each piece becomes its own
+// Alea cell (convert_solid). When options.union_decomposed_pieces is set,
+// pieces sharing a source_solid_id are validated, built as intersection
+// nodes, and combined into a single union cell, so Alea's flatten/dedup pass
+// collapses the cut surfaces shared between adjacent pieces and the original
+// CAD solid stays one logical body. If any piece in a group is not a simple
+// convex cell, the whole group falls back to per-piece emission so the
+// honest per-piece diagnostics still surface.
+void emit_decomposed_pieces(alea_system_t* sys,
+                            const CadModel& model,
+                            const ConversionOptions& options,
+                            ConversionReport& report) {
+    std::size_t piece_index = 0;
+    auto report_piece = [&](const DecomposedSolidPiece& piece) -> std::size_t {
+        ++piece_index;
+        ++report.solids_seen;
+        ++report.decomposition_pieces;
+        report.decomposed_pieces.push_back(
+            analyze_decomposed_piece(piece, piece_index, 100000 + piece_index, options));
+        add_diag(report, DiagnosticSeverity::info, "decomposed_piece_emitted",
+                 "Decomposed solid piece is being converted as an explicit preprocessing result.",
+                 piece.label);
+        return 100000 + piece_index;
+    };
+
+    if (!options.union_decomposed_pieces) {
+        for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+            if (!piece.active) continue;
+            const std::size_t idx = report_piece(piece);
+            convert_solid(sys, piece.solid, idx, options, report);
+        }
+        return;
+    }
+
+    // Group active pieces by source_solid_id, preserving first-seen order.
+    std::vector<std::string> order;
+    std::map<std::string, std::vector<const DecomposedSolidPiece*>> groups;
+    for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (!piece.active) continue;
+        if (groups.find(piece.source_solid_id) == groups.end()) {
+            order.push_back(piece.source_solid_id);
+        }
+        groups[piece.source_solid_id].push_back(&piece);
+    }
+
+    for (const std::string& key : order) {
+        const std::vector<const DecomposedSolidPiece*>& pieces = groups[key];
+
+        // Trial: build an intersection node for every piece in the group.
+        std::vector<alea_node_id_t> piece_nodes;
+        bool all_simple = true;
+        ConversionReport scratch;
+        for (const DecomposedSolidPiece* piece : pieces) {
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(piece->solid, props);
+            gp_Pnt interior;
+            if (!find_interior_point(piece->solid, props, options.linear_tolerance, &interior)) {
+                all_simple = false;
+                break;
+            }
+            if (options.require_convex_cells
+                && !validate_convex_halfspace_cell(piece->solid, interior, 100000, options,
+                                                   scratch, false, false, false,
+                                                   &model.face_replacements)) {
+                all_simple = false;
+                break;
+            }
+            const alea_node_id_t node = build_piece_intersection_node(
+                sys, piece->solid, interior, 100000, scratch, &model.face_replacements);
+            if (node == ALEA_NODE_ID_INVALID) {
+                all_simple = false;
+                break;
+            }
+            piece_nodes.push_back(node);
+        }
+
+        if (all_simple && !piece_nodes.empty()) {
+            for (const DecomposedSolidPiece* piece : pieces) {
+                report_piece(*piece);
+            }
+            const alea_node_id_t root = piece_nodes.size() == 1
+                ? piece_nodes.front()
+                : alea_union_n(sys, piece_nodes.data(), piece_nodes.size());
+            int material_index = alea_find_material_by_id(sys, options.default_material_id);
+            if (material_index < 0) {
+                material_index = alea_add_material(sys, options.default_material_id);
+            }
+            if (root != ALEA_NODE_ID_INVALID && material_index >= 0
+                && alea_add_cell(sys, 0, root, material_index,
+                                 options.default_density, 0) >= 0) {
+                ++report.solids_converted;
+            } else {
+                add_diag(report, DiagnosticSeverity::error, "alea_cell_failed",
+                         alea_error()[0] ? alea_error()
+                                         : "Alea failed to add the decomposed-piece union cell.",
+                         key);
+            }
+        } else {
+            // Honest fallback: emit each piece on its own so per-piece
+            // diagnostics (and any further decomposition) still happen.
+            for (const DecomposedSolidPiece* piece : pieces) {
+                const std::size_t idx = report_piece(*piece);
+                convert_solid(sys, piece->solid, idx, options, report);
+            }
+        }
+    }
+}
+
 } // namespace
 
 ConversionResult convert_model(const CadModel& model,
@@ -492,22 +629,7 @@ ConversionResult convert_model(const CadModel& model,
                       &model.face_replacements);
     }
 
-    std::size_t piece_index = 0;
-    for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
-        if (!piece.active) {
-            continue;
-        }
-        ++piece_index;
-        ++result.report.solids_seen;
-        ++result.report.decomposition_pieces;
-        result.report.decomposed_pieces.push_back(
-            analyze_decomposed_piece(piece, piece_index, 100000 + piece_index, options));
-        add_diag(result.report, DiagnosticSeverity::info, "decomposed_piece_emitted",
-                 "Decomposed solid piece is being converted as an explicit preprocessing result.",
-                 piece.label);
-        convert_solid(result.system.get(), piece.solid,
-                      100000 + piece_index, options, result.report);
-    }
+    emit_decomposed_pieces(result.system.get(), model, options, result.report);
 
     for (const SyntheticBody& body : model.synthetic_bodies) {
         if (!body.emit_as_cell) {

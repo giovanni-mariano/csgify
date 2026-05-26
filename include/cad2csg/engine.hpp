@@ -457,6 +457,19 @@ struct ConversionOptions {
     bool require_convex_cells = true;
     bool try_planar_decomposition = true;
     bool split_union_cells = true;
+    // Exhaustive surface-driven subdivision (the `shatter` op). Each solid
+    // is cut by the bounded cutter of every one of its own faces until each
+    // piece lies on one definite side of every surface. `shatter_max_depth`
+    // bounds the recursion that re-feeds any piece still failing convex
+    // validation. `allow_shatter_volume_drift` lets the op proceed when the
+    // summed piece volume drifts past linear_tolerance (default: refuse, to
+    // keep conversion exact -- see docs/PHILOSOPHY.md). When
+    // `union_decomposed_pieces` is set, emit groups pieces sharing a
+    // source_solid_id into a single Alea union cell instead of one cell per
+    // piece; Alea's flatten/dedup then collapses the shared cut surfaces.
+    int shatter_max_depth = 8;
+    bool allow_shatter_volume_drift = false;
+    bool union_decomposed_pieces = false;
     // Overlap detection. Runs during analyze; emits `solid_overlap`
     // diagnostics for pairs whose intersection volume exceeds
     // overlap_volume_threshold (absolute) OR overlap_volume_fraction

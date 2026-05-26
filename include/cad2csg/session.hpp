@@ -136,6 +136,17 @@ CommandResult decompose_by_planes(Session& session,
                                   const std::vector<PlaneSpec>& planes,
                                   ReportIdMode id_mode = ReportIdMode::scoped);
 
+// Exhaustive surface-driven subdivision of one solid. Cuts the solid by all
+// of its own surfaces, recursing into pieces that still fail convex
+// validation up to max_depth. Unlike auto_decompose_bsp there is no
+// confidence gate: it either reduces the solid to simple pieces or fails
+// honestly with a shatter_residual_nonconvex diagnostic.
+CommandResult shatter(Session& session,
+                      const std::string& solid_shape_id,
+                      int max_depth = 8,
+                      bool allow_volume_drift = false,
+                      ReportIdMode id_mode = ReportIdMode::scoped);
+
 DecompositionProposal propose_decomposition(
     Session& session,
     const std::string& solid_shape_id,

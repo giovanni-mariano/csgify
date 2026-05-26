@@ -1158,6 +1158,34 @@ int l_decompose_by_planes(lua_State* L) {
                                                       planes));
 }
 
+int l_shatter(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* shape_id = luaL_checkstring(L, 2);
+    int max_depth = 8;
+    bool allow_volume_drift = false;
+    if (lua_gettop(L) >= 3) {
+        if (lua_isnumber(L, 3)) {
+            max_depth = static_cast<int>(luaL_checkinteger(L, 3));
+        } else if (lua_istable(L, 3)) {
+            lua_getfield(L, 3, "max_depth");
+            if (!lua_isnil(L, -1)) {
+                max_depth = static_cast<int>(luaL_checkinteger(L, -1));
+            }
+            lua_pop(L, 1);
+            lua_getfield(L, 3, "allow_volume_drift");
+            if (!lua_isnil(L, -1)) {
+                allow_volume_drift = lua_toboolean(L, -1) != 0;
+            }
+            lua_pop(L, 1);
+        } else if (!lua_isnil(L, 3)) {
+            return luaL_error(L, "shatter expects a number or "
+                                 "{ max_depth = number, allow_volume_drift = bool }");
+        }
+    }
+    return push_command_result(L, shatter(*s->session, shape_id,
+                                          max_depth, allow_volume_drift));
+}
+
 int l_propose_decomposition(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* solid_id = luaL_checkstring(L, 2);
@@ -1697,6 +1725,8 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "decompose_by_plane");
     lua_pushcfunction(L, l_decompose_by_planes);
     lua_setfield(L, -2, "decompose_by_planes");
+    lua_pushcfunction(L, l_shatter);
+    lua_setfield(L, -2, "shatter");
     lua_pushcfunction(L, l_propose_decomposition);
     lua_setfield(L, -2, "propose_decomposition");
     lua_pushcfunction(L, l_apply_decomposition_candidate);
