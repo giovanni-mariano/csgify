@@ -17,6 +17,22 @@ struct CadDocument {
     CadModel model;
     ConversionReport report;
     PerformanceMetrics performance;
+
+    // High-water marks for the mutation-overlap check. After each
+    // mutating call, only synthetic bodies / decomposed pieces with
+    // index >= the corresponding high-water are tested against the
+    // surviving model. The high-water is bumped after each check so
+    // we never re-scan the same new geometry twice.
+    std::size_t synthetic_body_high_water = 0;
+    std::size_t decomposed_piece_high_water = 0;
+
+    // Canonical (lo<->hi) pairs of solid/synthetic/piece ids that are
+    // already known to overlap. Pairs detected here are not re-flagged
+    // as `mutation_introduced_overlap`; only pairs that were NOT in
+    // this set when discovered count as introduced. Populated by the
+    // explicit analyze() pass (full pairwise scan) and incrementally
+    // by the per-mutation check.
+    std::vector<std::pair<std::string, std::string>> known_overlap_pairs;
 };
 
 struct Session {

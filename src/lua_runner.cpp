@@ -2,6 +2,10 @@
 
 #include "cad2csg/engine.hpp"
 #include "cad2csg/session.hpp"
+#include "decision_pack.hpp"
+#include "recipe.hpp"
+#include "replay.hpp"
+#include "engine_model.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -680,6 +684,22 @@ void push_report_table(lua_State* L, const ConversionReport& report) {
     }
     lua_setfield(L, -2, "decomposed_pieces");
 
+    // Overlap pairs (interpenetrating solids). Empty when none were
+    // detected, or when options.check_overlaps is false.
+    lua_newtable(L);
+    for (std::size_t i = 0; i < report.overlaps.size(); ++i) {
+        const SolidOverlap& overlap = report.overlaps[i];
+        lua_newtable(L);
+        set_string_field(L, "solid_a_id", overlap.solid_a_id);
+        set_string_field(L, "solid_b_id", overlap.solid_b_id);
+        set_number_field(L, "volume_a", overlap.volume_a);
+        set_number_field(L, "volume_b", overlap.volume_b);
+        set_number_field(L, "intersection_volume", overlap.intersection_volume);
+        set_number_field(L, "min_fraction", overlap.min_fraction);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "overlaps");
+
     lua_newtable(L);
     for (std::size_t i = 0; i < report.decision_requests.size(); ++i) {
         push_decision_request_table(L, report.decision_requests[i]);
@@ -1257,6 +1277,327 @@ int l_emit(lua_State* L) {
     return push_command_result(L, emit_document(*s->session, document_id, output_path));
 }
 
+// s:preprocess_safe_all(doc_id[, opts])
+// Composed equivalent of CLI `preprocess --safe-all`:
+//   1. analyze + overlap precheck (refuses unless opts.allow_overlaps)
+//   2. auto-fit qualifying spline faces
+//   3. high-confidence removals (default: opts.apply_removal_candidates
+//      = "high"; pass "medium" to widen)
+//   4. safe BSP decomposition of non-convex solids
+// Returns a summary table:
+//   { ok, auto_fit_applied, removed, decomposed, attempted,
+//     needs_decision, remaining, overlaps_aborted }
+// `ok` is false if the overlap precheck aborted (overlaps_aborted=true)
+// or any underlying op fatally failed.
+int l_preprocess_safe_all(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* doc_id = luaL_checkstring(L, 2);
+
+    bool allow_overlaps = false;
+    std::string apply_removal_confidence = "high";
+    int max_depth = 4;
+    DecompositionPolicy policy;
+    bool has_max_deviation = false;
+    double max_deviation = 0.0;
+
+    if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
+        lua_getfield(L, 3, "allow_overlaps");
+        if (!lua_isnil(L, -1)) allow_overlaps = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "apply_removal_candidates");
+        if (lua_isstring(L, -1)) apply_removal_confidence = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "max_depth");
+        if (lua_isnumber(L, -1)) {
+            max_depth = static_cast<int>(luaL_checkinteger(L, -1));
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "max_deviation");
+        if (lua_isnumber(L, -1)) {
+            has_max_deviation = true;
+            max_deviation = luaL_checknumber(L, -1);
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "allow_medium_confidence_auto");
+        if (!lua_isnil(L, -1)) {
+            policy.allow_medium_confidence_auto = lua_toboolean(L, -1) != 0;
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "allow_bbox_fallback_auto");
+        if (!lua_isnil(L, -1)) {
+            policy.allow_bbox_fallback_auto = lua_toboolean(L, -1) != 0;
+        }
+        lua_pop(L, 1);
+    }
+
+    std::size_t auto_fit_applied = 0;
+    std::size_t removed = 0;
+    std::size_t attempted = 0;
+    std::size_t succeeded = 0;
+    std::size_t needs_decision = 0;
+    bool overlaps_aborted = false;
+
+    auto push_summary = [&](bool ok,
+                              std::size_t remaining_count) {
+        lua_newtable(L);
+        set_boolean_field(L, "ok", ok);
+        set_integer_field(L, "auto_fit_applied", auto_fit_applied);
+        set_integer_field(L, "removed", removed);
+        set_integer_field(L, "attempted", attempted);
+        set_integer_field(L, "decomposed", succeeded);
+        set_integer_field(L, "needs_decision", needs_decision);
+        set_integer_field(L, "remaining", remaining_count);
+        set_boolean_field(L, "overlaps_aborted", overlaps_aborted);
+    };
+
+    // 1. Overlap precheck.
+    if (!allow_overlaps) {
+        CommandResult precheck =
+            analyze(*s->session, doc_id, ReportIdMode::local);
+        if (!precheck.report.overlaps.empty()) {
+            overlaps_aborted = true;
+            push_summary(false, precheck.report.overlaps.size());
+            return 1;
+        }
+    }
+
+    // 2. Auto-fit spline faces.
+    AutoFitCommandResult af = auto_fit_splines_with_summary(
+        *s->session, doc_id, has_max_deviation, max_deviation,
+        ReportIdMode::local);
+    auto_fit_applied = af.summary.applied;
+
+    // 3. High-confidence removals.
+    if (!apply_removal_confidence.empty()) {
+        RemovalProposal removals = suggest_removals(*s->session, doc_id,
+                                                     ReportIdMode::local);
+        for (const RemovalCandidate& c : removals.candidates) {
+            const bool allowed = c.confidence == "high"
+                || (apply_removal_confidence == "medium"
+                    && c.confidence == "medium");
+            if (!allowed || c.suggested_action == "manual") continue;
+            CommandResult r = remove_solid(*s->session, c.solid_id,
+                                            ReportIdMode::local);
+            if (r.ok) ++removed;
+        }
+    }
+
+    // 4. Safe BSP decomposition of non-convex solids.
+    CommandResult analysis = analyze(*s->session, doc_id, ReportIdMode::local);
+    std::vector<std::string> targets;
+    for (const AnalyzedSolid& sol : analysis.report.solids) {
+        if (sol.needs_decomposition) targets.push_back(sol.id);
+    }
+    for (const std::string& id : targets) {
+        ++attempted;
+        CommandResult r = auto_decompose_bsp(*s->session, id, max_depth,
+                                              policy, ReportIdMode::local,
+                                              /*defer_analysis=*/true);
+        if (r.ok) {
+            ++succeeded;
+        } else {
+            for (const Diagnostic& d : r.report.diagnostics) {
+                if (d.code == "auto_decompose_bsp_needs_decision") {
+                    ++needs_decision; break;
+                }
+            }
+        }
+    }
+
+    // Final analyze to count what's left.
+    CommandResult final_analysis =
+        analyze(*s->session, doc_id, ReportIdMode::local);
+    std::size_t remaining = 0;
+    for (const AnalyzedSolid& sol : final_analysis.report.solids) {
+        if (!sol.exact_csg_supported) ++remaining;
+    }
+
+    push_summary(true, remaining);
+    return 1;
+}
+
+// s:write_decision_pack(doc_id, output_dir[, opts])
+// Bundles human/agent review packets (preview.html + targets) for the
+// document. opts may carry { target_id, max_packets }. Returns a
+// table { ok, packets_written, error }.
+int l_write_decision_pack(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* doc_id = luaL_checkstring(L, 2);
+    const char* out_dir = luaL_checkstring(L, 3);
+
+    DecisionPackOptions options;
+    options.output_dir = out_dir;
+    if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
+        lua_getfield(L, 4, "target_id");
+        if (lua_isstring(L, -1)) options.target_id = lua_tostring(L, -1);
+        lua_pop(L, 1);
+        lua_getfield(L, 4, "max_packets");
+        if (lua_isnumber(L, -1)) {
+            options.max_packets = static_cast<std::size_t>(
+                luaL_checkinteger(L, -1));
+        }
+        lua_pop(L, 1);
+    }
+
+    // write_decision_packs takes (report, model, options). The
+    // session keeps the model behind CadDocument; rather than break
+    // the session_impl encapsulation, re-load the CadModel from the
+    // recorded source path. Decision-pack writing is a once-per-
+    // review-cycle op, so the extra import cost is acceptable.
+    const std::string& source_path =
+        document_source_path(*s->session, doc_id);
+    if (source_path.empty()) {
+        lua_newtable(L);
+        set_boolean_field(L, "ok", false);
+        set_integer_field(L, "packets_written", 0);
+        set_string_field(L, "error",
+                         "document_not_found: cannot resolve source path");
+        return 1;
+    }
+
+    // The latest report from the session (analyze / mutate side
+    // effects) is what we hand to the decision-pack writer; it
+    // already carries the diagnostics + decision_requests that
+    // populate the review packets.
+    const ConversionReport& report = last_report(*s->session);
+
+    ConversionOptions load_options;
+    CadModel model = load_step_model(source_path, load_options);
+
+    DecisionPackResult result = write_decision_packs(report, model, options);
+
+    lua_newtable(L);
+    set_boolean_field(L, "ok", result.ok);
+    set_integer_field(L, "packets_written", result.packets_written);
+    set_string_field(L, "error", result.error);
+    return 1;
+}
+
+// s:explain(shape_id[, doc_id])
+// Returns a structured table describing why the target solid /
+// piece / face is not emit-ready: status, blockers, suggested
+// actions, and top decomposition / surface-replacement candidates.
+// Mirrors the data the CLI `explain` verb prints. `doc_id` defaults
+// to "doc:1" when omitted.
+int l_explain(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* shape_id = luaL_checkstring(L, 2);
+    const std::string doc_id = lua_gettop(L) >= 3 && !lua_isnil(L, 3)
+                                   ? luaL_checkstring(L, 3)
+                                   : "doc:1";
+
+    // Run analyze (local mode -- so ids in the resulting report match
+    // the local shape_id form the engine uses internally; the caller
+    // can still pass scoped ids and we strip the doc prefix below).
+    CommandResult analysis = analyze(*s->session, doc_id, ReportIdMode::local);
+    const ConversionReport& report = analysis.report;
+
+    auto strip_doc_prefix = [&](std::string id) {
+        const std::string prefix = doc_id + "/";
+        if (id.rfind(prefix, 0) == 0) id.erase(0, prefix.size());
+        return id;
+    };
+    const std::string target_id = strip_doc_prefix(shape_id);
+
+    const AnalyzedSolid* solid_hit = nullptr;
+    const AnalyzedDecomposedPiece* piece_hit = nullptr;
+    const AnalyzedFace* face_hit = nullptr;
+    for (const AnalyzedSolid& sol : report.solids) {
+        if (sol.id == target_id) { solid_hit = &sol; break; }
+    }
+    if (!solid_hit) {
+        for (const AnalyzedDecomposedPiece& p : report.decomposed_pieces) {
+            if (p.id == target_id) { piece_hit = &p; break; }
+        }
+    }
+    if (!solid_hit && !piece_hit) {
+        for (const AnalyzedFace& f : report.faces) {
+            if (f.id == target_id) { face_hit = &f; break; }
+        }
+    }
+
+    lua_newtable(L);
+    set_string_field(L, "target_id", shape_id);
+    if (!solid_hit && !piece_hit && !face_hit) {
+        set_string_field(L, "kind", "unknown");
+        set_string_field(L, "error", "explain_target_not_found");
+        set_boolean_field(L, "ready", false);
+        return 1;
+    }
+
+    auto status_label = [](const AnalyzedSolid& sol) -> const char* {
+        if (sol.exact_csg_supported) return "ready";
+        if (sol.needs_spline_replacement) return "spline";
+        if (sol.needs_decomposition) return "decompose";
+        if (sol.needs_user_decision) return "decision";
+        return "review";
+    };
+
+    if (solid_hit) {
+        set_string_field(L, "kind", "solid");
+        set_string_field(L, "status", status_label(*solid_hit));
+        set_number_field(L, "volume", solid_hit->volume);
+        set_boolean_field(L, "ready", solid_hit->exact_csg_supported);
+        set_boolean_field(L, "needs_decomposition", solid_hit->needs_decomposition);
+        set_boolean_field(L, "needs_spline_replacement",
+                          solid_hit->needs_spline_replacement);
+        set_boolean_field(L, "needs_surface_replacement",
+                          solid_hit->needs_surface_replacement);
+        set_boolean_field(L, "needs_user_decision",
+                          solid_hit->needs_user_decision);
+        // Blocking faces on this solid.
+        lua_newtable(L);
+        std::size_t idx = 0;
+        for (const AnalyzedFace& f : report.faces) {
+            if (f.solid_id != solid_hit->id) continue;
+            if (f.exact_csg_supported) continue;
+            ++idx;
+            push_face_table(L, f);
+            lua_rawseti(L, -2, static_cast<lua_Integer>(idx));
+        }
+        lua_setfield(L, -2, "blocking_faces");
+        // Top decomposition candidates (if non-convex).
+        if (solid_hit->needs_decomposition) {
+            DecompositionProposal prop =
+                propose_decomposition(*s->session, solid_hit->id,
+                                       ReportIdMode::local);
+            push_decomposition_proposal_table(L, prop);
+            lua_setfield(L, -2, "decomposition");
+        }
+    } else if (piece_hit) {
+        set_string_field(L, "kind", "piece");
+        set_string_field(L, "source_solid_id", piece_hit->source_solid_id);
+        set_number_field(L, "volume", piece_hit->volume);
+        set_boolean_field(L, "ready", piece_hit->exact_csg_supported);
+        set_boolean_field(L, "needs_decomposition", piece_hit->needs_decomposition);
+        set_boolean_field(L, "needs_spline_replacement",
+                          piece_hit->needs_spline_replacement);
+        set_boolean_field(L, "needs_surface_replacement",
+                          piece_hit->needs_surface_replacement);
+        set_boolean_field(L, "needs_user_decision",
+                          piece_hit->needs_user_decision);
+    } else { // face_hit
+        set_string_field(L, "kind", "face");
+        set_string_field(L, "surface_type", face_hit->surface_type);
+        set_string_field(L, "owner_solid_id", face_hit->solid_id);
+        set_number_field(L, "area", face_hit->area);
+        set_boolean_field(L, "ready", face_hit->exact_csg_supported);
+        set_boolean_field(L, "needs_spline_replacement",
+                          face_hit->needs_spline_replacement);
+        set_boolean_field(L, "needs_surface_replacement",
+                          face_hit->needs_surface_replacement);
+        set_boolean_field(L, "needs_emitter", face_hit->needs_emitter);
+        if (!face_hit->exact_csg_supported) {
+            SurfaceReplacementProposal prop =
+                propose_surface_replacement(*s->session, face_hit->id,
+                                             ReportIdMode::local);
+            push_surface_replacement_proposal_table(L, prop);
+            lua_setfield(L, -2, "surface_replacement");
+        }
+    }
+    return 1;
+}
+
 // s:export_step(doc, "simplified.step")
 // Writes the as-simplified geometry to STEP for visual review (the
 // CLI equivalent is --out-step). Original solids + decomposed pieces +
@@ -1366,6 +1707,12 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "emit");
     lua_pushcfunction(L, l_export_step);
     lua_setfield(L, -2, "export_step");
+    lua_pushcfunction(L, l_explain);
+    lua_setfield(L, -2, "explain");
+    lua_pushcfunction(L, l_write_decision_pack);
+    lua_setfield(L, -2, "write_decision_pack");
+    lua_pushcfunction(L, l_preprocess_safe_all);
+    lua_setfield(L, -2, "preprocess_safe_all");
     lua_pushcfunction(L, l_report_json);
     lua_setfield(L, -2, "report_json");
     lua_pushcfunction(L, l_report_table);
@@ -1377,11 +1724,56 @@ void register_session(lua_State* L) {
     lua_pop(L, 1);
 }
 
+// cad2csg.compact(log_path, recipe_path)
+// Reads an append-only decision log and writes a deterministic Lua
+// recipe. Module-level (not a session method) because it operates on
+// files, not session state. Returns true on success, or (nil, errmsg)
+// on failure.
+int l_module_compact(lua_State* L) {
+    const char* log_path = luaL_checkstring(L, 1);
+    const char* recipe_path = luaL_checkstring(L, 2);
+    const int rc = compact_log_to_recipe(log_path, recipe_path);
+    if (rc != 0) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "compact_log_to_recipe failed (rc=%d)", rc);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
+// cad2csg.replay(recipe_path, step_path, out_path, report_path[, out_step_path])
+// Replays a compacted recipe against a STEP file. step_path may be
+// empty to use the recorded step path from the recipe header. Returns
+// true on success, or (nil, errmsg) on failure.
+int l_module_replay(lua_State* L) {
+    const char* recipe_path = luaL_checkstring(L, 1);
+    const char* step_path = luaL_checkstring(L, 2);
+    const char* output_path = luaL_checkstring(L, 3);
+    const char* report_path = luaL_checkstring(L, 4);
+    const char* step_out_path = lua_gettop(L) >= 5 && !lua_isnil(L, 5)
+                                    ? luaL_checkstring(L, 5)
+                                    : "";
+    const int rc = replay_recipe(recipe_path, step_path, output_path,
+                                  report_path, step_out_path);
+    if (rc != 0) {
+        lua_pushnil(L);
+        lua_pushfstring(L, "replay_recipe failed (rc=%d)", rc);
+        return 2;
+    }
+    lua_pushboolean(L, 1);
+    return 1;
+}
+
 void register_cad2csg(lua_State* L) {
     register_session(L);
     lua_newtable(L);
     lua_pushcfunction(L, l_new_session);
     lua_setfield(L, -2, "session");
+    lua_pushcfunction(L, l_module_compact);
+    lua_setfield(L, -2, "compact");
+    lua_pushcfunction(L, l_module_replay);
+    lua_setfield(L, -2, "replay");
     lua_setglobal(L, "cad2csg");
 }
 

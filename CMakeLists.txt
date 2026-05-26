@@ -321,6 +321,33 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME cad2csg_overlap_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/overlap_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/overlap-output"
+    )
+
+    add_test(
+        NAME cad2csg_mutation_overlap_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/mutation_overlap_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/mutation-overlap-output"
+    )
+
+    add_test(
+        NAME cad2csg_overlap_gate_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/overlap_gate_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/overlap-gate-output"
+    )
+
+    add_test(
         NAME cad2csg_id_stability_smoke
         COMMAND
             bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/id_stability_smoke.sh"
@@ -400,6 +427,15 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/lua_api.lua"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
                 "${CMAKE_CURRENT_BINARY_DIR}/lua-api-output"
+        )
+        add_test(
+            NAME cad2csg_lua_coverage_smoke
+            COMMAND
+                bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/lua_coverage_smoke.sh"
+                "$<TARGET_FILE:cad2csg>"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/lua_coverage.lua"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+                "${CMAKE_CURRENT_BINARY_DIR}/lua-coverage-output"
         )
     endif()
 endif()

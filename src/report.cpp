@@ -608,6 +608,25 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         out << "\n";
     }
     out << "  ],\n";
+    out << "  \"overlaps\": [\n";
+    for (std::size_t i = 0; i < report.overlaps.size(); ++i) {
+        const SolidOverlap& overlap = report.overlaps[i];
+        out << "    {\n";
+        out << "      \"solid_a_id\": \"" << json_escape(overlap.solid_a_id) << "\",\n";
+        out << "      \"solid_b_id\": \"" << json_escape(overlap.solid_b_id) << "\",\n";
+        out << "      \"volume_a\": " << std::setprecision(17) << overlap.volume_a << ",\n";
+        out << "      \"volume_b\": " << std::setprecision(17) << overlap.volume_b << ",\n";
+        out << "      \"intersection_volume\": " << std::setprecision(17)
+            << overlap.intersection_volume << ",\n";
+        out << "      \"min_fraction\": " << std::setprecision(17)
+            << overlap.min_fraction << "\n";
+        out << "    }";
+        if (i + 1 < report.overlaps.size()) {
+            out << ",";
+        }
+        out << "\n";
+    }
+    out << "  ],\n";
     out << "  \"diagnostics\": [\n";
     for (std::size_t i = 0; i < report.diagnostics.size(); ++i) {
         const Diagnostic& diagnostic = report.diagnostics[i];

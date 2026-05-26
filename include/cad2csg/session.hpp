@@ -204,6 +204,14 @@ AutoFitCommandResult auto_fit_splines_with_summary(
 
 const ConversionReport& last_report(const Session& session);
 
+// Source-path lookup for a previously loaded document. Returns empty
+// when document_id is unknown. Used by callers (Lua bindings,
+// scripts) that need to re-derive the on-disk path the document was
+// loaded from -- e.g., to pass through to a tool that operates on
+// files rather than session state.
+const std::string& document_source_path(const Session& session,
+                                         const DocumentId& document_id);
+
 const DecompositionProposal& last_decomposition_proposal(const Session& session);
 
 const HoleFillProposal& last_hole_fill_proposal(const Session& session);

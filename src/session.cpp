@@ -605,6 +605,29 @@ CommandResult analyze(Session& session,
         }
         const auto start = Clock::now();
         ConversionReport local_report = analyze_model(document.model, document.options);
+        // Pairwise overlap detection only runs on the explicit
+        // analyze() entry, NOT on the per-mutation analyze inside
+        // finish_document_mutation. The O(N^2) bbox-prescreened
+        // intersection passes add up quickly during BSP recursion.
+        // The scoped diagnostics + report.overlaps[] are populated
+        // here so the caller sees them after `s:analyze(doc)` or
+        // `cad2csg inspect`.
+        detail::detect_solid_overlaps(document.model, document.options,
+                                       local_report);
+        // Seed the known-overlap set so subsequent mutation-overlap
+        // checks treat these pairs as pre-existing (not introduced by
+        // the mutation). Each pair is canonicalized (lo<->hi) for
+        // stable lookup.
+        for (const SolidOverlap& ov : local_report.overlaps) {
+            auto key = ov.solid_a_id < ov.solid_b_id
+                ? std::make_pair(ov.solid_a_id, ov.solid_b_id)
+                : std::make_pair(ov.solid_b_id, ov.solid_a_id);
+            bool exists = false;
+            for (const auto& k : document.known_overlap_pairs) {
+                if (k == key) { exists = true; break; }
+            }
+            if (!exists) document.known_overlap_pairs.push_back(key);
+        }
         document.performance.analyze_ms += elapsed_ms(start);
         local_report.performance = document.performance;
         document.report = id_mode == ReportIdMode::scoped
@@ -681,6 +704,18 @@ CommandResult finish_document_mutation(Session& session,
     // sibling still needs decomposition).
     const auto start = Clock::now();
     ConversionReport local_report = analyze_model(document.model, document.options);
+    // Mutation-overlap check: detect whether the most recent op
+    // introduced new overlaps. Only inspects synthetic bodies and
+    // decomposed pieces ADDED since the last call (high-water marked
+    // on the document), so cost is bounded by the new geometry's
+    // count, not the model size. Pre-existing overlaps are not
+    // re-reported here -- those come from the explicit analyze pass.
+    detail::detect_mutation_overlaps(document.model,
+                                      document.options,
+                                      local_report,
+                                      &document.synthetic_body_high_water,
+                                      &document.decomposed_piece_high_water,
+                                      &document.known_overlap_pairs);
     document.performance.analyze_ms += elapsed_ms(start);
     local_report.performance = document.performance;
     document.report = id_mode == ReportIdMode::scoped
@@ -2105,6 +2140,15 @@ VolumeComparison compare_document_volumes(Session& session,
 
 const ConversionReport& last_report(const Session& session) {
     return session.last_report_value;
+}
+
+const std::string& document_source_path(const Session& session,
+                                         const DocumentId& document_id) {
+    static const std::string kEmpty;
+    for (const CadDocument& doc : session.documents) {
+        if (doc.id == document_id) return doc.source_path;
+    }
+    return kEmpty;
 }
 
 const DecompositionProposal& last_decomposition_proposal(const Session& session) {

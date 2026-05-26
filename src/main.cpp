@@ -63,13 +63,20 @@ constexpr VerbHelp kVerbHelp[] = {
     {"inspect",
      "inspect input.step [--report report.json|-] [--log decisions.json]\n"
      "                            [--units mm|cm|m|in|...] [--scale X]\n"
-     "                            [--normalize-units mm|cm|m|in|...]",
+     "                            [--normalize-units mm|cm|m|in|...]\n"
+     "                            [--no-overlap-check]",
      "Analyze a STEP file; print a human summary or write JSON.",
      "  --report PATH         write JSON report to PATH (`-` for stdout)\n"
      "  --log PATH            open an append-only decision log alongside the run\n"
      "  --units NAME          assert the source unit (no geometry rescale)\n"
      "  --scale X             assert the source-unit-to-mm factor (no rescale)\n"
-     "  --normalize-units NM  actually rescale geometry to NM (mm|cm|m|in|...)",
+     "  --normalize-units NM  actually rescale geometry to NM (mm|cm|m|in|...)\n"
+     "  --no-overlap-check    skip the pairwise solid-overlap analysis\n"
+     "                          (default: on; flags interpenetrating solids,\n"
+     "                          which MCNP cannot tolerate)\n"
+     "  --allow-overlaps      downgrade overlap diagnostics from error to\n"
+     "                          warning; emit will proceed despite overlaps\n"
+     "                          (use only when you understand the consequences)",
      kReadOnlyMutation},
     {"explain",
      "explain <shape-id> input.step [--report report.json|-]",
@@ -112,11 +119,16 @@ constexpr VerbHelp kVerbHelp[] = {
      "                                  [--apply-removal-candidates high|medium]\n"
      "                                  [--safe-all] [--dry-run]\n"
      "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
+     "                                  [--allow-overlaps]\n"
      "                                  [--log decisions.json] [--report report.json|-]",
      "Apply safe high-confidence operations and emit a simplified STEP.",
      "  --safe-all              compose every safe pass (auto-fit + BSP + high-confidence removals)\n"
      "  --dry-run               print the plan without mutating; --out-step optional\n"
-     "  --apply-removal-candidates LEVEL  one of: high | medium (default: none)",
+     "  --apply-removal-candidates LEVEL  one of: high | medium (default: none)\n"
+     "  --allow-overlaps        downgrade overlap diagnostics to warning and\n"
+     "                            let --safe-all proceed despite pre-existing\n"
+     "                            interpenetrations (default: abort if any pair\n"
+     "                            is detected)",
      "Mutation contract: may suppress solids selected for removal, may auto-fit\n"
      "  spline faces in place (when --safe-all), and may decompose non-convex\n"
      "  targets. Decomposed solid:N is suppressed and produces piece:1..K\n"
@@ -482,6 +494,10 @@ void print_human_inspect(std::ostream& out,
         out << " (x" << report.length_unit_to_mm << " to mm)";
     }
     out << "\n";
+    if (!report.overlaps.empty()) {
+        out << "  overlaps: " << report.overlaps.size()
+            << " interpenetrating pair(s) -- MCNP cells must be disjoint\n";
+    }
     if (!report.solids.empty()) {
         out << "\nPer-solid status:\n";
         for (const cad2csg::AnalyzedSolid& s : report.solids) {
@@ -1280,6 +1296,7 @@ int run_simplify_command(int argc, char** argv) {
     cad2csg::HoleFillOptions hole_fill_options;
     bool has_max_deviation = false;
     double max_deviation = 0.0;
+    bool allow_overlaps = false;
 
     OptScanner scan(argc, argv, 7);
     while (!scan.done()) {
@@ -1316,6 +1333,7 @@ int run_simplify_command(int argc, char** argv) {
             decomposition_policy.allow_medium_confidence_auto = true;
             continue;
         }
+        if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1325,6 +1343,7 @@ int run_simplify_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
+    if (allow_overlaps) options.allow_overlaps = true;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -1665,6 +1684,8 @@ int run_inspect_command(int argc, char** argv) {
     std::string units_override;
     std::string normalize_to;
     double scale_override = 0.0;
+    bool disable_overlap_check = false;
+    bool allow_overlaps = false;
 
     OptScanner scan(argc, argv, 3);
     while (!scan.done()) {
@@ -1673,6 +1694,8 @@ int run_inspect_command(int argc, char** argv) {
         if (scan.take_string("--units", &units_override)) continue;
         if (scan.take_string("--normalize-units", &normalize_to)) continue;
         if (scan.take_double("--scale", &scale_override)) continue;
+        if (scan.take_flag("--no-overlap-check")) { disable_overlap_check = true; continue; }
+        if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1685,6 +1708,8 @@ int run_inspect_command(int argc, char** argv) {
     options.unit_override = units_override;
     options.normalize_to_unit = normalize_to;
     options.unit_scale_to_mm_override = scale_override;
+    if (disable_overlap_check) options.check_overlaps = false;
+    if (allow_overlaps) options.allow_overlaps = true;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -1946,6 +1971,7 @@ int run_decompose_apply_command(int argc, char** argv) {
     std::size_t max_splits_value = 16;
     std::size_t max_targets_value = 0;
     std::vector<std::string> selected_targets;
+    bool allow_overlaps = false;
 
     OptScanner scan(argc, argv, 5);
     while (!scan.done()) {
@@ -1965,6 +1991,7 @@ int run_decompose_apply_command(int argc, char** argv) {
         }
         if (scan.take_flag("--allow-medium-confidence-auto")) { allow_medium = true; continue; }
         if (scan.take_flag("--allow-bbox-fallback-auto")) { allow_bbox_fallback = true; continue; }
+        if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -2009,6 +2036,7 @@ int run_decompose_apply_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
+    if (allow_overlaps) options.allow_overlaps = true;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -2162,6 +2190,7 @@ int run_preprocess_command(int argc, char** argv) {
     std::vector<std::string> selected_targets;
     bool safe_all = false;
     bool dry_run = false;
+    bool allow_overlaps = false;
 
     OptScanner scan(argc, argv, 3);
     while (!scan.done()) {
@@ -2183,6 +2212,7 @@ int run_preprocess_command(int argc, char** argv) {
         if (scan.take_flag("--allow-bbox-fallback-auto")) { allow_bbox_fallback = true; continue; }
         if (scan.take_flag("--safe-all")) { safe_all = true; continue; }
         if (scan.take_flag("--dry-run")) { dry_run = true; continue; }
+        if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -2230,6 +2260,7 @@ int run_preprocess_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     cad2csg::ConversionOptions options;
+    if (allow_overlaps) options.allow_overlaps = true;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -2240,6 +2271,35 @@ int run_preprocess_command(int argc, char** argv) {
         }
     }
     const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input_path);
+
+    // --safe-all runs the full analyze first so we can refuse to
+    // proceed if any solids interpenetrate. Auto-fit / BSP / removal
+    // can only make a clean model out of a clean model -- they may
+    // also INTRODUCE new overlaps (a bbox replacement that lands on a
+    // neighbor), and trying to do that on top of pre-existing overlaps
+    // would compound the problem. The user must resolve pairs first,
+    // or pass --allow-overlaps to override (only for advanced flows
+    // that plan to fix the overlap in a later step).
+    if (safe_all && !allow_overlaps) {
+        cad2csg::CommandResult precheck =
+            cad2csg::analyze(*session, document_id,
+                              cad2csg::ReportIdMode::local);
+        if (!precheck.report.overlaps.empty()) {
+            std::cerr << "error preprocess_overlaps_present: --safe-all "
+                      << "refuses to proceed; "
+                      << precheck.report.overlaps.size()
+                      << " interpenetrating solid pair(s) detected. "
+                      << "Resolve them first (decompose / remove / fix "
+                      << "the source CAD), or pass --allow-overlaps.\n";
+            for (const cad2csg::SolidOverlap& ov : precheck.report.overlaps) {
+                std::cerr << "  " << ov.solid_a_id << " <-> " << ov.solid_b_id
+                          << "  intersection_volume=" << ov.intersection_volume
+                          << ", fraction_of_smaller=" << ov.min_fraction
+                          << '\n';
+            }
+            return EXIT_FAILURE;
+        }
+    }
 
     // --safe-all extends preprocess with a leading auto-fit pass over
     // spline faces that meet --max-deviation. This is the only place
@@ -2666,6 +2726,16 @@ int run_default_convert(int argc, char** argv) {
     cad2csg::ConversionOptions options;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
     const cad2csg::DocumentId document_id = cad2csg::load_step(*session, argv[1]);
+
+    // The default one-shot convert must run the explicit analyze pass
+    // (which includes overlap detection) before emit, otherwise the
+    // overlap diagnostics would never be added to the model and the
+    // subsequent emit would silently write a broken MCNP deck. Verbs
+    // like `simplify` and `apply` are iterative and trust the user to
+    // resolve overlaps step by step; the default convert path has no
+    // such hand-off.
+    cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
+
     cad2csg::CommandResult result =
         cad2csg::emit_document(*session,
                                document_id,

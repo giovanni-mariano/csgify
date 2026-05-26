@@ -457,6 +457,25 @@ struct ConversionOptions {
     bool require_convex_cells = true;
     bool try_planar_decomposition = true;
     bool split_union_cells = true;
+    // Overlap detection. Runs during analyze; emits `solid_overlap`
+    // diagnostics for pairs whose intersection volume exceeds
+    // overlap_volume_threshold (absolute) OR overlap_volume_fraction
+    // of the smaller solid (whichever is larger). Disable with
+    // check_overlaps=false on huge assemblies where the bbox prescreen
+    // does not help. Pairs are reported in report.overlaps[].
+    //
+    // Severity is `error` by default -- MCNP cannot tolerate
+    // overlapping cells, so report.ok() returns false and
+    // emit_document refuses to write the MCNP deck. Set
+    // allow_overlaps=true (or pass --allow-overlaps on the CLI) to
+    // downgrade both `solid_overlap` and `mutation_introduced_overlap`
+    // to warnings; only use this if you understand the consequences
+    // (e.g., during incremental simplification where the overlap is
+    // expected to be resolved by a later op).
+    bool check_overlaps = true;
+    bool allow_overlaps = false;
+    double overlap_volume_threshold = 1.0e-9;
+    double overlap_volume_fraction = 1.0e-6;
     // Unit overrides applied at STEP import. Per docs/PHILOSOPHY.md
     // ("make failure visible"), the default is report-only: the
     // importer captures the declared STEP unit but does not silently
@@ -466,6 +485,19 @@ struct ConversionOptions {
     std::string unit_override;        // assert the source unit (no rescale)
     double unit_scale_to_mm_override = 0.0;  // assert scale (no rescale)
     std::string normalize_to_unit;    // actually rescale geometry to this unit
+};
+
+// One detected pair of overlapping solids. Reported by the analyze
+// stage. `intersection_volume` is in the report's length unit cubed.
+// `min_fraction` is intersection_volume / min(volume(a), volume(b)) --
+// the worst-case "how much of the smaller solid is double-counted".
+struct SolidOverlap {
+    std::string solid_a_id;
+    std::string solid_b_id;
+    double volume_a = 0.0;
+    double volume_b = 0.0;
+    double intersection_volume = 0.0;
+    double min_fraction = 0.0;
 };
 
 struct ConversionReport {
@@ -495,6 +527,7 @@ struct ConversionReport {
     std::vector<AnalyzedDecomposedPiece> decomposed_pieces;
     std::vector<AssemblyNode> assembly;
     std::vector<DecisionRequest> decision_requests;
+    std::vector<SolidOverlap> overlaps;
     PerformanceMetrics performance;
 
     bool ok() const;

@@ -254,6 +254,20 @@ TopoDS_Shape build_synthetic(const SyntheticBody& body) {
 
 } // namespace
 
+namespace detail {
+
+// Shared synthetic-body shape builder. Used by step_export (to write
+// out the simplified geometry) and by the mutation-overlap check
+// in analyze.cpp (to test newly-created synthetic bodies against
+// neighbors). Boolean kinds return the bbox placeholder, same as the
+// step-export path; downstream callers that need exact CSG for the
+// boolean case must reconstruct it themselves.
+TopoDS_Shape build_synthetic_shape(const SyntheticBody& body) {
+    return build_synthetic(body);
+}
+
+} // namespace detail
+
 int export_step(const CadModel& model, const std::string& output_path) {
     if (model.root.IsNull()) {
         std::cerr << "error step_export: model root is null\n";

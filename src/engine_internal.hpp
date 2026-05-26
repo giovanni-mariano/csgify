@@ -96,4 +96,37 @@ AnalyzedDecomposedPiece analyze_decomposed_piece(const DecomposedSolidPiece& pie
                                                  std::size_t report_solid_index,
                                                  const ConversionOptions& options);
 
+// Run pairwise solid-overlap detection over the model. Lives in
+// src/analyze.cpp; exposed so the session layer can run it once per
+// explicit analyze() call without paying its O(N^2) cost on every
+// internal post-mutation analyze. Honors options.check_overlaps.
+void detect_solid_overlaps(CadModel& model,
+                            const ConversionOptions& options,
+                            ConversionReport& report);
+
+// Build a TopoDS_Shape for a primitive SyntheticBody. Returns a null
+// shape for boolean synthetic bodies (union/intersection/difference)
+// since those require recursive BRepAlgoAPI_* and are out of scope
+// for the geometric tests that call this. Lives in src/step_export.cpp.
+TopoDS_Shape build_synthetic_shape(const SyntheticBody& body);
+
+// Post-mutation overlap check. Walks synthetic bodies added since
+// document.synthetic_body_high_water (and decomposed pieces since
+// document.decomposed_piece_high_water), tests each against the
+// surviving active solids and the prior synthetic bodies + pieces.
+// Emits a `mutation_introduced_overlap` warning (and appends to
+// report.overlaps) for any overlap that was NOT already in
+// `known_overlap_pairs`. Bumps the high-water marks and updates
+// `known_overlap_pairs` so subsequent mutations don't re-flag the
+// same pair. Lives in src/analyze.cpp.
+//
+// `known_overlap_pairs` is keyed by canonical (lo, hi) id strings.
+void detect_mutation_overlaps(
+    CadModel& model,
+    const ConversionOptions& options,
+    ConversionReport& report,
+    std::size_t* synthetic_body_high_water,
+    std::size_t* decomposed_piece_high_water,
+    std::vector<std::pair<std::string, std::string>>* known_overlap_pairs);
+
 } // namespace cad2csg::detail

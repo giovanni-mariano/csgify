@@ -18,13 +18,17 @@
 #include <vector>
 
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepAlgoAPI_Common.hxx>
 #include <BRepGProp.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepBndLib.hxx>
 #include <GProp_GProps.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Solid.hxx>
+#include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
 
 namespace cad2csg {
@@ -596,6 +600,410 @@ void finalize_cleanup_metrics(ConversionReport& report, const ConversionOptions&
     }
 }
 
+// Inflate-with-pad bbox intersection check. Two solids' geometric
+// volumes can only overlap if their bboxes overlap (modulo numerical
+// noise). Used to skip the O(N^2) BRepAlgoAPI_Common pairs that are
+// trivially disjoint -- the dominant case for instanced assemblies
+// where most pins/bolts do NOT touch each other.
+bool bboxes_intersect(const Bnd_Box& a, const Bnd_Box& b, double pad) {
+    if (a.IsVoid() || b.IsVoid()) return false;
+    double ax0, ay0, az0, ax1, ay1, az1;
+    double bx0, by0, bz0, bx1, by1, bz1;
+    a.Get(ax0, ay0, az0, ax1, ay1, az1);
+    b.Get(bx0, by0, bz0, bx1, by1, bz1);
+    return !(ax1 + pad < bx0 || bx1 + pad < ax0
+          || ay1 + pad < by0 || by1 + pad < ay0
+          || az1 + pad < bz0 || bz1 + pad < az0);
+}
+
+double shape_volume(const TopoDS_Shape& shape) {
+    if (shape.IsNull()) return 0.0;
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(shape, props);
+    return std::abs(props.Mass());
+}
+
+// Detect interpenetrating solid pairs in the imported model. Runs
+// AFTER per-solid analysis so we have the bboxes already; uses them
+// as a cheap prescreen before falling back to BRepAlgoAPI_Common for
+// pairs whose bboxes actually intersect.
+//
+// Emits a `solid_overlap` warning diagnostic per detected pair --
+// warning severity because MCNP cannot tolerate overlapping cells,
+// but the cad2csg user may have authored the overlap intentionally
+// (e.g., as a tolerance feature) and we don't want to refuse to
+// emit. Pairs are also recorded in report.overlaps[] for tooling.
+//
+// Lives in cad2csg::detail so the session layer can run it once per
+// explicit analyze call without paying the O(N^2) cost on every
+// internal post-mutation analyze.
+void detect_solid_overlaps(CadModel& model,
+                            const ConversionOptions& options,
+                            ConversionReport& report) {
+    if (!options.check_overlaps) return;
+    if (model.root.IsNull()) return;
+
+    // Refresh the persistent record. Each analyze() call recomputes
+    // the full pairwise overlap set, so stale solid_overlap entries
+    // from a prior analyze must be removed first to avoid duplicate
+    // diagnostics in model.diagnostics. mutation_introduced_overlap
+    // entries are kept (those record per-op history, not current
+    // state).
+    model.diagnostics.erase(
+        std::remove_if(model.diagnostics.begin(),
+                       model.diagnostics.end(),
+                       [](const Diagnostic& d) {
+                           return d.code == "solid_overlap";
+                       }),
+        model.diagnostics.end());
+
+    // Walk solids in TopExp order so `solid:N` indices match the rest
+    // of the report. Skip suppressed solids.
+    struct Entry {
+        std::string id;
+        TopoDS_Solid solid;
+        Bnd_Box bbox;
+        double volume = 0.0;
+    };
+    std::vector<Entry> entries;
+    std::size_t solid_index = 0;
+    for (TopExp_Explorer exp(model.root, TopAbs_SOLID); exp.More(); exp.Next()) {
+        ++solid_index;
+        const std::string id = solid_id(solid_index);
+        if (contains_id(model.removed_solid_ids, id)) continue;
+        Entry e;
+        e.id = id;
+        e.solid = TopoDS::Solid(exp.Current());
+        BRepBndLib::Add(e.solid, e.bbox);
+        e.volume = shape_volume(e.solid);
+        entries.push_back(std::move(e));
+    }
+
+    // Pad the bbox prescreen by linear_tolerance so we don't miss
+    // numerically-touching pairs.
+    const double pad = std::max(options.linear_tolerance, 1.0e-9);
+
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        for (std::size_t j = i + 1; j < entries.size(); ++j) {
+            if (!bboxes_intersect(entries[i].bbox, entries[j].bbox, pad)) {
+                continue;
+            }
+            // Bboxes overlap; compute the actual volume of the
+            // boolean intersection. OCCT can throw on degenerate
+            // inputs; treat any failure as "no detected overlap"
+            // and continue (rather than failing the whole analyze).
+            double inter_volume = 0.0;
+            try {
+                BRepAlgoAPI_Common common(entries[i].solid, entries[j].solid);
+                common.Build();
+                if (common.IsDone() && !common.Shape().IsNull()) {
+                    inter_volume = shape_volume(common.Shape());
+                }
+            } catch (...) {
+                inter_volume = 0.0;
+            }
+            if (inter_volume <= 0.0) continue;
+
+            const double min_vol = std::min(entries[i].volume, entries[j].volume);
+            const double min_frac =
+                min_vol > 0.0 ? inter_volume / min_vol : 0.0;
+
+            const bool over_absolute =
+                inter_volume > options.overlap_volume_threshold;
+            const bool over_fraction =
+                min_frac > options.overlap_volume_fraction;
+            if (!over_absolute && !over_fraction) continue;
+
+            SolidOverlap overlap;
+            overlap.solid_a_id = entries[i].id;
+            overlap.solid_b_id = entries[j].id;
+            overlap.volume_a = entries[i].volume;
+            overlap.volume_b = entries[j].volume;
+            overlap.intersection_volume = inter_volume;
+            overlap.min_fraction = min_frac;
+            report.overlaps.push_back(overlap);
+
+            std::ostringstream msg;
+            msg << "Solids " << entries[i].id << " and " << entries[j].id
+                << " interpenetrate (intersection_volume=" << inter_volume
+                << ", fraction_of_smaller=" << min_frac
+                << "). MCNP cells must be non-overlapping; resolve via "
+                << "decomposition, removal, or fixing the source CAD.";
+            Diagnostic d;
+            // Error severity by default so report.ok() == false and
+            // emit_document refuses to write a broken MCNP deck.
+            // Override via options.allow_overlaps (CLI: --allow-overlaps).
+            d.severity = options.allow_overlaps
+                ? DiagnosticSeverity::warning
+                : DiagnosticSeverity::error;
+            d.code = "solid_overlap";
+            d.message = msg.str();
+            d.shape_id = entries[i].id;
+            d.shape_label = entries[i].id + "<->" + entries[j].id;
+            report.diagnostics.push_back(d);
+            // Persist on the model so subsequent analyze_model passes
+            // (e.g. inside emit_document's convert_model) carry the
+            // diagnostic forward, keeping report.ok() == false until
+            // the overlap is resolved.
+            model.diagnostics.push_back(d);
+        }
+    }
+}
+
+namespace {
+
+// Canonical (lo, hi) pair key used by mutation-overlap state.
+std::pair<std::string, std::string> canonical_pair(const std::string& a,
+                                                    const std::string& b) {
+    return a < b ? std::make_pair(a, b) : std::make_pair(b, a);
+}
+
+bool pair_known(
+    const std::vector<std::pair<std::string, std::string>>& known,
+    const std::string& a, const std::string& b) {
+    const auto key = canonical_pair(a, b);
+    for (const auto& k : known) {
+        if (k.first == key.first && k.second == key.second) return true;
+    }
+    return false;
+}
+
+// One "ego" entry the mutation check considers -- could be a brand-new
+// synthetic body or a decomposed piece. Bundled with its TopoDS so
+// we can run BRepAlgoAPI_Common against neighbors without rebuilding.
+struct EgoEntry {
+    std::string id;
+    TopoDS_Shape shape;
+    Bnd_Box bbox;
+    double volume = 0.0;
+    // If the ego came from suppressing a source solid, the source id
+    // is recorded so we can skip self-overlaps with the (now-suppressed)
+    // source. For ego entries whose source is unrelated this stays empty.
+    std::string source_solid_id;
+};
+
+}  // namespace
+
+// Post-mutation overlap check. See engine_internal.hpp for the contract.
+//
+// Strategy: walk the "new" tail of model.synthetic_bodies and
+// model.decomposed_pieces (those past the document's high-water marks)
+// and pair each new ego against every surviving active TopExp solid +
+// every prior synthetic body + every prior decomposed piece. Bbox
+// prescreen on every candidate pair keeps the worst case to ego_count
+// * N_active, with most pairs rejected by bbox alone.
+//
+// Among new pieces of the same parent decomposition, also run a
+// pairwise check -- BRepAlgoAPI_Splitter is supposed to produce
+// disjoint pieces, but degenerate cuts can leave residual overlap
+// and we want to catch that explicitly.
+void detect_mutation_overlaps(
+    CadModel& model,
+    const ConversionOptions& options,
+    ConversionReport& report,
+    std::size_t* synthetic_body_high_water,
+    std::size_t* decomposed_piece_high_water,
+    std::vector<std::pair<std::string, std::string>>* known_overlap_pairs) {
+    if (!options.check_overlaps) return;
+    if (model.root.IsNull()) return;
+    if (!synthetic_body_high_water || !decomposed_piece_high_water
+        || !known_overlap_pairs) return;
+
+    // 1. Build the ego list (new synthetics + new pieces).
+    std::vector<EgoEntry> egos;
+    for (std::size_t i = *synthetic_body_high_water;
+         i < model.synthetic_bodies.size(); ++i) {
+        const SyntheticBody& body = model.synthetic_bodies[i];
+        if (!body.emit_as_cell) continue;
+        TopoDS_Shape shape = build_synthetic_shape(body);
+        if (shape.IsNull()) continue;
+        EgoEntry e;
+        e.id = body.id;
+        e.shape = shape;
+        BRepBndLib::Add(shape, e.bbox);
+        e.volume = shape_volume(shape);
+        e.source_solid_id = body.source_solid_id;
+        egos.push_back(std::move(e));
+    }
+    for (std::size_t i = *decomposed_piece_high_water;
+         i < model.decomposed_pieces.size(); ++i) {
+        const DecomposedSolidPiece& piece = model.decomposed_pieces[i];
+        if (!piece.active || piece.solid.IsNull()) continue;
+        EgoEntry e;
+        e.id = piece.id;
+        e.shape = piece.solid;
+        BRepBndLib::Add(piece.solid, e.bbox);
+        e.volume = shape_volume(piece.solid);
+        e.source_solid_id = piece.source_solid_id;
+        egos.push_back(std::move(e));
+    }
+
+    // Bump high-water unconditionally so a noop call still advances
+    // past whatever was added (otherwise we'd re-scan every time the
+    // BSP loop calls finish_document_mutation).
+    *synthetic_body_high_water = model.synthetic_bodies.size();
+    *decomposed_piece_high_water = model.decomposed_pieces.size();
+
+    if (egos.empty()) return;
+
+    // 2. Build the "neighbor" list = active TopExp solids + already-
+    // existing synthetic bodies + already-existing pieces (i.e., the
+    // entries we did NOT just create). All represented uniformly as
+    // (id, shape, bbox, volume).
+    struct Neighbor {
+        std::string id;
+        TopoDS_Shape shape;
+        Bnd_Box bbox;
+        double volume = 0.0;
+    };
+    std::vector<Neighbor> neighbors;
+    std::size_t solid_index = 0;
+    for (TopExp_Explorer exp(model.root, TopAbs_SOLID); exp.More(); exp.Next()) {
+        ++solid_index;
+        const std::string id = solid_id(solid_index);
+        if (contains_id(model.removed_solid_ids, id)) continue;
+        Neighbor n;
+        n.id = id;
+        n.shape = exp.Current();
+        BRepBndLib::Add(n.shape, n.bbox);
+        n.volume = shape_volume(n.shape);
+        neighbors.push_back(std::move(n));
+    }
+    // Prior synthetic bodies (before the high-water we just bumped).
+    for (std::size_t i = 0; i < model.synthetic_bodies.size(); ++i) {
+        if (i >= *synthetic_body_high_water) break;  // safety
+        // Skip the egos we just added by id check below; but since the
+        // egos were taken from the >= high_water tail, the prior set
+        // (i < old_high_water == egos[].source set start) is what we
+        // want. egos[] only contains body indices >= old_high_water,
+        // so iterating [0, new_high_water) here also includes them.
+        // Use id-based exclusion to be safe.
+    }
+    // Recompute prior synthetic bodies cleanly: those with id NOT in
+    // the ego set.
+    auto in_ego_set = [&](const std::string& id) {
+        for (const EgoEntry& e : egos) if (e.id == id) return true;
+        return false;
+    };
+    for (const SyntheticBody& body : model.synthetic_bodies) {
+        if (!body.emit_as_cell) continue;
+        if (in_ego_set(body.id)) continue;
+        TopoDS_Shape shape = build_synthetic_shape(body);
+        if (shape.IsNull()) continue;
+        Neighbor n;
+        n.id = body.id;
+        n.shape = shape;
+        BRepBndLib::Add(shape, n.bbox);
+        n.volume = shape_volume(shape);
+        neighbors.push_back(std::move(n));
+    }
+    for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (!piece.active || piece.solid.IsNull()) continue;
+        if (in_ego_set(piece.id)) continue;
+        Neighbor n;
+        n.id = piece.id;
+        n.shape = piece.solid;
+        BRepBndLib::Add(piece.solid, n.bbox);
+        n.volume = shape_volume(piece.solid);
+        neighbors.push_back(std::move(n));
+    }
+
+    const double pad = std::max(options.linear_tolerance, 1.0e-9);
+
+    auto record_pair = [&](const EgoEntry& ego, const std::string& other_id,
+                           double other_volume, double inter_volume) {
+        const double min_vol = std::min(ego.volume, other_volume);
+        const double min_frac = min_vol > 0.0 ? inter_volume / min_vol : 0.0;
+        const bool over_abs = inter_volume > options.overlap_volume_threshold;
+        const bool over_frac = min_frac > options.overlap_volume_fraction;
+        if (!over_abs && !over_frac) return;
+
+        // De-dupe against known pairs (pre-existing or already flagged).
+        if (pair_known(*known_overlap_pairs, ego.id, other_id)) return;
+        known_overlap_pairs->push_back(canonical_pair(ego.id, other_id));
+
+        SolidOverlap overlap;
+        overlap.solid_a_id = ego.id;
+        overlap.solid_b_id = other_id;
+        overlap.volume_a = ego.volume;
+        overlap.volume_b = other_volume;
+        overlap.intersection_volume = inter_volume;
+        overlap.min_fraction = min_frac;
+        report.overlaps.push_back(overlap);
+
+        std::ostringstream msg;
+        msg << "Mutation introduced an overlap between " << ego.id
+            << " (newly created) and " << other_id
+            << " (intersection_volume=" << inter_volume
+            << ", fraction_of_smaller=" << min_frac
+            << "). MCNP cells must be non-overlapping; review the most"
+               " recent op or tighten its volume guard.";
+        Diagnostic d;
+        // Error severity by default so report.ok() == false and the
+        // downstream emit_document gate refuses the deck. Override
+        // via options.allow_overlaps (CLI: --allow-overlaps).
+        d.severity = options.allow_overlaps
+            ? DiagnosticSeverity::warning
+            : DiagnosticSeverity::error;
+        d.code = "mutation_introduced_overlap";
+        d.message = msg.str();
+        d.shape_id = ego.id;
+        d.shape_label = ego.id + "<->" + other_id;
+        report.diagnostics.push_back(d);
+        // Persist on the model so subsequent re-analyze passes
+        // (including emit_document's fresh analysis) still surface
+        // this. Without this push the diagnostic would only show on
+        // the immediate finish_document_mutation report.
+        model.diagnostics.push_back(d);
+    };
+
+    auto compute_intersection_volume = [](const TopoDS_Shape& a,
+                                           const TopoDS_Shape& b) {
+        try {
+            BRepAlgoAPI_Common common(a, b);
+            common.Build();
+            if (common.IsDone() && !common.Shape().IsNull()) {
+                return shape_volume(common.Shape());
+            }
+        } catch (...) {
+        }
+        return 0.0;
+    };
+
+    // 3. Pair each ego against each neighbor (with bbox prescreen).
+    // The source solid is NOT in `neighbors` (it's been suppressed or
+    // is one of the ego pieces), so we don't false-positive on the
+    // ego occupying the source's footprint.
+    for (const EgoEntry& ego : egos) {
+        for (const Neighbor& n : neighbors) {
+            // Skip the ego's own source solid -- a synthetic body
+            // replacing solid:N "overlaps" solid:N by design, and the
+            // source is already suppressed in active membership. The
+            // contains_id check above handles the suppression, but a
+            // belt-and-braces id compare guards against future bugs.
+            if (!ego.source_solid_id.empty()
+                && ego.source_solid_id == n.id) continue;
+            if (!bboxes_intersect(ego.bbox, n.bbox, pad)) continue;
+            const double iv = compute_intersection_volume(ego.shape, n.shape);
+            if (iv <= 0.0) continue;
+            record_pair(ego, n.id, n.volume, iv);
+        }
+    }
+
+    // 4. Sibling check: pieces produced together by a decomposition
+    // should be disjoint. Pair each new ego against the other new
+    // egos (n^2 but n is small per mutation).
+    for (std::size_t i = 0; i < egos.size(); ++i) {
+        for (std::size_t j = i + 1; j < egos.size(); ++j) {
+            if (!bboxes_intersect(egos[i].bbox, egos[j].bbox, pad)) continue;
+            const double iv = compute_intersection_volume(egos[i].shape,
+                                                           egos[j].shape);
+            if (iv <= 0.0) continue;
+            record_pair(egos[i], egos[j].id, egos[j].volume, iv);
+        }
+    }
+}
+
 } // namespace
 
 AnalysisReport analyze_model(const CadModel& model,
@@ -661,6 +1069,12 @@ AnalysisReport analyze_model(const CadModel& model,
 
     finalize_cleanup_metrics(report, options);
     append_decision_requests(report);
+    // Overlap detection is intentionally NOT run here -- analyze_model
+    // is called from every mutating session call (via
+    // finish_document_mutation), and the O(N^2) bbox-prescreened
+    // boolean intersections add up quickly during BSP recursion. The
+    // session-level analyze() entry point invokes detect_solid_overlaps
+    // separately so the cost is paid once per explicit user request.
 
     if (report.solids_seen == 0) {
         add_diag(report, DiagnosticSeverity::error, "no_active_solids",

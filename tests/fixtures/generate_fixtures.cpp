@@ -136,6 +136,50 @@ TopoDS_Shape make_four_solids() {
     return compound;
 }
 
+// L-shape plus a small box sitting in the L's notch. The two solids
+// do NOT overlap as-loaded, but bbox-replacing the L-shape (whose
+// bbox fills the notch) introduces a new overlap with the inner
+// box. Used to test mutation-overlap detection.
+TopoDS_Shape make_l_with_inner_box() {
+    // Outer 10x10x10 box minus a 6x6x12 notch starting at (4,4,-1) so
+    // the notch is fully open along +Z. The remaining L-shape is the
+    // first solid.
+    TopoDS_Shape outer = BRepPrimAPI_MakeBox(10.0, 10.0, 10.0).Shape();
+    TopoDS_Shape notch =
+        BRepPrimAPI_MakeBox(gp_Pnt(4.0, 4.0, -1.0), 6.0, 6.0, 12.0).Shape();
+    TopoDS_Shape l_shape = BRepAlgoAPI_Cut(outer, notch).Shape();
+
+    // Inner box sitting fully inside the notch: (5,5,1)..(8,8,4).
+    // It does NOT overlap the L-shape geometry, but it DOES sit
+    // inside the L's bounding box.
+    TopoDS_Shape inner =
+        BRepPrimAPI_MakeBox(gp_Pnt(5.0, 5.0, 1.0), 3.0, 3.0, 3.0).Shape();
+
+    TopoDS_Compound compound;
+    BRep_Builder builder;
+    builder.MakeCompound(compound);
+    builder.Add(compound, l_shape);
+    builder.Add(compound, inner);
+    return compound;
+}
+
+// Two boxes that physically overlap. Used to test that cad2csg
+// detects (or reports) interpenetrating solids -- a modeling error
+// for MCNP, since two cells cannot claim the same point.
+TopoDS_Shape make_overlapping_boxes() {
+    TopoDS_Compound compound;
+    BRep_Builder builder;
+    builder.MakeCompound(compound);
+    TopoDS_Shape a =
+        BRepPrimAPI_MakeBox(gp_Pnt(0.0, 0.0, 0.0), 2.0, 2.0, 2.0).Shape();
+    // Overlap in the (1,1,1)..(2,2,2) cube (volume = 1).
+    TopoDS_Shape b =
+        BRepPrimAPI_MakeBox(gp_Pnt(1.0, 1.0, 1.0), 2.0, 2.0, 2.0).Shape();
+    builder.Add(compound, a);
+    builder.Add(compound, b);
+    return compound;
+}
+
 TopoDS_Shape make_bolt_hole() {
     TopoDS_Shape block = BRepPrimAPI_MakeBox(10.0, 10.0, 4.0).Shape();
     gp_Ax2 hole_axis(gp_Pnt(5.0, 5.0, -1.0), gp_Dir(0.0, 0.0, 1.0));
@@ -177,6 +221,8 @@ int main(int argc, char** argv) {
         {"tilted_torus.step", make_tilted_torus()},
         {"bolt_hole.step", make_bolt_hole()},
         {"four_solids.step", make_four_solids()},
+        {"overlapping_boxes.step", make_overlapping_boxes()},
+        {"l_with_inner_box.step", make_l_with_inner_box()},
     };
 
     for (const Item& item : items) {
