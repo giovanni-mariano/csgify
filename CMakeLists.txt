@@ -348,6 +348,15 @@ if(BUILD_TESTING)
     )
 
     add_test(
+        NAME cad2csg_recipe_replay_overlap_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/recipe_replay_overlap_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/recipe-replay-overlap-output"
+    )
+
+    add_test(
         NAME cad2csg_id_stability_smoke
         COMMAND
             bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/id_stability_smoke.sh"

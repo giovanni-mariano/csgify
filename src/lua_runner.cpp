@@ -86,6 +86,10 @@ ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
     take_bool("require_convex_cells",   &options.require_convex_cells);
     take_bool("try_planar_decomposition", &options.try_planar_decomposition);
     take_bool("split_union_cells",      &options.split_union_cells);
+    take_bool("check_overlaps",         &options.check_overlaps);
+    take_bool("allow_overlaps",         &options.allow_overlaps);
+    take_double("overlap_volume_threshold", &options.overlap_volume_threshold);
+    take_double("overlap_volume_fraction",  &options.overlap_volume_fraction);
     return options;
 }
 

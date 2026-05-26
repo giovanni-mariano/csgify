@@ -188,6 +188,12 @@ std::vector<Decision> compact(const std::vector<Decision>& records) {
         if (d.kind != "decision") continue;
         if (d.result != "applied") continue;
         if (undone.count(d.seq)) continue;
+        // export_step writes the simplified STEP, a side-output rather than a
+        // step in the MCNP conversion pipeline. The recipe pins no STEP output
+        // path; `cad2csg replay --out-step` is the knob for that. Dropping it
+        // keeps recipe.lua, recipe.json, and replay free of an op none of them
+        // can act on.
+        if (d.op == "export_step") continue;
         if (d.op == "load_step" || d.op == "emit_mcnp") {
             kept[d.seq] = d;
             continue;
@@ -454,12 +460,49 @@ bool emit_face_op(std::ostream& out, const Decision& d) {
     return true;
 }
 
+// Build a Lua options table from the conversion options journaled on a
+// load_step decision (currently the overlap knobs). Returns "" when none are
+// present, so ordinary recipes keep the bare s:load_step(path) form. Mirrors
+// the params written in session.cpp and consumed by replay.cpp.
+std::string load_step_options_table(const Decision& d) {
+    std::vector<std::string> fields;
+    auto add_bool = [&](const char* key) {
+        auto it = d.params.find(key);
+        if (it != d.params.end() && it->second->kind == JsonKind::boolean) {
+            fields.push_back(std::string(key) + " = "
+                             + (it->second->as_bool() ? "true" : "false"));
+        }
+    };
+    auto add_num = [&](const char* key) {
+        auto it = d.params.find(key);
+        if (it != d.params.end() && it->second->kind == JsonKind::number) {
+            fields.push_back(std::string(key) + " = "
+                             + format_double(it->second->as_number()));
+        }
+    };
+    add_bool("allow_overlaps");
+    add_bool("check_overlaps");
+    add_num("overlap_volume_threshold");
+    add_num("overlap_volume_fraction");
+    if (fields.empty()) return "";
+    std::string table = "{ ";
+    for (std::size_t i = 0; i < fields.size(); ++i) {
+        if (i) table += ", ";
+        table += fields[i];
+    }
+    table += " }";
+    return table;
+}
+
 bool emit_document_op(std::ostream& out, const Decision& d, const std::string& doc_var) {
     if (d.op == "load_step") {
         auto it = d.params.find("step_path");
         const std::string step = it != d.params.end() ? it->second->as_string() : "";
         out << "local " << doc_var << " = s:load_step(\""
-            << lua_escape(step) << "\")\n";
+            << lua_escape(step) << "\"";
+        const std::string opts = load_step_options_table(d);
+        if (!opts.empty()) out << ", " << opts;
+        out << ")\n";
         return true;
     }
     if (d.op == "emit_mcnp") {

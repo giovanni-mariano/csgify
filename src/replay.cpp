@@ -95,6 +95,34 @@ RecipeFile read_recipe(const std::string& path) {
     return out;
 }
 
+// Reconstruct the conversion options the original session used, from the
+// options journaled on the recipe's load_step op. Mirrors the params written
+// in session.cpp and re-emitted by recipe.cpp. Absent params keep defaults.
+ConversionOptions load_options_from_recipe(const RecipeFile& recipe) {
+    ConversionOptions options;
+    for (const RecipeOp& op : recipe.ops) {
+        if (op.op != "load_step" || !op.params
+            || op.params->kind != JsonKind::object) {
+            continue;
+        }
+        const JsonValue& p = *op.params;
+        if (const JsonValue* v = p.get("allow_overlaps")) {
+            options.allow_overlaps = v->as_bool(options.allow_overlaps);
+        }
+        if (const JsonValue* v = p.get("check_overlaps")) {
+            options.check_overlaps = v->as_bool(options.check_overlaps);
+        }
+        if (const JsonValue* v = p.get("overlap_volume_threshold")) {
+            options.overlap_volume_threshold = v->as_number(options.overlap_volume_threshold);
+        }
+        if (const JsonValue* v = p.get("overlap_volume_fraction")) {
+            options.overlap_volume_fraction = v->as_number(options.overlap_volume_fraction);
+        }
+        break;
+    }
+    return options;
+}
+
 // ---- Matching -----------------------------------------------------------
 
 bool close_rel(double a, double b, double rel_tol) {
@@ -531,7 +559,11 @@ int replay_recipe(const std::string& recipe_json_path,
     SessionPtr session_ptr = create_session();
     Session& session = *session_ptr;
 
-    const DocumentId doc = load_step(session, step_path);
+    // Reproduce the conversion options the original session loaded with
+    // (notably allow_overlaps). The recipe's own load_step op is skipped in
+    // the loop below, so we apply its journaled options here, at reload.
+    const ConversionOptions replay_options = load_options_from_recipe(recipe);
+    const DocumentId doc = load_step(session, step_path, &replay_options);
 
     // Snapshot of the loaded metadata. Recipe ops were captured against
     // the original-import metadata, so we resolve targets against the
@@ -570,6 +602,13 @@ int replay_recipe(const std::string& recipe_json_path,
         }
 
         if (op.op == "emit_mcnp") {
+            // Run analyze first so the overlap gate is live during replay.
+            // emit_document's convert_model only reads model.diagnostics; the
+            // pairwise overlap pass populates them here. Without this, replay
+            // would happily emit a deck for overlapping geometry the recipe
+            // never allowed. allow_overlaps (applied at load) downgrades the
+            // overlap diagnostic to a warning, so the gate passes by intent.
+            analyze(session, doc, ReportIdMode::local);
             CommandResult r = emit_document(session, doc, output_path,
                                             ReportIdMode::local);
             rec.outcome = r.ok ? Outcome::applied : Outcome::dispatch_failed;
@@ -643,7 +682,8 @@ int replay_recipe(const std::string& recipe_json_path,
 
     if (!emit_called && !output_path.empty()) {
         // Recipe omitted an explicit emit (rare); fire one so --out has
-        // meaning.
+        // meaning. Analyze first for the same overlap-gate reason as above.
+        analyze(session, doc, ReportIdMode::local);
         CommandResult r = emit_document(session, doc, output_path,
                                         ReportIdMode::local);
         if (!r.ok) {

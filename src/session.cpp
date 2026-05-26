@@ -589,8 +589,28 @@ DocumentId load_step(Session& session,
     session.documents.push_back(document);
     const DocumentId new_id = session.documents.back().id;
     if (session.log) {
-        log_document_op(session, new_id, "load_step",
-                        {param_string("step_path", step_path)},
+        // Journal the step path plus any non-default overlap-related
+        // conversion options, so compaction and replay can reproduce the
+        // emit gate (recipe.lua / recipe.json re-emit these onto load_step;
+        // replay applies them when it reloads the STEP). Defaults are left
+        // out to keep ordinary recipes as a bare s:load_step(path).
+        std::vector<DecisionParam> load_params{param_string("step_path", step_path)};
+        const ConversionOptions defaults;
+        if (options.allow_overlaps != defaults.allow_overlaps) {
+            load_params.push_back(param_bool("allow_overlaps", options.allow_overlaps));
+        }
+        if (options.check_overlaps != defaults.check_overlaps) {
+            load_params.push_back(param_bool("check_overlaps", options.check_overlaps));
+        }
+        if (options.overlap_volume_threshold != defaults.overlap_volume_threshold) {
+            load_params.push_back(
+                param_double("overlap_volume_threshold", options.overlap_volume_threshold));
+        }
+        if (options.overlap_volume_fraction != defaults.overlap_volume_fraction) {
+            load_params.push_back(
+                param_double("overlap_volume_fraction", options.overlap_volume_fraction));
+        }
+        log_document_op(session, new_id, "load_step", load_params,
                         document.model.loaded());
     }
     return new_id;
