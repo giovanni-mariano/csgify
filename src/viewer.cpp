@@ -31,6 +31,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <map>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -108,71 +109,6 @@ void print_selection_details(const SolidViewEntry& entry) {
         std::cerr << "  from " << entry.source_solid_id;
     }
     std::cerr << "\n";
-}
-
-void emit_remove_command(const std::string& selected_id) {
-    if (selected_id.empty()) {
-        std::cerr << "  no selected solid; click a solid first.\n";
-        return;
-    }
-    std::cout << "command remove_solid " << selected_id << "\n";
-    std::cout.flush();
-}
-
-void emit_accept_command(const std::string& selected_id,
-                         const DecompositionCandidate* candidate,
-                         const ViewerReviewContext& review) {
-    if (!review.action.empty()) {
-        std::cout << "command " << review.action;
-        if (!review.target_id.empty()) {
-            std::cout << " " << review.target_id;
-        }
-        if (!review.candidate_id.empty()
-            && review.candidate_id != review.target_id) {
-            std::cout << " " << review.candidate_id;
-        }
-        std::cout << "\n";
-        std::cout.flush();
-        return;
-    }
-    if (candidate) {
-        std::cout << "command apply_decomposition_candidate "
-                  << candidate->target_id << " " << candidate->id << "\n";
-        std::cout.flush();
-        return;
-    }
-    if (selected_id.empty()) {
-        std::cerr << "  no selected solid or active candidate to accept.\n";
-        return;
-    }
-    std::cout << "accept selected " << selected_id << "\n";
-    std::cout.flush();
-}
-
-void emit_reject_command(const std::string& selected_id,
-                         const DecompositionCandidate* candidate,
-                         const ViewerReviewContext& review) {
-    if (!review.review_id.empty()) {
-        std::cout << "reject " << review.kind << " " << review.review_id;
-        if (!review.target_id.empty()) {
-            std::cout << " target " << review.target_id;
-        }
-        std::cout << "\n";
-        std::cout.flush();
-        return;
-    }
-    if (candidate) {
-        std::cout << "reject candidate " << candidate->id
-                  << " target " << candidate->target_id << "\n";
-        std::cout.flush();
-        return;
-    }
-    if (selected_id.empty()) {
-        std::cerr << "  no selected solid or active candidate to reject.\n";
-        return;
-    }
-    std::cout << "reject selected " << selected_id << "\n";
-    std::cout.flush();
 }
 
 Handle(AIS_Shape) make_hole_fill_overlay(const HoleFillCandidate& candidate) {
@@ -253,12 +189,14 @@ Handle(AIS_InteractiveObject) make_surface_replacement_overlay(
 
 } // namespace
 
-int run_viewer_command(const Session& session,
+int run_viewer_command(Session& session,
                        const std::string& step_path,
+                       const std::string& document_id,
                        const std::string& preselect_id,
                        const DecompositionProposal* proposal,
                        const std::string& candidate_id,
-                       const ViewerReviewContext& review) {
+                       const ViewerReviewContext& review,
+                       const std::string& commit_out_path) {
     const std::vector<SolidViewEntry> entries = collect_view_entries(session);
     if (entries.empty()) {
         std::cerr << "error viewer_no_shapes: no displayable solids in session.\n";
@@ -394,6 +332,98 @@ int run_viewer_command(const Session& session,
         }
     }
 
+    // --- decisions live in the headless-testable controller ----------------
+    // viewer.cpp only renders controller state and forwards key events. The
+    // controller owns the alternative state machine and every session mutation
+    // (the same calls the CLI and the headless `--keys` path use).
+    ViewerController controller(session, document_id, review);
+    const bool removal_set_mode = controller.removal_set_mode();
+
+    auto ais_for_id = [&](const std::string& id) -> Handle(AIS_Shape) {
+        for (const auto& item : id_to_ais) {
+            if (id_matches(item.first, id)) return item.second;
+        }
+        return {};
+    };
+
+    // Recolor removal-set alternatives from controller state: active = bright
+    // red, other pending = dim, rejected = restored, accepted = already erased.
+    auto recolor_alternatives = [&]() {
+        const std::vector<ControllerAlternative>& alts = controller.alternatives();
+        const int active = controller.active_index();
+        for (int i = 0; i < static_cast<int>(alts.size()); ++i) {
+            Handle(AIS_Shape) ais = ais_for_id(alts[i].info.target_id);
+            if (ais.IsNull() || alts[i].state == AltState::accepted) continue;
+            if (alts[i].state == AltState::rejected) {
+                const SolidViewEntry* e =
+                    find_entry_by_id(entries, alts[i].info.target_id);
+                ctx->SetColor(ais, color_for_status(
+                    e ? e->status : SolidViewStatus::needs_decomposition), false);
+                ctx->SetTransparency(ais, 0.25, false);
+                continue;
+            }
+            const bool is_active = (i == active);
+            ctx->SetColor(ais,
+                is_active ? Quantity_Color(1.00, 0.18, 0.08, Quantity_TOC_sRGB)
+                          : Quantity_Color(0.80, 0.45, 0.30, Quantity_TOC_sRGB),
+                false);
+            ctx->SetTransparency(ais, is_active ? 0.05 : 0.55, false);
+        }
+        view->Redraw();
+    };
+
+    // Display the AIS shapes for newly created pieces (looked up by id from the
+    // mutated model). No STEP re-import.
+    auto sync_added = [&](const std::vector<std::string>& added) {
+        if (added.empty()) return;
+        const std::vector<SolidViewEntry> now = collect_view_entries(session);
+        for (const std::string& id : added) {
+            for (const SolidViewEntry& e : now) {
+                if (e.shape_id != id || e.shape.IsNull()) continue;
+                Handle(AIS_Shape) ais = new AIS_Shape(e.shape);
+                ctx->Display(ais, AIS_Shaded, 0, false);
+                ctx->SetColor(ais, color_for_status(e.status), false);
+                ctx->SetTransparency(ais, high_transparency ? 0.65 : 0.25, false);
+                ais_to_id[ais.get()] = e.shape_id;
+                id_to_ais.push_back(std::make_pair(e.shape_id, ais));
+                ais_shapes.push_back(ais);
+                break;
+            }
+        }
+    };
+
+    // Apply one controller action to the display and the output streams.
+    auto apply_action = [&](const ViewerAction& a) {
+        if (!a.stdout_line.empty()) {
+            std::cout << a.stdout_line << "\n";
+            std::cout.flush();
+        }
+        if (!a.message.empty()) std::cerr << "  " << a.message << "\n";
+        for (const std::string& id : a.erased) {
+            Handle(AIS_Shape) ais = ais_for_id(id);
+            if (!ais.IsNull()) ctx->Erase(ais, false);
+        }
+        sync_added(a.added);
+        if (a.alternatives_changed) recolor_alternatives();
+        ctx->UpdateCurrentViewer();
+        view->Redraw();
+    };
+
+    if (removal_set_mode) {
+        // Fade non-candidate solids so the candidates stand out.
+        for (const auto& item : id_to_ais) {
+            bool is_candidate = false;
+            for (const ControllerAlternative& a : controller.alternatives()) {
+                if (id_matches(item.first, a.info.target_id)) {
+                    is_candidate = true;
+                    break;
+                }
+            }
+            if (!is_candidate) ctx->SetTransparency(item.second, 0.80, false);
+        }
+        recolor_alternatives();
+    }
+
     ctx->UpdateCurrentViewer();
     view->FitAll(0.02, true);
     view->Redraw();
@@ -410,8 +440,19 @@ int run_viewer_command(const Session& session,
                  "click=select  F=fit\n";
     std::cerr << "  H=hide selected  I=isolate selected  S=show all  "
                  "T=toggle transparency\n";
-    std::cerr << "  R=emit remove command  A=accept active candidate/selection  "
-                 "X=reject active candidate/selection  Q/Esc=quit\n";
+    std::cerr << "  R=remove selected (logged)  A=accept active (logged)  "
+                 "X=reject active  Q/Esc=quit\n";
+    if (!commit_out_path.empty())
+        std::cerr << "  on quit: emit MCNP deck -> " << commit_out_path << "\n";
+    else
+        std::cerr << "  (no --out given: decisions are logged, no deck emitted "
+                     "on quit)\n";
+    if (removal_set_mode) {
+        std::cerr << "  removal review: " << controller.alternatives().size()
+                  << " candidate(s); Tab/Shift-Tab=cycle active  "
+                     "A=accept (remove) active  X=reject active\n";
+        std::cerr << "  " << controller.active_summary() << "\n";
+    }
     if (!preselect_id.empty())
         std::cerr << "  pre-selected: " << preselect_id << "\n";
     if (cand)
@@ -552,17 +593,27 @@ int run_viewer_command(const Session& session,
 
         case KeyPress: {
             const KeySym key = XLookupKeysym(&ev.xkey, 0);
+            const bool shift = (ev.xkey.state & ShiftMask) != 0;
             if (key == XK_q || key == XK_Q || key == XK_Escape) {
+                const bool ok = controller.commit(commit_out_path);
+                if (!commit_out_path.empty()) {
+                    std::cerr << (ok ? "  emitted deck -> "
+                                     : "  emit failed; deck not written "
+                                       "(resolve blockers): ")
+                              << commit_out_path << "\n";
+                }
                 return EXIT_SUCCESS;
             } else if (key == XK_f || key == XK_F) {
                 view->FitAll(0.02, true);
                 view->Redraw();
-            } else if (key == XK_r || key == XK_R) {
-                emit_remove_command(selected_id);
+            } else if (removal_set_mode && key == XK_Tab) {
+                apply_action(controller.cycle(!shift));
             } else if (key == XK_a || key == XK_A) {
-                emit_accept_command(selected_id, cand, review);
+                apply_action(controller.accept_active());
             } else if (key == XK_x || key == XK_X) {
-                emit_reject_command(selected_id, cand, review);
+                apply_action(controller.reject_active());
+            } else if (key == XK_r || key == XK_R) {
+                apply_action(controller.remove_target(selected_id));
             } else if (key == XK_h || key == XK_H) {
                 if (selected_id.empty()) {
                     std::cerr << "  no selected solid; click a solid first.\n";

@@ -86,6 +86,7 @@ add_library(cad2csg_engine
     src/shatter.cpp
     src/spline_fit.cpp
     src/step_export.cpp
+    src/viewer_controller.cpp
 )
 
 target_include_directories(cad2csg_engine
@@ -265,6 +266,15 @@ if(BUILD_TESTING)
             "$<TARGET_FILE:cad2csg>"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
             "${CMAKE_CURRENT_BINARY_DIR}/shatter-output"
+    )
+
+    add_test(
+        NAME cad2csg_viewer_session_smoke
+        COMMAND
+            bash "${CMAKE_CURRENT_SOURCE_DIR}/tests/viewer_session_smoke.sh"
+            "$<TARGET_FILE:cad2csg>"
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures"
+            "${CMAKE_CURRENT_BINARY_DIR}/viewer-session-output"
     )
 
     add_test(

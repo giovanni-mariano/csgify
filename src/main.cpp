@@ -9,6 +9,7 @@
 #include "replay.hpp"
 
 #include "viewer.hpp"
+#include "viewer_controller.hpp"  // ViewerReviewContext + headless replay (ungated)
 
 #include <alea.h>
 #include <Graphic3d_GraphicDriverFactory.hxx>
@@ -144,6 +145,17 @@ constexpr VerbHelp kVerbHelp[] = {
      "",
      "Mutation contract: decomposed solid:N is suppressed and produces\n"
      "  piece:1..K. Surviving solid:N IDs do NOT shift."},
+    {"shatter",
+     "shatter input.step --out output.i [--all | --target solid:N ...]\n"
+     "                                  [--max-depth N] [--allow-shatter-volume-drift]\n"
+     "                                  [--log decisions.json] [--out-step simplified.step] [--report report.json|-]",
+     "Exhaustively subdivide non-convex solids (no confidence gate) then emit MCNP.",
+     "  --all                   shatter every solid that fails convex validation\n"
+     "  --target solid:N        shatter only the named solid(s) (repeatable)\n"
+     "  --max-depth N           recursion bound (default 8)\n"
+     "  --allow-shatter-volume-drift  proceed when a cut drifts past tolerance\n\n"
+     "Mutation contract: shattered solid:N is suppressed and produces\n"
+     "  piece:1..K. Surviving solid:N IDs do NOT shift."},
     {"compact",
      "compact decisions.json --out recipe.lua",
      "Compact a decision log into a deterministic Lua recipe.", "",
@@ -241,10 +253,20 @@ constexpr VerbHelp kVerbHelp[] = {
      "view input.step [--select doc:N/solid:M|solid:M]\n"
      "                         [--candidate candidate:N]\n"
      "                         [--review-removal removal:N]\n"
+     "                         [--review-removals  (show all removal candidates; Tab to cycle, A/X to accept/reject)]\n"
      "                         [--review-hole-fill hole-fill:N [--host solid:N] [--near-removed solid:M]]\n"
      "                         [--review-decomp candidate:N --select solid:N]\n"
-     "                         [--review-surface-replacement candidate:N --select-face face:N.M]",
-     "Open the OCCT viewer for visual review.", "", kReadOnlyMutation},
+     "                         [--review-surface-replacement candidate:N --select-face face:N.M]\n"
+     "                         [--log decisions.json] [--out output.i] [--keys A,Tab,A,Q]",
+     "Open the OCCT viewer for visual review and live editing.",
+     "  --log decisions.json           record accepted decisions (replayable)\n"
+     "  --out output.i                 emit the MCNP deck on quit\n"
+     "  --keys A,Tab,A,Q               headless: replay keys, no window/display\n"
+     "                                 (A=accept active, X=reject, Tab/BackTab=cycle,\n"
+     "                                  R:solid:N=remove, Q=quit+commit)",
+     "Accepting (A) or removing (R) drives the session in place (suppresses "
+     "solids / adds pieces). With --log each decision is recorded; compact it "
+     "into a recipe to replay headless."},
     {"help",
      "help [verb]",
      "Show global usage, or the help for a specific verb.", "", ""},
@@ -754,15 +776,17 @@ int run_volume_command(int argc, char** argv) {
 
 int run_view_command(int argc, char** argv) {
     if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "view");
-#if CAD2CSG_HAVE_TKOPENGL
     if (argc < 3) {
         std::cerr << "usage: " << argv[0] << " view input.step"
                      " [--select doc:N/solid:M|solid:M]"
                      " [--candidate candidate:N]"
                      " [--review-removal removal:N]"
+                     " [--review-removals]"
                      " [--review-hole-fill hole-fill:N]"
                      " [--review-decomp candidate:N]"
-                     " [--review-surface-replacement candidate:N --select-face face:N.M]\n";
+                     " [--review-surface-replacement candidate:N --select-face face:N.M]"
+                     " [--log decisions.json] [--out output.i]"
+                     " [--keys A,Tab,A,Q  (headless: replay keys, no window)]\n";
         return EXIT_FAILURE;
     }
     const std::string input_path = argv[2];
@@ -770,19 +794,31 @@ int run_view_command(int argc, char** argv) {
     std::string preselect_id;
     std::string candidate_id;
     std::string review_removal_id;
+    bool review_removals_all = false;
     std::string review_hole_fill_id;
     std::string review_decomp_id;
     std::string review_surface_id;
     std::string select_face_id;
+    std::string log_path;
+    std::string commit_out_path;
+    std::string headless_keys;
     cad2csg::HoleFillOptions hole_fill_options;
 
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--select") == 0 && i + 1 < argc) {
             preselect_id = argv[++i];
+        } else if (std::strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
+            log_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            commit_out_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--keys") == 0 && i + 1 < argc) {
+            headless_keys = argv[++i];
         } else if (std::strcmp(argv[i], "--candidate") == 0 && i + 1 < argc) {
             candidate_id = argv[++i];
         } else if (std::strcmp(argv[i], "--review-removal") == 0 && i + 1 < argc) {
             review_removal_id = argv[++i];
+        } else if (std::strcmp(argv[i], "--review-removals") == 0) {
+            review_removals_all = true;
         } else if (std::strcmp(argv[i], "--review-hole-fill") == 0 && i + 1 < argc) {
             review_hole_fill_id = argv[++i];
         } else if (std::strcmp(argv[i], "--review-decomp") == 0 && i + 1 < argc) {
@@ -815,6 +851,7 @@ int run_view_command(int argc, char** argv) {
     }
 
     const int review_count = (review_removal_id.empty() ? 0 : 1)
+        + (review_removals_all ? 1 : 0)
         + (review_hole_fill_id.empty() ? 0 : 1)
         + (review_decomp_id.empty() ? 0 : 1)
         + (review_surface_id.empty() ? 0 : 1);
@@ -825,6 +862,9 @@ int run_view_command(int argc, char** argv) {
 
     cad2csg::ConversionOptions options;
     cad2csg::SessionPtr session = cad2csg::create_session(options);
+    if (!log_path.empty()) {
+        cad2csg::attach_decision_log(*session, log_path, input_path);
+    }
     const cad2csg::DocumentId doc_id = cad2csg::load_step(*session, input_path);
     cad2csg::analyze(*session, doc_id, cad2csg::ReportIdMode::scoped);
 
@@ -854,6 +894,28 @@ int run_view_command(int argc, char** argv) {
         review.review_id = selected->id;
         review.action = "remove_solid";
         review.target_id = selected->solid_id;
+    }
+
+    if (review_removals_all) {
+        cad2csg::RemovalProposal removals =
+            cad2csg::suggest_removals(*session,
+                                      doc_id,
+                                      cad2csg::ReportIdMode::scoped);
+        if (removals.candidates.empty()) {
+            std::cerr << "view_review_removals: no removal candidates in "
+                      << input_path << "\n";
+        }
+        review.kind = "removal_set";
+        review.action = "remove_solid";
+        for (const cad2csg::RemovalCandidate& c : removals.candidates) {
+            cad2csg::ViewerReviewAlternative alt;
+            alt.review_id = c.id;
+            alt.target_id = c.solid_id;
+            alt.confidence = c.confidence;
+            alt.volume_fraction = c.volume_fraction;
+            alt.score = c.score;
+            review.alternatives.push_back(std::move(alt));
+        }
     }
 
     if (!review_hole_fill_id.empty()) {
@@ -938,20 +1000,34 @@ int run_view_command(int argc, char** argv) {
                       << review_decomp_id << '\n';
             return EXIT_FAILURE;
         }
-        if (!review_decomp_id.empty() && selected) {
-            review.kind = "decomposition";
-            review.review_id = selected->id;
+        if (selected) {
+            // Even without --review-decomp, a resolved candidate makes A apply
+            // it: the controller dispatches on review.action/target/candidate.
             review.action = "apply_decomposition_candidate";
             review.target_id = selected->target_id;
             review.candidate_id = selected->id;
+            if (!review_decomp_id.empty()) {
+                review.kind = "decomposition";
+                review.review_id = selected->id;
+            }
         }
     }
 
+    // Headless replay path: no window, no display, no TKOpenGl needed.
+    if (!headless_keys.empty()) {
+        return cad2csg::run_viewer_headless(*session, doc_id, review,
+                                            headless_keys, commit_out_path,
+                                            std::cout, std::cerr);
+    }
+
+#if CAD2CSG_HAVE_TKOPENGL
     return cad2csg::run_viewer_command(
-        *session, input_path, preselect_id, proposal, candidate_id, review);
+        *session, input_path, doc_id, preselect_id, proposal, candidate_id,
+        review, commit_out_path);
 #else
-    (void)argc; (void)argv;
-    std::cerr << "error viewer_not_built: cad2csg was built without TKOpenGl support.\n";
+    (void)input_path; (void)preselect_id; (void)proposal; (void)candidate_id;
+    std::cerr << "error viewer_not_built: cad2csg was built without TKOpenGl "
+                 "support. Use --keys for headless review.\n";
     return EXIT_FAILURE;
 #endif
 }
@@ -2196,6 +2272,160 @@ int run_decompose_apply_command(int argc, char** argv) {
     return EXIT_SUCCESS;
 }
 
+int run_shatter_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "shatter");
+    if (argc < 5) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    if (std::strcmp(argv[3], "--out") != 0) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string output_path = argv[4];
+
+    std::string log_path;
+    std::string step_out_path;
+    std::string report_path;
+    double max_depth_value = 8.0;
+    bool shatter_all = false;
+    bool allow_volume_drift = false;
+    bool allow_overlaps = false;
+    std::vector<std::string> selected_targets;
+
+    OptScanner scan(argc, argv, 5);
+    while (!scan.done()) {
+        std::string target_id;
+        if (scan.take_string("--log", &log_path)) continue;
+        if (scan.take_string("--out-step", &step_out_path)) continue;
+        if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_double("--max-depth", &max_depth_value)) continue;
+        if (scan.take_string("--target", &target_id)) {
+            selected_targets.push_back(target_id);
+            continue;
+        }
+        if (scan.take_flag("--all")) { shatter_all = true; continue; }
+        if (scan.take_flag("--allow-shatter-volume-drift")) {
+            allow_volume_drift = true;
+            continue;
+        }
+        if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    if (!shatter_all && selected_targets.empty()) {
+        std::cerr << "error missing_target: shatter requires --all or "
+                     "--target solid:N\n";
+        return EXIT_FAILURE;
+    }
+    if (max_depth_value < 0.0) {
+        std::cerr << "error invalid_max_depth: --max-depth must be non-negative\n";
+        return EXIT_FAILURE;
+    }
+
+    std::cerr << "cad2csg: OCCT " << cad2csg::occt_version()
+              << ", Alea " << alea_version() << '\n';
+
+    cad2csg::ConversionOptions options;
+    if (allow_overlaps) options.allow_overlaps = true;
+    cad2csg::SessionPtr session = cad2csg::create_session(options);
+    if (!log_path.empty()) {
+        try {
+            cad2csg::attach_decision_log(*session, log_path, input_path);
+        } catch (const std::exception& e) {
+            std::cerr << "error decision_log_open_failed: " << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    const cad2csg::DocumentId document_id = cad2csg::load_step(*session, input_path);
+
+    // Explicit --target wins; otherwise (--all) snapshot every solid that
+    // fails convex validation. solid:N IDs are stable across shatters (a
+    // shattered solid is suppressed, not renumbered), so a single up-front
+    // snapshot is valid for the whole loop.
+    std::vector<std::string> targets = selected_targets;
+    if (targets.empty()) {
+        cad2csg::CommandResult analysis =
+            cad2csg::analyze(*session, document_id, cad2csg::ReportIdMode::local);
+        for (const cad2csg::AnalyzedSolid& s : analysis.report.solids) {
+            if (s.needs_decomposition) {
+                targets.push_back(s.id);
+            }
+        }
+        if (targets.empty()) {
+            std::cerr << "shatter: no solids require decomposition; "
+                         "emitting as-is\n";
+        }
+    }
+
+    std::size_t attempted = 0;
+    std::size_t succeeded = 0;
+    std::size_t residual = 0;
+    std::size_t other_failure = 0;
+    for (const std::string& id : targets) {
+        ++attempted;
+        cad2csg::CommandResult r =
+            cad2csg::shatter(*session, id,
+                             static_cast<int>(max_depth_value),
+                             allow_volume_drift,
+                             cad2csg::ReportIdMode::local);
+        if (r.ok) {
+            ++succeeded;
+        } else {
+            const bool stuck = std::any_of(
+                r.report.diagnostics.begin(), r.report.diagnostics.end(),
+                [](const cad2csg::Diagnostic& d) {
+                    return d.code == "shatter_residual_nonconvex";
+                });
+            if (stuck) ++residual;
+            else ++other_failure;
+        }
+    }
+
+    std::cerr << "shatter: " << succeeded << "/" << attempted
+              << " solid(s) reduced to convex pieces"
+              << " (max-depth=" << static_cast<int>(max_depth_value) << ")\n";
+    if (residual > 0) {
+        std::cerr << "  " << residual
+                  << " solid(s) left residual (need surface replacement, not"
+                     " decomposition); see report diagnostics.\n";
+    }
+    if (other_failure > 0) {
+        std::cerr << "  " << other_failure
+                  << " failed for other reasons; see report diagnostics.\n";
+    }
+
+    if (!step_out_path.empty()) {
+        cad2csg::CommandResult step_result =
+            cad2csg::export_document_step(*session, document_id, step_out_path,
+                                          cad2csg::ReportIdMode::local);
+        if (!step_result.ok) {
+            print_diagnostics(step_result.report);
+            return EXIT_FAILURE;
+        }
+    }
+
+    cad2csg::CommandResult result =
+        cad2csg::emit_document(*session, document_id, output_path,
+                               cad2csg::ReportIdMode::local);
+    print_diagnostics(result.report);
+    print_summary(result.report);
+
+    if (!report_path.empty()
+        && write_report_or_stdout(result.report, report_path) != 0) {
+        std::cerr << "error report_write_failed: " << report_path << '\n';
+        return EXIT_FAILURE;
+    }
+
+    if (!result.report.ok() || result.report.solids_converted == 0) {
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
 int run_preprocess_command(int argc, char** argv) {
     if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "preprocess");
     if (argc < 3) {
@@ -3111,6 +3341,7 @@ int main(int argc, char** argv) {
     if (verb == "decompose-suggest") return run_decompose_suggest_command(argc, argv);
     if (verb == "preprocess") return run_preprocess_command(argc, argv);
     if (verb == "decompose-apply") return run_decompose_apply_command(argc, argv);
+    if (verb == "shatter") return run_shatter_command(argc, argv);
     if (verb == "compact") return run_compact_command(argc, argv);
     if (verb == "replay") return run_replay_command(argc, argv);
     if (verb == "volume")  return run_volume_command(argc, argv);

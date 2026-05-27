@@ -82,6 +82,61 @@ if not sh:
     sys.exit(1)
 PY
 
+# --- 1c. large-coordinate assembly: a rails solid far from the origin -----
+# rails.stp sits at coordinates ~1e4. Before cutters were anchored on the
+# target solid, the bounded cutter face was centered on each surface's
+# intrinsic Location and never reached the part, so the split silently failed
+# and the solid stayed residual. This locks in that fix: solid:16 (a
+# cylinder+plane body that was fully residual) must now decompose into convex
+# pieces with no residual.
+rails="$fixtures/rails.stp"
+if [[ -f "$rails" ]]; then
+    rails_report="$outdir/rails16.json"
+    "$exe" simplify "$rails" --shatter solid:16 --out "$outdir/rails16.i" \
+        --report "$rails_report" --max-depth 8 >/dev/null 2>&1 \
+        || fail "shatter on rails solid:16 returned non-zero"
+    python3 - "$rails_report" <<'PY' || exit 1
+import json, sys
+r = json.load(open(sys.argv[1]))
+pieces = r.get("decomposed_pieces", [])
+if len(pieces) < 2:
+    print(f"rails solid:16: expected >=2 pieces, got {len(pieces)}", file=sys.stderr)
+    sys.exit(1)
+nonexact = [p["id"] for p in pieces if not p.get("exact_csg_supported")]
+if nonexact:
+    print(f"rails solid:16: pieces not exact_csg_supported: {nonexact}", file=sys.stderr)
+    sys.exit(1)
+codes = {d.get("code") for d in r.get("diagnostics", [])}
+for bad in ("shatter_residual_nonconvex", "interior_point_not_found"):
+    if bad in codes:
+        print(f"rails solid:16: unexpected {bad}", file=sys.stderr)
+        sys.exit(1)
+PY
+fi
+
+# --- 1d. the standalone `shatter` verb with --all -------------------------
+# One command shatters every non-convex solid in the model and emits.
+all_mcnp="$outdir/l_all.i"
+all_report="$outdir/l_all.json"
+"$exe" shatter "$step" --out "$all_mcnp" --all --report "$all_report" >/dev/null 2>&1 \
+    || fail "shatter --all returned non-zero"
+[[ -s "$all_mcnp" ]] || fail "shatter --all produced no deck"
+python3 - "$all_report" <<'PY' || exit 1
+import json, sys
+r = json.load(open(sys.argv[1]))
+if not r.get("decomposed_pieces"):
+    print("shatter --all produced no pieces on a non-convex model", file=sys.stderr)
+    sys.exit(1)
+for s in r.get("solids", []):
+    if s.get("needs_decomposition"):
+        print(f"shatter --all left {s.get('id')} needing decomposition", file=sys.stderr)
+        sys.exit(1)
+PY
+# Requiring neither --all nor --target must be a usage error.
+if "$exe" shatter "$step" --out "$outdir/none.i" >/dev/null 2>&1; then
+    fail "shatter without --all/--target should have failed"
+fi
+
 # --- 2. compact -> Lua recipe -> replay via `cad2csg lua` -----------------
 recipe="$outdir/recipe.lua"
 "$exe" compact "$log" --out "$recipe" >/dev/null 2>&1 \
