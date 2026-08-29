@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end smoke test for `cad2csg replay`. Builds a recipe.json that
+# End-to-end smoke test for `csgify replay`. Builds a recipe.json that
 # exercises all three target-resolution outcomes against box.step's single
 # solid:
 #   - applied:      correct component_entry
@@ -36,7 +36,7 @@ report_unmatched="$outdir/unmatched.json"
 # path, but we include one so the JSON shape matches the compactor's.
 cat > "$recipe" <<EOF
 {
-  "manifest": {"step_path":"$step","step_digest":"","cad2csg_version":"unversioned","occt_version":"8.0.0"},
+  "manifest": {"step_path":"$step","step_digest":"","csgify_version":"unversioned","occt_version":"8.0.0"},
   "ops": [
     {"op":"load_step","target":{"kind":"document","shape_id":"doc:1","component_entry":""},"params":{"step_path":"$step"}},
     {"op":"replace_solid_with_bbox","target":{"kind":"solid","shape_id":"solid:1","component_entry":"0:1:1:1","fingerprint":{"volume":100.0,"surface_area":160.0,"bbox_diagonal":11.358,"face_count":6,"centroid":[5.0,2.5,1.0]}},"params":{}},
@@ -70,7 +70,7 @@ PY
 # --- soft_applied: wrong component_entry, matching fingerprint.
 cat > "$recipe" <<EOF
 {
-  "manifest": {"step_path":"$step","step_digest":"","cad2csg_version":"unversioned","occt_version":"8.0.0"},
+  "manifest": {"step_path":"$step","step_digest":"","csgify_version":"unversioned","occt_version":"8.0.0"},
   "ops": [
     {"op":"load_step","target":{"kind":"document","shape_id":"doc:1","component_entry":""},"params":{"step_path":"$step"}},
     {"op":"replace_solid_with_bbox","target":{"kind":"solid","shape_id":"solid:99","component_entry":"0:9:9:9","fingerprint":{"volume":100.0,"surface_area":160.0,"bbox_diagonal":11.358,"face_count":6,"centroid":[5.0,2.5,1.0]}},"params":{}},
@@ -102,7 +102,7 @@ PY
 # --- unmatched: wrong component_entry AND a very wrong fingerprint.
 cat > "$recipe" <<EOF
 {
-  "manifest": {"step_path":"$step","step_digest":"","cad2csg_version":"unversioned","occt_version":"8.0.0"},
+  "manifest": {"step_path":"$step","step_digest":"","csgify_version":"unversioned","occt_version":"8.0.0"},
   "ops": [
     {"op":"load_step","target":{"kind":"document","shape_id":"doc:1","component_entry":""},"params":{"step_path":"$step"}},
     {"op":"replace_solid_with_bbox","target":{"kind":"solid","shape_id":"solid:99","component_entry":"0:9:9:9","fingerprint":{"volume":12345.0,"surface_area":67890.0,"bbox_diagonal":999.0,"face_count":42,"centroid":[1000.0,2000.0,3000.0]}},"params":{}},

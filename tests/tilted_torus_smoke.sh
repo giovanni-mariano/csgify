@@ -2,7 +2,7 @@
 #
 # Scaffolding smoke test for the surface-splitting work track. The
 # tilted_torus fixture has a single solid whose only face is a torus on
-# axis (1,1,1)/sqrt(3) — explicitly not axis-aligned. cad2csg currently
+# axis (1,1,1)/sqrt(3) — explicitly not axis-aligned. csgify currently
 # cannot convert this to MCNP; the test pins the agent-facing contract
 # that must remain stable while the surface-splitter is being built:
 #

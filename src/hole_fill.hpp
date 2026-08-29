@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
-namespace cad2csg {
+namespace csgify {
 
 struct CadModel;
 
@@ -11,4 +11,4 @@ HoleFillProposal propose_hole_fill_candidates(
     const HoleFillOptions& hole_options,
     const ConversionOptions& conversion_options = {});
 
-} // namespace cad2csg
+} // namespace csgify

@@ -28,7 +28,7 @@
 #include <V3d_Viewer.hxx>
 #include <Xw_Window.hxx>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 struct TargetInfo {
@@ -162,7 +162,7 @@ bool write_occt_overview_png(const CadModel& model,
         occ::handle<V3d_View> view = viewer->CreateView();
         occ::handle<Xw_Window> window =
             new Xw_Window(driver->GetDisplayConnection(),
-                          "cad2csg decision packet",
+                          "csgify decision packet",
                           0,
                           0,
                           1000,
@@ -601,4 +601,4 @@ DecisionPackResult write_decision_packs(const ConversionReport& report,
     return write_decision_packs_impl(report, &model, options);
 }
 
-} // namespace cad2csg
+} // namespace csgify

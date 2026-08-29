@@ -1,4 +1,4 @@
-local s = cad2csg.session()
+local s = csgify.session()
 local doc = s:load_step(arg[1])
 
 local report, err = s:auto_fit_splines(doc, 1e-6)

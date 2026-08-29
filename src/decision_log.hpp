@@ -3,7 +3,7 @@
 // Append-only decision log writer. See docs/DECISION_LOG_AND_RECIPE.md.
 //
 // This is the MVP (step 1 of the plan in that doc):
-// - JSON file, manifest record first, then decision records.
+// - Newline-delimited JSON, manifest record first, then decision records.
 // - Sequential integer ids; content-addressed ids deferred to step 2.
 // - No geometric fingerprints yet; deferred to step 3 (soft-match replay).
 //
@@ -18,7 +18,7 @@
 
 #include "engine_model.hpp"  // ShapeFingerprint
 
-namespace cad2csg {
+namespace csgify {
 
 // One parameter on a decision record. value is a JSON-encoded fragment
 // (numbers without quotes, strings already wrapped and escaped). The caller
@@ -75,7 +75,6 @@ private:
     std::string path_;
     std::ofstream out_;
     std::size_t seq_ = 0;        // last assigned seq; 0 == manifest
-    bool first_record_ = true;   // controls comma separator in the array
 };
 
-} // namespace cad2csg
+} // namespace csgify

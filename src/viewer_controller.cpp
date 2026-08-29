@@ -7,7 +7,7 @@
 #include <sstream>
 #include <utility>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 ViewerAction message_action(const std::string& msg) {
@@ -224,6 +224,7 @@ int run_viewer_headless(Session& session,
     }
 
     bool committed = false;
+    bool commit_ok = true;
     for (const std::string& tok : tokenize_keys(keys)) {
         ViewerAction a;
         if (tok == "A" || tok == "a") {
@@ -239,6 +240,7 @@ int run_viewer_headless(Session& session,
         } else if (tok == "Q" || tok == "q") {
             const bool ok = controller.commit(commit_out_path);
             committed = true;
+            commit_ok = ok;
             if (!commit_out_path.empty()) {
                 err << (ok ? "  emitted deck -> " : "  emit failed: ")
                     << commit_out_path << "\n";
@@ -254,12 +256,13 @@ int run_viewer_headless(Session& session,
 
     if (!committed) {
         const bool ok = controller.commit(commit_out_path);
+        commit_ok = ok;
         if (!commit_out_path.empty()) {
             err << (ok ? "  emitted deck -> " : "  emit failed: ")
                 << commit_out_path << "\n";
         }
     }
-    return EXIT_SUCCESS;
+    return commit_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
-} // namespace cad2csg
+} // namespace csgify

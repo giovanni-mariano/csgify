@@ -1,4 +1,4 @@
-local s = cad2csg.session()
+local s = csgify.session()
 local doc = s:load_step(arg[1])
 
 local function expect_fill_error(code, fn)
@@ -18,7 +18,7 @@ local function expect_fill_error(code, fn)
 end
 
 do
-    local check = cad2csg.session()
+    local check = csgify.session()
     local check_doc = check:load_step(arg[1])
     expect_fill_error("hole_fill_candidate_not_found", function()
         return check:fill_hole(check_doc, "hole-fill:1")
@@ -26,7 +26,7 @@ do
 end
 
 do
-    local check = cad2csg.session()
+    local check = csgify.session()
     local check_doc = check:load_step(arg[1])
     local check_holes = check:propose_hole_fills(check_doc, {
         host = check_doc .. "/solid:1",
@@ -43,7 +43,7 @@ do
 end
 
 do
-    local check = cad2csg.session()
+    local check = csgify.session()
     local check_doc = check:load_step(arg[1])
     local check_holes = check:propose_hole_fills(check_doc, {
         host = check_doc .. "/solid:1",

@@ -4,7 +4,7 @@
 // external API: users and agents should drive the engine through session.hpp,
 // IDs, commands, reports, and files.
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
 #include <string>
 #include <vector>
@@ -13,7 +13,7 @@
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Solid.hxx>
 
-namespace cad2csg {
+namespace csgify {
 
 // Tolerance-rounded geometric identity used as a soft-match key when an
 // XCAF component_entry can no longer be resolved against a revised STEP.
@@ -314,4 +314,4 @@ VolumeComparison compare_step_volumes(const std::string& original_path,
 
 int export_mcnp(alea_system_t* system, const std::string& output_path);
 
-} // namespace cad2csg
+} // namespace csgify

@@ -18,7 +18,7 @@
 #include <gp_Sphere.hxx>
 #include <gp_Torus.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 
 enum class AnalyticSurfaceKind {
     plane,
@@ -99,4 +99,4 @@ bool analytic_surface_from_face(const TopoDS_Face& face,
                                 AnalyticSurface* out,
                                 const std::vector<FaceReplacement>* replacements = nullptr);
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

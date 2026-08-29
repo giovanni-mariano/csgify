@@ -20,7 +20,7 @@
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846264338327950288;
@@ -355,4 +355,4 @@ HoleFillProposal propose_hole_fill_candidates(
     return proposal;
 }
 
-} // namespace cad2csg
+} // namespace csgify

@@ -19,7 +19,7 @@
 #include <gp_Pnt.hxx>
 #include <gp_Sphere.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846264338327950288;
@@ -217,4 +217,4 @@ FittedConeCandidate fitted_cone_candidate(const TopoDS_Solid& solid,
     return candidate;
 }
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

@@ -4,13 +4,13 @@
 // Declares SolidViewEntry, SolidViewStatus, and collect_view_entries.
 // Not installed as part of the public API.
 
-#include "cad2csg/session.hpp"
+#include "csgify/session.hpp"
 
 #include <TopoDS_Shape.hxx>
 #include <string>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 
 enum class SolidViewStatus {
     exact_csg,            // ready for CSG emission — displayed green
@@ -33,4 +33,4 @@ struct SolidViewEntry {
 // analysis report when available; defaults to needs_decomposition otherwise.
 std::vector<SolidViewEntry> collect_view_entries(const Session& session);
 
-} // namespace cad2csg
+} // namespace csgify

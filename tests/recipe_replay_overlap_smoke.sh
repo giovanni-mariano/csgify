@@ -27,12 +27,13 @@ fail() { echo "recipe_replay_overlap_smoke: $*" >&2; exit 1; }
 
 bad="$fixtures/overlapping_boxes.step"
 [ -f "$bad" ] || fail "fixture missing: $bad"
+rm -f "$outdir/allow_log.json" "$outdir/deny_log.json"
 
 # ---- build an allow_overlaps decision log, then compact ------------------
 # attach_decision_log BEFORE load_step so load_step is journaled as the first
 # op (it carries the option and declares the doc handle).
 cat > "$outdir/allow_sess.lua" <<EOF
-local s = cad2csg.session()
+local s = csgify.session()
 s:attach_decision_log("$outdir/allow_log.json", "$bad")
 local doc = s:load_step("$bad", { allow_overlaps = true })
 s:analyze(doc)
@@ -80,7 +81,7 @@ status=$?
 # The in-session emit fails (gate), so compaction keeps only load_step; the
 # replay fallback emit then hits the live gate and must refuse.
 cat > "$outdir/noallow_sess.lua" <<EOF
-local s = cad2csg.session()
+local s = csgify.session()
 s:attach_decision_log("$outdir/noallow_log.json", "$bad")
 local doc = s:load_step("$bad")
 s:analyze(doc)

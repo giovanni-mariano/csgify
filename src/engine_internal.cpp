@@ -23,7 +23,7 @@
 #include <TopoDS_Vertex.hxx>
 #include <gp_Vec.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 namespace {
 
 std::string shape_id_from_label(const std::string& label) {
@@ -331,7 +331,7 @@ bool find_interior_point(const TopoDS_Solid& solid,
     for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
         const TopoDS_Face face = TopoDS::Face(face_exp.Current());
         BRepGProp_Face face_prop(face);
-        Standard_Real u1 = 0.0, u2 = 0.0, v1 = 0.0, v2 = 0.0;
+        double u1 = 0.0, u2 = 0.0, v1 = 0.0, v2 = 0.0;
         face_prop.Bounds(u1, u2, v1, v2);
         if (u2 < u1 || v2 < v1) {
             continue;
@@ -552,4 +552,4 @@ double synthetic_volume_estimate(const SyntheticBody& body) {
     return 0.0;
 }
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

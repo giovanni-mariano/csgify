@@ -18,6 +18,7 @@ fail() {
 
 log="$outdir/decisions.json"
 out="$outdir/simplified.i"
+rm -f "$log"
 
 "$exe" simplify "$fixtures/box.step" --replace-solid-bbox solid:1 \
     --out "$out" --log "$log" >/dev/null 2>&1 \
@@ -30,14 +31,14 @@ import json
 import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as handle:
-    records = json.load(handle)
+    records = [json.loads(line) for line in handle if line.strip()]
 
 if not records or records[0].get("kind") != "manifest":
     print("first record must be manifest", file=sys.stderr)
     sys.exit(1)
 
 manifest = records[0]
-for required in ("cad2csg_version", "occt_version", "step_path",
+for required in ("csgify_version", "occt_version", "step_path",
                  "step_digest", "created_at"):
     if required not in manifest:
         print(f"manifest missing field: {required}", file=sys.stderr)
@@ -89,6 +90,7 @@ PY
 # same step_digest. (The created_at timestamp will differ; the digest
 # must not.)
 log2="$outdir/decisions2.json"
+rm -f "$log2"
 "$exe" simplify "$fixtures/box.step" --replace-solid-bbox solid:1 \
     --out "$outdir/simplified2.i" --log "$log2" >/dev/null 2>&1 \
     || fail "second simplify run failed"
@@ -96,8 +98,8 @@ log2="$outdir/decisions2.json"
 python3 - "$log" "$log2" <<'PY' || exit 1
 import json, sys
 with open(sys.argv[1]) as a, open(sys.argv[2]) as b:
-    d1 = json.load(a)[0]["step_digest"]
-    d2 = json.load(b)[0]["step_digest"]
+    d1 = json.loads(next(line for line in a if line.strip()))["step_digest"]
+    d2 = json.loads(next(line for line in b if line.strip()))["step_digest"]
 if d1 != d2:
     print(f"step_digest unstable: {d1} != {d2}", file=sys.stderr)
     sys.exit(1)

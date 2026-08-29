@@ -14,7 +14,7 @@
 #include <gp_Dir.hxx>
 #include <gp_XYZ.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 namespace {
 
 double plane_value(const gp_Pln& plane, const gp_Pnt& point) {
@@ -364,4 +364,4 @@ bool analytic_surface_from_face(const TopoDS_Face& face,
     }
 }
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

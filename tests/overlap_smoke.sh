@@ -2,7 +2,7 @@
 #
 # overlap_smoke: pairwise solid-overlap detection.
 #
-# MCNP cells must be non-overlapping; cad2csg's analyze stage detects
+# MCNP cells must be non-overlapping; csgify's analyze stage detects
 # interpenetrating solid pairs and emits a `solid_overlap` warning.
 # Asserts:
 #   - overlapping_boxes.step (built-in fixture: two 2x2x2 boxes with
@@ -24,7 +24,7 @@ fail() { echo "overlap_smoke: $*" >&2; exit 1; }
 
 bad="$fixtures/overlapping_boxes.step"
 good="$fixtures/four_solids.step"
-[ -f "$bad" ]  || fail "fixture missing: $bad (run cad2csg_generate_fixtures)"
+[ -f "$bad" ]  || fail "fixture missing: $bad (run csgify_generate_fixtures)"
 [ -f "$good" ] || fail "fixture missing: $good"
 
 # ---- overlapping fixture: one detected pair --------------------------

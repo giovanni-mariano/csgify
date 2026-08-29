@@ -1,16 +1,18 @@
 #include "decision_log.hpp"
 
-#include "cad2csg/engine.hpp"  // occt_version()
+#include "csgify/engine.hpp"  // occt_version()
 #include "fnv.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
+#include <fstream>
 #include <iomanip>
 #include <ios>
 #include <sstream>
 #include <stdexcept>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 // Local JSON helpers — small enough that pulling report.cpp's namespace in
@@ -62,6 +64,33 @@ std::string iso8601_utc_now() {
     return out.str();
 }
 
+std::size_t latest_seq_in_log(const std::string& path) {
+    std::ifstream in(path);
+    std::size_t latest = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        const std::string marker = "\"seq\":";
+        const std::size_t pos = line.find(marker);
+        if (pos == std::string::npos) continue;
+        std::size_t i = pos + marker.size();
+        while (i < line.size() && line[i] == ' ') ++i;
+        std::size_t value = 0;
+        bool have = false;
+        while (i < line.size() && line[i] >= '0' && line[i] <= '9') {
+            have = true;
+            value = value * 10 + static_cast<std::size_t>(line[i] - '0');
+            ++i;
+        }
+        if (have) latest = std::max(latest, value);
+    }
+    return latest;
+}
+
+bool file_has_content(const std::string& path) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    return in && in.tellg() > 0;
+}
+
 } // namespace
 
 DecisionParam param_string(const std::string& name, const std::string& value) {
@@ -84,23 +113,25 @@ DecisionParam param_int(const std::string& name, long long value) {
 
 DecisionLog::DecisionLog(const std::string& path, const std::string& step_path)
     : path_(path) {
-    out_.open(path, std::ios::out | std::ios::trunc);
+    const bool append_existing = file_has_content(path);
+    seq_ = latest_seq_in_log(path);
+    out_.open(path, std::ios::out | std::ios::app);
     if (!out_.is_open()) {
         throw std::runtime_error("could not open decision log: " + path);
     }
-    out_ << "[\n";
-    write_manifest(step_path);
+    if (!append_existing) {
+        write_manifest(step_path);
+    }
 }
 
 DecisionLog::~DecisionLog() {
     if (out_.is_open()) {
-        out_ << "\n]\n";
         out_.close();
     }
 }
 
 void DecisionLog::write_manifest(const std::string& step_path) {
-    // TODO: include cad2csg_version once the build exposes one.
+    // TODO: include csgify_version once the build exposes one.
     std::string digest;
     if (!step_path.empty()) {
         const std::string raw = fnv1a128_file_hex(step_path);
@@ -108,16 +139,16 @@ void DecisionLog::write_manifest(const std::string& step_path) {
             digest = "fnv1a128:" + raw;
         }
     }
-    out_ << "  {"
+    out_ << "{"
          << "\"kind\":\"manifest\","
          << "\"seq\":0,"
-         << "\"cad2csg_version\":\"unversioned\","
+         << "\"csgify_version\":\"unversioned\","
          << "\"occt_version\":" << quote(occt_version()) << ","
          << "\"step_path\":" << quote(step_path) << ","
          << "\"step_digest\":" << quote(digest) << ","
          << "\"created_at\":" << quote(iso8601_utc_now())
-         << "}";
-    first_record_ = false;
+         << "}\n";
+    out_.flush();
 }
 
 void DecisionLog::record(const DecisionTarget& target,
@@ -129,12 +160,8 @@ void DecisionLog::record(const DecisionTarget& target,
         return;
     }
     ++seq_;
-    if (!first_record_) {
-        out_ << ",\n";
-    }
-    first_record_ = false;
 
-    out_ << "  {"
+    out_ << "{"
          << "\"kind\":\"decision\","
          << "\"seq\":" << seq_ << ","
          << "\"target\":{"
@@ -169,7 +196,7 @@ void DecisionLog::record(const DecisionTarget& target,
     }
     out_ << "],"
          << "\"issued_at\":" << quote(iso8601_utc_now())
-         << "}";
+         << "}\n";
     out_.flush();
 }
 
@@ -178,18 +205,14 @@ void DecisionLog::record_undo(std::size_t undoes_seq) {
         return;
     }
     ++seq_;
-    if (!first_record_) {
-        out_ << ",\n";
-    }
-    first_record_ = false;
 
-    out_ << "  {"
+    out_ << "{"
          << "\"kind\":\"undo\","
          << "\"seq\":" << seq_ << ","
          << "\"undoes_seq\":" << undoes_seq << ","
          << "\"issued_at\":" << quote(iso8601_utc_now())
-         << "}";
+         << "}\n";
     out_.flush();
 }
 
-} // namespace cad2csg
+} // namespace csgify

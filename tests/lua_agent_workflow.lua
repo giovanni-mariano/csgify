@@ -1,4 +1,4 @@
-local s = cad2csg.session()
+local s = csgify.session()
 local original = s:load_step(arg[1])
 local work = s:load_step(arg[1])
 

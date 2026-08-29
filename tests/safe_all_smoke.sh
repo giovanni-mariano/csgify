@@ -25,6 +25,8 @@ status=$?
 grep -q "dry-run" "$plan_out" || fail "dry-run output missing [dry-run] marker"
 grep -q "safe-all.*summary" "$plan_out" \
     || fail "dry-run output missing safe-all summary line"
+grep -q "auto-fit skipped.*max-deviation" "$plan_out" \
+    || fail "safe-all must not auto-fit without an explicit deviation budget"
 # Output STEP file must not have been created by --dry-run.
 [ ! -e "$outdir/should_not_exist.step" ] || fail "dry-run wrote an output file"
 

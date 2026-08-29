@@ -1,11 +1,11 @@
 #pragma once
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
 #include <memory>
 #include <string>
 
-namespace cad2csg {
+namespace csgify {
 
 struct Session;
 
@@ -191,9 +191,10 @@ CommandResult emit_document(Session& session,
                             const std::string& output_path,
                             ReportIdMode id_mode = ReportIdMode::scoped);
 
-// Write the as-simplified geometry as STEP. Pass 1: original surviving
-// solids, decomposition pieces, and primitive synthetic bodies. Boolean
-// synthetic nodes are emitted as bbox placeholders for now.
+// Write the as-simplified geometry as STEP. Original surviving solids,
+// decomposition pieces, primitives, and recursively materialized Boolean
+// synthetic bodies are exported. The operation fails rather than substituting
+// placeholder geometry when exact materialization is unavailable.
 CommandResult export_document_step(Session& session,
                                    const DocumentId& document_id,
                                    const std::string& output_path,
@@ -232,4 +233,4 @@ const SurfaceReplacementProposal& last_surface_replacement_proposal(
 
 std::size_t document_count(const Session& session);
 
-} // namespace cad2csg
+} // namespace csgify

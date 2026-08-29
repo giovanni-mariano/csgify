@@ -2,7 +2,7 @@
 // and per-face classification, fitted-primitive candidates, cleanup metrics,
 // and diagnostics. No mutation of the model; pure read.
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
 #include "analytic_surface.hpp"
 #include "engine_internal.hpp"
@@ -31,10 +31,10 @@
 #include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
-using namespace cad2csg::detail;
+using namespace csgify::detail;
 
 const ShapeMetadata* find_solid_metadata(const CadModel& model, const std::string& id) {
     for (const ShapeMetadata& metadata : model.solid_metadata) {
@@ -201,7 +201,9 @@ void inspect_solid(const TopoDS_Solid& solid,
         if (exact_supported) {
             ++report.analytic_faces;
         }
-        analyzed_face.surface_type = surface_type_name(surface_type);
+        analyzed_face.surface_type = replacement
+            ? spline_fit_kind_name(replacement->kind)
+            : surface_type_name(surface_type);
         analyzed_face.support_kind = replacement
             ? ("replacement_" + std::string(spline_fit_kind_name(replacement->kind)))
             : surface_support_kind_name(surface_type);
@@ -623,6 +625,30 @@ double shape_volume(const TopoDS_Shape& shape) {
     return std::abs(props.Mass());
 }
 
+struct IntersectionResult {
+    bool known = false;
+    double volume = 0.0;
+};
+
+IntersectionResult intersection_volume(const TopoDS_Shape& a,
+                                       const TopoDS_Shape& b) {
+    IntersectionResult result;
+    try {
+        BRepAlgoAPI_Common common(a, b);
+        common.Build();
+        if (common.IsDone()) {
+            result.known = true;
+            if (!common.Shape().IsNull()) {
+                result.volume = shape_volume(common.Shape());
+            }
+        }
+    } catch (...) {
+        result.known = false;
+        result.volume = 0.0;
+    }
+    return result;
+}
+
 // Detect interpenetrating solid pairs in the imported model. Runs
 // AFTER per-solid analysis so we have the bboxes already; uses them
 // as a cheap prescreen before falling back to BRepAlgoAPI_Common for
@@ -630,11 +656,11 @@ double shape_volume(const TopoDS_Shape& shape) {
 //
 // Emits a `solid_overlap` warning diagnostic per detected pair --
 // warning severity because MCNP cannot tolerate overlapping cells,
-// but the cad2csg user may have authored the overlap intentionally
+// but the csgify user may have authored the overlap intentionally
 // (e.g., as a tolerance feature) and we don't want to refuse to
 // emit. Pairs are also recorded in report.overlaps[] for tooling.
 //
-// Lives in cad2csg::detail so the session layer can run it once per
+// Lives in csgify::detail so the session layer can run it once per
 // explicit analyze call without paying the O(N^2) cost on every
 // internal post-mutation analyze.
 void detect_solid_overlaps(CadModel& model,
@@ -643,25 +669,35 @@ void detect_solid_overlaps(CadModel& model,
     if (!options.check_overlaps) return;
     if (model.root.IsNull()) return;
 
-    // Refresh the persistent record. Each analyze() call recomputes
-    // the full pairwise overlap set, so stale solid_overlap entries
-    // from a prior analyze must be removed first to avoid duplicate
-    // diagnostics in model.diagnostics. mutation_introduced_overlap
-    // entries are kept (those record per-op history, not current
-    // state).
+    // Refresh the persistent record. Each full overlap pass recomputes
+    // the current pairwise overlap set, so stale overlap entries from
+    // prior analyzes or mutations must be removed first. Mutation
+    // history belongs in the decision log; model.diagnostics is the
+    // live gate consumed by emit_document.
     model.diagnostics.erase(
         std::remove_if(model.diagnostics.begin(),
                        model.diagnostics.end(),
                        [](const Diagnostic& d) {
-                           return d.code == "solid_overlap";
+                           return d.code == "solid_overlap"
+                               || d.code == "mutation_introduced_overlap"
+                               || d.code == "overlap_unknown";
                        }),
         model.diagnostics.end());
+    report.diagnostics.erase(
+        std::remove_if(report.diagnostics.begin(),
+                       report.diagnostics.end(),
+                       [](const Diagnostic& d) {
+                           return d.code == "solid_overlap"
+                               || d.code == "mutation_introduced_overlap"
+                               || d.code == "overlap_unknown";
+                       }),
+        report.diagnostics.end());
 
     // Walk solids in TopExp order so `solid:N` indices match the rest
     // of the report. Skip suppressed solids.
     struct Entry {
         std::string id;
-        TopoDS_Solid solid;
+        TopoDS_Shape shape;
         Bnd_Box bbox;
         double volume = 0.0;
     };
@@ -673,9 +709,29 @@ void detect_solid_overlaps(CadModel& model,
         if (contains_id(model.removed_solid_ids, id)) continue;
         Entry e;
         e.id = id;
-        e.solid = TopoDS::Solid(exp.Current());
-        BRepBndLib::Add(e.solid, e.bbox);
-        e.volume = shape_volume(e.solid);
+        e.shape = exp.Current();
+        BRepBndLib::Add(e.shape, e.bbox);
+        e.volume = shape_volume(e.shape);
+        entries.push_back(std::move(e));
+    }
+    for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (!piece.active || piece.solid.IsNull()) continue;
+        Entry e;
+        e.id = piece.id;
+        e.shape = piece.solid;
+        BRepBndLib::Add(e.shape, e.bbox);
+        e.volume = shape_volume(e.shape);
+        entries.push_back(std::move(e));
+    }
+    for (const SyntheticBody& body : model.synthetic_bodies) {
+        if (!body.emit_as_cell) continue;
+        TopoDS_Shape shape = build_synthetic_shape(model, body);
+        if (shape.IsNull()) continue;
+        Entry e;
+        e.id = body.id;
+        e.shape = shape;
+        BRepBndLib::Add(e.shape, e.bbox);
+        e.volume = shape_volume(e.shape);
         entries.push_back(std::move(e));
     }
 
@@ -688,20 +744,26 @@ void detect_solid_overlaps(CadModel& model,
             if (!bboxes_intersect(entries[i].bbox, entries[j].bbox, pad)) {
                 continue;
             }
-            // Bboxes overlap; compute the actual volume of the
-            // boolean intersection. OCCT can throw on degenerate
-            // inputs; treat any failure as "no detected overlap"
-            // and continue (rather than failing the whole analyze).
-            double inter_volume = 0.0;
-            try {
-                BRepAlgoAPI_Common common(entries[i].solid, entries[j].solid);
-                common.Build();
-                if (common.IsDone() && !common.Shape().IsNull()) {
-                    inter_volume = shape_volume(common.Shape());
-                }
-            } catch (...) {
-                inter_volume = 0.0;
+            const IntersectionResult intersection =
+                intersection_volume(entries[i].shape, entries[j].shape);
+            if (!intersection.known) {
+                std::ostringstream msg;
+                msg << "Could not evaluate boolean intersection between "
+                    << entries[i].id << " and " << entries[j].id
+                    << "; overlap state is unknown.";
+                Diagnostic d;
+                d.severity = options.allow_overlaps
+                    ? DiagnosticSeverity::warning
+                    : DiagnosticSeverity::error;
+                d.code = "overlap_unknown";
+                d.message = msg.str();
+                d.shape_id = entries[i].id;
+                d.shape_label = entries[i].id + "<->" + entries[j].id;
+                report.diagnostics.push_back(d);
+                model.diagnostics.push_back(d);
+                continue;
             }
+            const double inter_volume = intersection.volume;
             if (inter_volume <= 0.0) continue;
 
             const double min_vol = std::min(entries[i].volume, entries[j].volume);
@@ -815,7 +877,7 @@ void detect_mutation_overlaps(
          i < model.synthetic_bodies.size(); ++i) {
         const SyntheticBody& body = model.synthetic_bodies[i];
         if (!body.emit_as_cell) continue;
-        TopoDS_Shape shape = build_synthetic_shape(body);
+        TopoDS_Shape shape = build_synthetic_shape(model, body);
         if (shape.IsNull()) continue;
         EgoEntry e;
         e.id = body.id;
@@ -888,7 +950,7 @@ void detect_mutation_overlaps(
     for (const SyntheticBody& body : model.synthetic_bodies) {
         if (!body.emit_as_cell) continue;
         if (in_ego_set(body.id)) continue;
-        TopoDS_Shape shape = build_synthetic_shape(body);
+        TopoDS_Shape shape = build_synthetic_shape(model, body);
         if (shape.IsNull()) continue;
         Neighbor n;
         n.id = body.id;
@@ -957,17 +1019,23 @@ void detect_mutation_overlaps(
         model.diagnostics.push_back(d);
     };
 
-    auto compute_intersection_volume = [](const TopoDS_Shape& a,
-                                           const TopoDS_Shape& b) {
-        try {
-            BRepAlgoAPI_Common common(a, b);
-            common.Build();
-            if (common.IsDone() && !common.Shape().IsNull()) {
-                return shape_volume(common.Shape());
-            }
-        } catch (...) {
-        }
-        return 0.0;
+    auto record_unknown = [&](const EgoEntry& ego, const std::string& other_id) {
+        if (pair_known(*known_overlap_pairs, ego.id, other_id)) return;
+        known_overlap_pairs->push_back(canonical_pair(ego.id, other_id));
+        std::ostringstream msg;
+        msg << "Mutation requires a boolean overlap check between " << ego.id
+            << " and " << other_id
+            << ", but the intersection could not be evaluated.";
+        Diagnostic d;
+        d.severity = options.allow_overlaps
+            ? DiagnosticSeverity::warning
+            : DiagnosticSeverity::error;
+        d.code = "overlap_unknown";
+        d.message = msg.str();
+        d.shape_id = ego.id;
+        d.shape_label = ego.id + "<->" + other_id;
+        report.diagnostics.push_back(d);
+        model.diagnostics.push_back(d);
     };
 
     // 3. Pair each ego against each neighbor (with bbox prescreen).
@@ -984,9 +1052,14 @@ void detect_mutation_overlaps(
             if (!ego.source_solid_id.empty()
                 && ego.source_solid_id == n.id) continue;
             if (!bboxes_intersect(ego.bbox, n.bbox, pad)) continue;
-            const double iv = compute_intersection_volume(ego.shape, n.shape);
-            if (iv <= 0.0) continue;
-            record_pair(ego, n.id, n.volume, iv);
+            const IntersectionResult intersection =
+                intersection_volume(ego.shape, n.shape);
+            if (!intersection.known) {
+                record_unknown(ego, n.id);
+                continue;
+            }
+            if (intersection.volume <= 0.0) continue;
+            record_pair(ego, n.id, n.volume, intersection.volume);
         }
     }
 
@@ -996,10 +1069,14 @@ void detect_mutation_overlaps(
     for (std::size_t i = 0; i < egos.size(); ++i) {
         for (std::size_t j = i + 1; j < egos.size(); ++j) {
             if (!bboxes_intersect(egos[i].bbox, egos[j].bbox, pad)) continue;
-            const double iv = compute_intersection_volume(egos[i].shape,
-                                                           egos[j].shape);
-            if (iv <= 0.0) continue;
-            record_pair(egos[i], egos[j].id, egos[j].volume, iv);
+            const IntersectionResult intersection =
+                intersection_volume(egos[i].shape, egos[j].shape);
+            if (!intersection.known) {
+                record_unknown(egos[i], egos[j].id);
+                continue;
+            }
+            if (intersection.volume <= 0.0) continue;
+            record_pair(egos[i], egos[j].id, egos[j].volume, intersection.volume);
         }
     }
 }
@@ -1008,7 +1085,7 @@ void detect_mutation_overlaps(
 
 AnalysisReport analyze_model(const CadModel& model,
                              const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     AnalysisReport report;
     report.diagnostics = model.diagnostics;
     report.assembly = model.assembly;
@@ -1090,4 +1167,4 @@ ConversionReport inspect_step_file(const std::string& step_path,
     return analyze_model(model, options);
 }
 
-} // namespace cad2csg
+} // namespace csgify

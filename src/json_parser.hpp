@@ -1,10 +1,11 @@
 #pragma once
 
-// Minimal recursive-descent JSON parser, scoped to what cad2csg's
+// Minimal recursive-descent JSON parser, scoped to what csgify's
 // decision-log writer and recipe compactor emit (objects, arrays,
 // strings, numbers, bools, nulls). Header-only, no dependency.
 
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <map>
@@ -14,7 +15,7 @@
 #include <string>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 
 struct JsonValue;
 using JsonObject = std::map<std::string, std::shared_ptr<JsonValue>>;
@@ -81,6 +82,44 @@ private:
         ++pos_;
     }
 
+    static int hex_value(char ch) {
+        if (ch >= '0' && ch <= '9') return ch - '0';
+        if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
+        if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
+        return -1;
+    }
+
+    unsigned parse_hex4() {
+        if (pos_ + 4 > src_.size()) fail("unterminated \\u escape");
+        unsigned value = 0;
+        for (int i = 0; i < 4; ++i) {
+            const int h = hex_value(src_[pos_++]);
+            if (h < 0) fail("invalid \\u escape");
+            value = (value << 4) | static_cast<unsigned>(h);
+        }
+        return value;
+    }
+
+    void append_utf8(unsigned codepoint, std::string* out) {
+        if (codepoint <= 0x7f) {
+            out->push_back(static_cast<char>(codepoint));
+        } else if (codepoint <= 0x7ff) {
+            out->push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+            out->push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+        } else if (codepoint <= 0xffff) {
+            out->push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+            out->push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+            out->push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+        } else if (codepoint <= 0x10ffff) {
+            out->push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
+            out->push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
+            out->push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+            out->push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+        } else {
+            fail("unicode codepoint out of range");
+        }
+    }
+
     std::shared_ptr<JsonValue> parse_value() {
         skip_ws();
         const char c = peek();
@@ -144,14 +183,34 @@ private:
                 case 't':  out += '\t'; break;
                 case 'b':  out += '\b'; break;
                 case 'f':  out += '\f'; break;
-                case 'u':
-                    if (pos_ + 4 > src_.size()) fail("unterminated \\u escape");
-                    out += '?';
-                    pos_ += 4;
+                case 'u': {
+                    unsigned codepoint = parse_hex4();
+                    if (codepoint >= 0xd800 && codepoint <= 0xdbff) {
+                        if (pos_ + 2 > src_.size()
+                            || src_[pos_] != '\\'
+                            || src_[pos_ + 1] != 'u') {
+                            fail("missing low surrogate");
+                        }
+                        pos_ += 2;
+                        const unsigned low = parse_hex4();
+                        if (low < 0xdc00 || low > 0xdfff) {
+                            fail("invalid low surrogate");
+                        }
+                        codepoint = 0x10000
+                            + ((codepoint - 0xd800) << 10)
+                            + (low - 0xdc00);
+                    } else if (codepoint >= 0xdc00 && codepoint <= 0xdfff) {
+                        fail("unexpected low surrogate");
+                    }
+                    append_utf8(codepoint, &out);
                     break;
+                }
                 default: fail("unknown escape");
                 }
             } else {
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    fail("unescaped control character in string");
+                }
                 out += c;
             }
         }
@@ -166,16 +225,55 @@ private:
     std::shared_ptr<JsonValue> parse_number() {
         const std::size_t start = pos_;
         if (peek() == '-') ++pos_;
-        while (pos_ < src_.size() &&
-               (std::isdigit(static_cast<unsigned char>(src_[pos_])) ||
-                src_[pos_] == '.' || src_[pos_] == 'e' || src_[pos_] == 'E' ||
-                src_[pos_] == '+' || src_[pos_] == '-')) {
+        if (pos_ >= src_.size()) fail("invalid number");
+        if (src_[pos_] == '0') {
             ++pos_;
+            if (pos_ < src_.size()
+                && std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+                fail("invalid leading zero");
+            }
+        } else if (src_[pos_] >= '1' && src_[pos_] <= '9') {
+            while (pos_ < src_.size()
+                   && std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+                ++pos_;
+            }
+        } else {
+            fail("invalid number");
+        }
+        if (pos_ < src_.size() && src_[pos_] == '.') {
+            ++pos_;
+            if (pos_ >= src_.size()
+                || !std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+                fail("invalid fraction");
+            }
+            while (pos_ < src_.size()
+                   && std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+                ++pos_;
+            }
+        }
+        if (pos_ < src_.size() && (src_[pos_] == 'e' || src_[pos_] == 'E')) {
+            ++pos_;
+            if (pos_ < src_.size() && (src_[pos_] == '+' || src_[pos_] == '-')) {
+                ++pos_;
+            }
+            if (pos_ >= src_.size()
+                || !std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+                fail("invalid exponent");
+            }
+            while (pos_ < src_.size()
+                   && std::isdigit(static_cast<unsigned char>(src_[pos_]))) {
+                ++pos_;
+            }
         }
         auto v = std::make_shared<JsonValue>();
         v->kind = JsonKind::number;
         try {
-            v->num = std::stod(src_.substr(start, pos_ - start));
+            std::size_t consumed = 0;
+            const std::string token = src_.substr(start, pos_ - start);
+            v->num = std::stod(token, &consumed);
+            if (consumed != token.size() || !std::isfinite(v->num)) {
+                fail("invalid number");
+            }
         } catch (const std::exception&) {
             fail("invalid number");
         }
@@ -220,4 +318,4 @@ inline std::shared_ptr<JsonValue> load_json_file(const std::string& path) {
     return JsonParser(buf.str()).parse();
 }
 
-} // namespace cad2csg
+} // namespace csgify

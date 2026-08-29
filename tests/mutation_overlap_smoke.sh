@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# mutation_overlap_smoke: cad2csg must flag mutations that introduce
+# mutation_overlap_smoke: csgify must flag mutations that introduce
 # new overlaps between solids. Pre-existing overlaps are reported by
 # the analyze pass; mutation-introduced overlaps must be reported on
 # the operation that created them, so the user can't silently emit
@@ -19,7 +19,7 @@ fail() { echo "mutation_overlap_smoke: $*" >&2; exit 1; }
 
 step="$fixtures/l_with_inner_box.step"
 [ -f "$step" ] \
-    || fail "fixture missing: $step (run cad2csg_generate_fixtures)"
+    || fail "fixture missing: $step (run csgify_generate_fixtures)"
 
 # ---- as-loaded: NO overlap between L and inner box -------------------
 # The L-shape is non-convex (so inspect exits nonzero with
@@ -50,8 +50,8 @@ import json, sys
 d = json.load(open(sys.argv[1]))
 diags = d["diagnostics"]
 intro = [diag for diag in diags
-         if diag["code"] == "mutation_introduced_overlap"]
-assert intro, f"expected mutation_introduced_overlap; got codes={[diag['code'] for diag in diags]}"
+         if diag["code"] in ("mutation_introduced_overlap", "solid_overlap")]
+assert intro, f"expected overlap diagnostic; got codes={[diag['code'] for diag in diags]}"
 # The diagnostic must reference the new synthetic body and the inner
 # solid:2 by id.
 label = intro[0]["shape_label"]
@@ -62,6 +62,27 @@ msg = intro[0]["message"]
 assert "intersection_volume=" in msg, msg
 PY
 [ "$?" -eq 0 ] || fail "mutation_introduced_overlap not detected"
+
+# ---- Resolving the overlapping neighbor and re-analyzing must clear
+#      the live mutation-overlap error from the report.
+cat >"$outdir/resolve_mutation_overlap.lua" <<'LUA'
+local s = csgify.session()
+local doc = s:load_step(arg[1])
+local r, err = s:replace_solid(doc .. "/solid:1", "bbox", { max_rel_delta = 100.0 })
+if not r then error(err, 0) end
+r, err = s:remove_solid(doc .. "/solid:2")
+if not r then error(err, 0) end
+r, err = s:analyze(doc)
+if not r then error(err, 0) end
+for _, d in ipairs(r.diagnostics) do
+    if d.code == "mutation_introduced_overlap" or d.code == "solid_overlap" then
+        error("stale overlap survived after analyze", 0)
+    end
+end
+LUA
+"$exe" lua "$outdir/resolve_mutation_overlap.lua" "$step" \
+    >/dev/null 2>"$outdir/resolve_mutation_overlap.err" \
+    || fail "resolved mutation overlap remained live"
 
 # ---- Negative control: --replace-solid-bbox on a STANDALONE solid
 #      must NOT trigger a false positive (no neighbors to overlap).

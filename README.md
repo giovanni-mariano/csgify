@@ -1,6 +1,6 @@
-# cad2csg
+# csgify
 
-`cad2csg` converts STEP CAD models into Alea CSG systems for neutronics workflows.
+`csgify` converts STEP CAD models into Alea CSG systems for neutronics workflows.
 
 This first engine pass targets Open CASCADE Technology 8.0.0 APIs and links to
 `../libalea`. CMake requires `OpenCASCADE 8.0.0 EXACT`, so older system OCCT
@@ -41,31 +41,49 @@ cmake --build /home/giovanni/OCCT-8_0_0-build --parallel 2
 cmake --install /home/giovanni/OCCT-8_0_0-build
 ```
 
-`cad2csg` requires `OpenCASCADE 8.0.0 EXACT`, so CMake will reject the system
+`csgify` requires `OpenCASCADE 8.0.0 EXACT`, so CMake will reject the system
 OCCT 7.8.1 package.
 
-Build `cad2csg`:
+Build `csgify`:
 
 ```sh
 cmake --preset occt8
 cmake --build --preset occt8
 ```
 
+Configuration compiles and links an Alea API probe before generating the main
+build. If `../libalea/include` is newer than `../libalea/bin`, rebuild libalea;
+csgify deliberately refuses a mismatched header/archive pair.
+
 Run:
 
 ```sh
-./build/cad2csg input.step output.i
+./build/csgify input.step output.i
 ```
 
 Inspect a model before conversion:
 
 ```sh
-./build/cad2csg inspect input.step --report report.json
+./build/csgify inspect input.step --report report.json
 ```
 
 `inspect` writes a machine-readable report with summary counters, diagnostics,
 and allowed actions for human or agent preprocessing. It does not create Alea
 cells or export neutronics input.
+
+For composed preprocessing, spline approximation is opt-in and bounded:
+
+```sh
+./build/csgify preprocess input.step --safe-all --max-deviation 1e-6 \
+  --out-step simplified.step --report report.json
+```
+
+Without `--max-deviation`, `--safe-all` leaves spline faces untouched and
+reports them as remaining decisions. Feature-removal candidates are also left
+untouched unless `--apply-removal-candidates high|medium` is supplied.
+
+The standalone `auto-fit` command always requires `--max-deviation`; there is
+no unbounded batch-fitting mode in the CLI or Lua API.
 
 The report includes stable traversal IDs for decisions:
 
@@ -85,9 +103,9 @@ automatic approval.
 Calculate volume, or compare original and simplified models:
 
 ```sh
-./build/cad2csg volume input.step
-./build/cad2csg volume original.step --compare simplified.step --rel-tol 1e-4
-./build/cad2csg volume original.step --compare simplified.step --abs-tol 0.01
+./build/csgify volume input.step
+./build/csgify volume original.step --compare simplified.step --rel-tol 1e-4
+./build/csgify volume original.step --compare simplified.step --abs-tol 0.01
 ```
 
 The comparison command exits with success only when the absolute and relative
@@ -97,13 +115,13 @@ the command reports the delta and requires exact equality.
 Run a first in-memory simplification and export:
 
 ```sh
-./build/cad2csg simplify input.step --replace-solid-bbox solid:1 --out simplified.i
-./build/cad2csg simplify input.step --replace-solid-bbox-cylinder solid:1 --out simplified.i
-./build/cad2csg simplify input.step --replace-solid-fitted-cylinder solid:1 --out simplified.i
-./build/cad2csg simplify input.step --replace-solid-fitted-sphere solid:1 --out simplified.i
-./build/cad2csg simplify input.step --replace-solid-fitted-cone solid:1 --out simplified.i
-./build/cad2csg simplify input.step --decompose-planar solid:1 --out simplified.i
-./build/cad2csg simplify input.step --remove-solid solid:1 --out simplified.i
+./build/csgify simplify input.step --replace-solid-bbox solid:1 --out simplified.i
+./build/csgify simplify input.step --replace-solid-bbox-cylinder solid:1 --out simplified.i
+./build/csgify simplify input.step --replace-solid-fitted-cylinder solid:1 --out simplified.i
+./build/csgify simplify input.step --replace-solid-fitted-sphere solid:1 --out simplified.i
+./build/csgify simplify input.step --replace-solid-fitted-cone solid:1 --out simplified.i
+./build/csgify simplify input.step --decompose-planar solid:1 --out simplified.i
+./build/csgify simplify input.step --remove-solid solid:1 --out simplified.i
 ```
 
 `--replace-solid-bbox` suppresses the selected CAD solid and adds a synthetic
@@ -125,11 +143,11 @@ exporter.
 Replacement commands also accept volume guards:
 
 ```sh
-./build/cad2csg simplify input.step --replace-solid-fitted-cylinder solid:1 \
+./build/csgify simplify input.step --replace-solid-fitted-cylinder solid:1 \
   --out simplified.i --max-rel-delta 0.01
-./build/cad2csg simplify input.step --replace-solid-bbox solid:1 \
+./build/csgify simplify input.step --replace-solid-bbox solid:1 \
   --out simplified.i --max-abs-delta 0.001
-./build/cad2csg simplify input.step --replace-solid-fitted-cylinder solid:1 \
+./build/csgify simplify input.step --replace-solid-fitted-cylinder solid:1 \
   --out simplified.i --report simplified-report.json
 ```
 

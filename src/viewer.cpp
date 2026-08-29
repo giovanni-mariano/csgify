@@ -1,5 +1,5 @@
 #include "viewer.hpp"
-#if CAD2CSG_HAVE_TKOPENGL
+#if CSGIFY_HAVE_TKOPENGL
 
 #include "session_view.hpp"
 
@@ -36,7 +36,7 @@
 #include <utility>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 Quantity_Color color_for_status(SolidViewStatus status) {
@@ -225,7 +225,7 @@ int run_viewer_command(Session& session,
     Handle(AIS_InteractiveContext) ctx = new AIS_InteractiveContext(v3d_viewer);
     ctx->SetDisplayMode(AIS_Shaded, false);
 
-    const std::string title = "cad2csg view  —  " + step_path;
+    const std::string title = "csgify view  —  " + step_path;
     Handle(Xw_Window) xw_win = new Xw_Window(
         disp_conn, title.c_str(), 50, 50, 1100, 750);
     xw_win->Map();
@@ -429,7 +429,7 @@ int run_viewer_command(Session& session,
     view->Redraw();
 
     // Legend on stderr so stdout stays clean for selected IDs.
-    std::cerr << "\ncad2csg viewer  (" << entries.size() << " solid"
+    std::cerr << "\ncsgify viewer  (" << entries.size() << " solid"
               << (entries.size() == 1 ? "" : "s") << ")  "
               << step_path << "\n";
     std::cerr << "  green  = exact-CSG ready\n";
@@ -678,6 +678,6 @@ int run_viewer_command(Session& session,
     return EXIT_SUCCESS;
 }
 
-} // namespace cad2csg
+} // namespace csgify
 
-#endif // CAD2CSG_HAVE_TKOPENGL
+#endif // CSGIFY_HAVE_TKOPENGL

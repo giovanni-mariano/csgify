@@ -9,15 +9,15 @@
 // GUI's X11 loop drives. The GUI (src/viewer.cpp, GL-gated) is a thin shell
 // that renders controller state and forwards key events to these methods.
 
-#include "cad2csg/engine.hpp"   // HoleFillCandidate, SurfaceReplacementCandidate
-#include "cad2csg/session.hpp"  // Session, CommandResult, mutators
+#include "csgify/engine.hpp"   // HoleFillCandidate, SurfaceReplacementCandidate
+#include "csgify/session.hpp"  // Session, CommandResult, mutators
 
 #include <iosfwd>
 #include <set>
 #include <string>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 
 // One entry in a multi-alternative review (e.g. the full set of removal
 // suggestions shown together so the user can compare and pick in-window).
@@ -113,7 +113,7 @@ private:
 //   A         accept active            X    reject active
 //   Tab       cycle next               BackTab / ShiftTab   cycle previous
 //   R:solid:N remove that solid        Q    quit (emit deck if commit_out set)
-// Returns a process exit code. Used by `cad2csg view --keys ...` and tests.
+// Returns a process exit code. Used by `csgify view --keys ...` and tests.
 int run_viewer_headless(Session& session,
                         const std::string& document_id,
                         const ViewerReviewContext& review,
@@ -122,4 +122,4 @@ int run_viewer_headless(Session& session,
                         std::ostream& out,
                         std::ostream& err);
 
-} // namespace cad2csg
+} // namespace csgify

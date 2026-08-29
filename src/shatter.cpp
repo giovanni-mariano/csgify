@@ -30,12 +30,20 @@
 #include <TopoDS_Solid.hxx>
 #include <gp_Pnt.hxx>
 
-namespace cad2csg {
+namespace csgify {
 
 bool shatter_solid(CadModel& model,
                    const std::string& id,
                    const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
+
+    if (!std::isfinite(options.shatter_relative_volume_tolerance)
+        || options.shatter_relative_volume_tolerance < 0.0) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error, "invalid_shatter_volume_tolerance",
+            "shatter_relative_volume_tolerance must be finite and non-negative.", id});
+        return false;
+    }
 
     std::size_t target_index = 0;
     if (!parse_solid_id(id, &target_index)) {
@@ -227,14 +235,24 @@ bool shatter_solid(CadModel& model,
 
     const double relative_delta =
         std::abs(pieces_volume - original_volume) / original_volume;
-    if (relative_delta > options.linear_tolerance
+    if (relative_delta > options.shatter_relative_volume_tolerance
         && !options.allow_shatter_volume_drift) {
         std::ostringstream msg;
         msg << "Shatter changed volume by relative delta " << relative_delta
-            << " (> linear_tolerance " << options.linear_tolerance
+            << " (> shatter_relative_volume_tolerance "
+            << options.shatter_relative_volume_tolerance
             << "). Refusing to mutate; set allow_shatter_volume_drift to override.";
         model.diagnostics.push_back({
             DiagnosticSeverity::error, "decomposition_volume_changed", msg.str(), id});
+        return false;
+    }
+
+    if (residual_nonconvex > 0) {
+        std::ostringstream rmsg;
+        rmsg << residual_nonconvex << " shattered piece(s) still fail convex "
+                "validation. Refusing to mutate the source solid.";
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error, "shatter_residual_nonconvex", rmsg.str(), id});
         return false;
     }
 
@@ -244,17 +262,10 @@ bool shatter_solid(CadModel& model,
         << " pieces_volume=" << pieces_volume
         << " relative_delta=" << relative_delta;
     model.diagnostics.push_back({
-        relative_delta <= options.linear_tolerance ? DiagnosticSeverity::info
-                                                    : DiagnosticSeverity::warning,
+        relative_delta <= options.shatter_relative_volume_tolerance
+            ? DiagnosticSeverity::info
+            : DiagnosticSeverity::warning,
         "shatter", msg.str(), id});
-
-    if (residual_nonconvex > 0) {
-        std::ostringstream rmsg;
-        rmsg << residual_nonconvex << " shattered piece(s) still fail convex "
-                "validation and will be reported per-piece at emit.";
-        model.diagnostics.push_back({
-            DiagnosticSeverity::warning, "shatter_residual_nonconvex", rmsg.str(), id});
-    }
 
     remove_solid(model, id);
     for (const TopoDS_Solid& piece : kept) {
@@ -271,4 +282,4 @@ bool shatter_solid(CadModel& model,
     return true;
 }
 
-} // namespace cad2csg
+} // namespace csgify

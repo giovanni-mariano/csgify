@@ -1,19 +1,22 @@
 #include "lua_runner.hpp"
 
-#include "cad2csg/engine.hpp"
-#include "cad2csg/session.hpp"
+#include "csgify/engine.hpp"
+#include "csgify/session.hpp"
 #include "decision_pack.hpp"
 #include "recipe.hpp"
 #include "replay.hpp"
 #include "engine_model.hpp"
+#include "session_impl.hpp"
 
+#include <cmath>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <new>
 #include <string>
 #include <vector>
 
-#if CAD2CSG_ENABLE_LUA
+#if CSGIFY_ENABLE_LUA
 
 extern "C" {
 #include <lauxlib.h>
@@ -21,10 +24,10 @@ extern "C" {
 #include <lualib.h>
 }
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
-constexpr const char* kSessionMeta = "cad2csg.session";
+constexpr const char* kSessionMeta = "csgify.session";
 
 struct LuaSession {
     SessionPtr session;
@@ -37,16 +40,52 @@ LuaSession* check_session(lua_State* L, int index) {
     return static_cast<LuaSession*>(userdata);
 }
 
+void reject_unknown_table_keys(lua_State* L,
+                               int index,
+                               std::initializer_list<const char*> allowed,
+                               const char* context) {
+    index = lua_absindex(L, index);
+    lua_pushnil(L);
+    while (lua_next(L, index) != 0) {
+        if (lua_type(L, -2) != LUA_TSTRING) {
+            luaL_error(L, "%s keys must be strings", context);
+        }
+        const char* key = lua_tostring(L, -2);
+        bool known = false;
+        for (const char* candidate : allowed) {
+            if (std::string(key) == candidate) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            luaL_error(L, "unknown %s option: %s", context, key);
+        }
+        lua_pop(L, 1);
+    }
+}
+
 // Parse a ConversionOptions table. Recognized keys mirror the CLI
 // flags introduced in M2 (units, scale, normalize-units) plus the
-// existing engine tuning knobs. Unknown keys are silently ignored so
-// future fields can be added without breaking scripts.
+// existing engine tuning knobs. Unknown keys are rejected: audited scripts
+// must not silently run with a misspelled safety or tolerance option.
 ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
     ConversionOptions options;
     if (lua_isnoneornil(L, index)) {
         return options;
     }
     luaL_checktype(L, index, LUA_TTABLE);
+    reject_unknown_table_keys(
+        L, index,
+        {"unit_override", "units", "normalize_to_unit", "normalize_units",
+         "unit_scale_to_mm_override", "scale", "linear_tolerance",
+         "angular_tolerance", "small_volume_fraction", "small_bbox_fraction",
+         "thin_plate_ratio", "long_body_ratio", "heal_shape",
+         "require_convex_cells", "try_planar_decomposition",
+         "split_union_cells", "shatter_relative_volume_tolerance",
+         "check_overlaps", "allow_overlaps", "overlap_volume_threshold",
+         "overlap_volume_fraction"},
+        "conversion");
 
     auto take_string = [&](const char* key, std::string* out) {
         lua_getfield(L, index, key);
@@ -86,6 +125,8 @@ ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
     take_bool("require_convex_cells",   &options.require_convex_cells);
     take_bool("try_planar_decomposition", &options.try_planar_decomposition);
     take_bool("split_union_cells",      &options.split_union_cells);
+    take_double("shatter_relative_volume_tolerance",
+                &options.shatter_relative_volume_tolerance);
     take_bool("check_overlaps",         &options.check_overlaps);
     take_bool("allow_overlaps",         &options.allow_overlaps);
     take_double("overlap_volume_threshold", &options.overlap_volume_threshold);
@@ -1259,8 +1300,21 @@ int l_auto_fit_splines(lua_State* L) {
     const char* document_id = luaL_checkstring(L, 2);
     bool has_max_deviation = false;
     double max_deviation = 0.0;
+    if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
+        reject_unknown_table_keys(L, 3, {"max_deviation"},
+                                  "auto_fit_splines");
+    }
     if (!optional_deviation_from_lua(L, 3, &has_max_deviation, &max_deviation)) {
         return luaL_error(L, "auto_fit_splines expects a number or { max_deviation = number }");
+    }
+    if (!has_max_deviation) {
+        return luaL_argerror(
+            L, 3,
+            "auto_fit_splines requires an explicit max_deviation budget");
+    }
+    if (!std::isfinite(max_deviation) || max_deviation < 0.0) {
+        return luaL_argerror(
+            L, 3, "max_deviation must be a finite non-negative number");
     }
     return push_command_result(
         L,
@@ -1312,9 +1366,8 @@ int l_emit(lua_State* L) {
 // s:preprocess_safe_all(doc_id[, opts])
 // Composed equivalent of CLI `preprocess --safe-all`:
 //   1. analyze + overlap precheck (refuses unless opts.allow_overlaps)
-//   2. auto-fit qualifying spline faces
-//   3. high-confidence removals (default: opts.apply_removal_candidates
-//      = "high"; pass "medium" to widen)
+//   2. auto-fit qualifying spline faces only when opts.max_deviation is set
+//   3. removals only when opts.apply_removal_candidates is explicitly set
 //   4. safe BSP decomposition of non-convex solids
 // Returns a summary table:
 //   { ok, auto_fit_applied, removed, decomposed, attempted,
@@ -1326,13 +1379,19 @@ int l_preprocess_safe_all(lua_State* L) {
     const char* doc_id = luaL_checkstring(L, 2);
 
     bool allow_overlaps = false;
-    std::string apply_removal_confidence = "high";
+    std::string apply_removal_confidence;
     int max_depth = 4;
     DecompositionPolicy policy;
     bool has_max_deviation = false;
     double max_deviation = 0.0;
 
     if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
+        reject_unknown_table_keys(
+            L, 3,
+            {"allow_overlaps", "apply_removal_candidates", "max_depth",
+             "max_deviation", "allow_medium_confidence_auto",
+             "allow_bbox_fallback_auto"},
+            "preprocess_safe_all");
         lua_getfield(L, 3, "allow_overlaps");
         if (!lua_isnil(L, -1)) allow_overlaps = lua_toboolean(L, -1) != 0;
         lua_pop(L, 1);
@@ -1360,6 +1419,11 @@ int l_preprocess_safe_all(lua_State* L) {
             policy.allow_bbox_fallback_auto = lua_toboolean(L, -1) != 0;
         }
         lua_pop(L, 1);
+    }
+    if (has_max_deviation
+        && (!std::isfinite(max_deviation) || max_deviation < 0.0)) {
+        return luaL_argerror(L, 3,
+                             "max_deviation must be a finite non-negative number");
     }
 
     std::size_t auto_fit_applied = 0;
@@ -1393,13 +1457,15 @@ int l_preprocess_safe_all(lua_State* L) {
         }
     }
 
-    // 2. Auto-fit spline faces.
-    AutoFitCommandResult af = auto_fit_splines_with_summary(
-        *s->session, doc_id, has_max_deviation, max_deviation,
-        ReportIdMode::local);
-    auto_fit_applied = af.summary.applied;
+    // 2. Auto-fit spline faces only under an explicit approximation budget.
+    // A missing max_deviation means "do not approximate", not "unbounded".
+    if (has_max_deviation) {
+        AutoFitCommandResult af = auto_fit_splines_with_summary(
+            *s->session, doc_id, true, max_deviation, ReportIdMode::local);
+        auto_fit_applied = af.summary.applied;
+    }
 
-    // 3. High-confidence removals.
+    // 3. Explicitly authorized removal candidates.
     if (!apply_removal_confidence.empty()) {
         RemovalProposal removals = suggest_removals(*s->session, doc_id,
                                                      ReportIdMode::local);
@@ -1471,32 +1537,27 @@ int l_write_decision_pack(lua_State* L) {
         lua_pop(L, 1);
     }
 
-    // write_decision_packs takes (report, model, options). The
-    // session keeps the model behind CadDocument; rather than break
-    // the session_impl encapsulation, re-load the CadModel from the
-    // recorded source path. Decision-pack writing is a once-per-
-    // review-cycle op, so the extra import cost is acceptable.
-    const std::string& source_path =
-        document_source_path(*s->session, doc_id);
-    if (source_path.empty()) {
+    CadDocument* document = nullptr;
+    for (CadDocument& candidate : s->session->documents) {
+        if (candidate.id == doc_id) {
+            document = &candidate;
+            break;
+        }
+    }
+    if (!document) {
         lua_newtable(L);
         set_boolean_field(L, "ok", false);
         set_integer_field(L, "packets_written", 0);
         set_string_field(L, "error",
-                         "document_not_found: cannot resolve source path");
+                         "document_not_found: cannot resolve session document");
         return 1;
     }
 
-    // The latest report from the session (analyze / mutate side
-    // effects) is what we hand to the decision-pack writer; it
-    // already carries the diagnostics + decision_requests that
-    // populate the review packets.
-    const ConversionReport& report = last_report(*s->session);
+    const CommandResult analysis =
+        analyze(*s->session, doc_id, ReportIdMode::local);
 
-    ConversionOptions load_options;
-    CadModel model = load_step_model(source_path, load_options);
-
-    DecisionPackResult result = write_decision_packs(report, model, options);
+    DecisionPackResult result =
+        write_decision_packs(analysis.report, document->model, options);
 
     lua_newtable(L);
     set_boolean_field(L, "ok", result.ok);
@@ -1758,7 +1819,7 @@ void register_session(lua_State* L) {
     lua_pop(L, 1);
 }
 
-// cad2csg.compact(log_path, recipe_path)
+// csgify.compact(log_path, recipe_path)
 // Reads an append-only decision log and writes a deterministic Lua
 // recipe. Module-level (not a session method) because it operates on
 // files, not session state. Returns true on success, or (nil, errmsg)
@@ -1776,7 +1837,7 @@ int l_module_compact(lua_State* L) {
     return 1;
 }
 
-// cad2csg.replay(recipe_path, step_path, out_path, report_path[, out_step_path])
+// csgify.replay(recipe_path, step_path, out_path, report_path[, out_step_path])
 // Replays a compacted recipe against a STEP file. step_path may be
 // empty to use the recorded step path from the recipe header. Returns
 // true on success, or (nil, errmsg) on failure.
@@ -1799,7 +1860,7 @@ int l_module_replay(lua_State* L) {
     return 1;
 }
 
-void register_cad2csg(lua_State* L) {
+void register_csgify(lua_State* L) {
     register_session(L);
     lua_newtable(L);
     lua_pushcfunction(L, l_new_session);
@@ -1808,7 +1869,7 @@ void register_cad2csg(lua_State* L) {
     lua_setfield(L, -2, "compact");
     lua_pushcfunction(L, l_module_replay);
     lua_setfield(L, -2, "replay");
-    lua_setglobal(L, "cad2csg");
+    lua_setglobal(L, "csgify");
 }
 
 void set_arg_table(lua_State* L, const std::string& script_path, int argc, char** argv) {
@@ -1831,7 +1892,7 @@ int run_lua_script(const std::string& script_path, int argc, char** argv) {
         return 1;
     }
     luaL_openlibs(L);
-    register_cad2csg(L);
+    register_csgify(L);
     set_arg_table(L, script_path, argc, argv);
 
     const int status = luaL_dofile(L, script_path.c_str());
@@ -1845,18 +1906,18 @@ int run_lua_script(const std::string& script_path, int argc, char** argv) {
     return 0;
 }
 
-} // namespace cad2csg
+} // namespace csgify
 
 #else
 
-namespace cad2csg {
+namespace csgify {
 
 int run_lua_script(const std::string& /*script_path*/, int /*argc*/, char** /*argv*/) {
-    std::cerr << "error lua_not_built: rebuild with CAD2CSG_ENABLE_LUA=ON "
+    std::cerr << "error lua_not_built: rebuild with CSGIFY_ENABLE_LUA=ON "
               << "and Lua development files installed\n";
     return 1;
 }
 
-} // namespace cad2csg
+} // namespace csgify
 
 #endif

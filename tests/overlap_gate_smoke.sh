@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
-# overlap_gate_smoke: cad2csg refuses to emit a broken MCNP deck.
+# overlap_gate_smoke: csgify refuses to emit a broken MCNP deck.
 #
 # Overlap diagnostics are error-severity by default, so:
-#   - default convert (`cad2csg input.step output.i`) refuses to write
+#   - default convert (`csgify input.step output.i`) refuses to write
 #     the .i file when overlaps are present
 #   - preprocess --safe-all refuses to proceed
 #   - --allow-overlaps downgrades the diagnostic to warning and lets
@@ -32,6 +32,34 @@ status=$?
     || fail "default convert should refuse overlapping input (got exit 0)"
 [ ! -e "$outdir/refused.i" ] \
     || fail "default convert wrote a .i file despite overlap"
+
+# ---- direct session emit refuses without caller-side analyze -------------
+cat >"$outdir/direct_emit.lua" <<'LUA'
+local s = csgify.session()
+local doc = s:load_step(arg[1])
+local ok, err = s:emit(doc, arg[2])
+if ok then
+    error("direct emit unexpectedly succeeded", 0)
+end
+local report = s:report_table()
+local found = false
+for _, d in ipairs(report.diagnostics) do
+    if d.code == "solid_overlap" and d.severity == "error" then
+        found = true
+    end
+end
+if not found then
+    error("direct emit did not report solid_overlap", 0)
+end
+LUA
+rm -f "$outdir/direct_emit.i"
+"$exe" lua "$outdir/direct_emit.lua" "$bad" "$outdir/direct_emit.i" \
+    >/dev/null 2>"$outdir/direct_emit.err"
+status=$?
+[ "$status" -eq 0 ] \
+    || fail "direct Lua emit overlap check failed"
+[ ! -e "$outdir/direct_emit.i" ] \
+    || fail "direct Lua emit wrote a .i file despite overlap"
 
 # ---- preprocess --safe-all aborts ---------------------------------------
 rm -f "$outdir/safe_all.step"

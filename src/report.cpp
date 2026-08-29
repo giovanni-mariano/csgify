@@ -2,7 +2,7 @@
 // dependencies on the rest of the engine's mutation state. Lives in its own
 // translation unit so engine.cpp doesn't carry ~700 lines of stream-stitching.
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
 #include "spline_fit.hpp"
 
@@ -14,7 +14,7 @@
 
 #include <alea.h>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 const char* severity_json_name(DiagnosticSeverity severity) {
@@ -1195,4 +1195,4 @@ std::string surface_replacement_proposal_json_string(
     return out.str();
 }
 
-} // namespace cad2csg
+} // namespace csgify

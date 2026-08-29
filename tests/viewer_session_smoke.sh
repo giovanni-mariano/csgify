@@ -3,7 +3,7 @@
 # Smoke test for the decision-log-backed viewer session (Plan A) and its
 # headless decision controller (point-5 refactor).
 #
-# `cad2csg view --keys "..."` replays a key string through the SAME
+# `csgify view --keys "..."` replays a key string through the SAME
 # ViewerController the X11 event loop drives -- with no window, no display, no
 # TKOpenGl. Accepting a candidate calls the same session mutators the CLI uses
 # on a session with a decision log attached, so a visual decision is logged and
@@ -26,6 +26,7 @@ fail() { echo "viewer_session_smoke: $*" >&2; exit 1; }
 step="$fixtures/four_solids.step"
 log="$outdir/decisions.json"
 direct="$outdir/headless.i"
+rm -f "$log" "$direct" "$outdir/stdout.txt"
 
 # R:<id> removes that solid; Q commits (emits the deck because --out is set).
 "$exe" view "$step" \
@@ -61,6 +62,7 @@ diff "$direct" "$replay" >/dev/null 2>&1 \
 rails="$fixtures/rails.stp"
 if [[ -f "$rails" ]]; then
     rlog="$outdir/rails.json"
+    rm -f "$rlog"
     # Reject the first candidate, skip to the third, accept it: exactly one
     # removal must be logged, and it must NOT be the rejected one.
     out=$("$exe" view "$rails" --review-removals \

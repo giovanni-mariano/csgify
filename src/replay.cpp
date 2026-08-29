@@ -1,6 +1,6 @@
 #include "replay.hpp"
 
-#include "cad2csg/session.hpp"
+#include "csgify/session.hpp"
 #include "engine_model.hpp"
 #include "fnv.hpp"
 #include "json_parser.hpp"
@@ -17,7 +17,7 @@
 #include <unordered_set>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 struct Fingerprint {
@@ -370,14 +370,36 @@ bool dispatch_solid_op(Session& session,
     if (op.op == "apply_replacement_operation"
         || op.op == "apply_checked_replacement_operation") {
         int op_enum = -1;
+        ReplacementLimits limits;
         if (op.params && op.params->kind == JsonKind::object) {
             if (const JsonValue* v = op.params->get("operation")) {
                 op_enum = static_cast<int>(v->as_number());
+            }
+            if (const JsonValue* v = op.params->get("has_max_abs_delta")) {
+                limits.has_absolute_delta = v->as_bool(false);
+            }
+            if (const JsonValue* v = op.params->get("max_abs_delta")) {
+                limits.max_absolute_delta = v->as_number();
+            }
+            if (const JsonValue* v = op.params->get("has_max_rel_delta")) {
+                limits.has_relative_delta = v->as_bool(false);
+            }
+            if (const JsonValue* v = op.params->get("max_rel_delta")) {
+                limits.max_relative_delta = v->as_number();
             }
         }
         if (op_enum < 0 || op_enum > 4) {
             *error_out = "missing or out-of-range replacement enum";
             return false;
+        }
+        if (op.op == "apply_checked_replacement_operation") {
+            ReplacementCommandResult r = apply_checked_replacement_operation(
+                session, resolved_local_id,
+                static_cast<ReplacementOperation>(op_enum),
+                limits,
+                ReportIdMode::local);
+            if (!r.command.ok) *error_out = "apply_checked_replacement_operation failed";
+            return r.command.ok;
         }
         const CommandResult r = apply_replacement_operation(
             session, resolved_local_id,
@@ -729,4 +751,4 @@ int replay_recipe(const std::string& recipe_json_path,
     return exit_status;
 }
 
-} // namespace cad2csg
+} // namespace csgify

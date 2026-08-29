@@ -8,6 +8,9 @@
 #include <string>
 #include <unordered_set>
 
+#include <BRepAlgoAPI_Common.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
@@ -29,7 +32,7 @@
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 class CoutSilencer {
@@ -227,18 +230,7 @@ TopoDS_Shape build_synthetic_cone(const SyntheticBody& body) {
     return maker.Solid();
 }
 
-TopoDS_Shape build_synthetic_placeholder(const SyntheticBody& body) {
-    // Boolean synthetic nodes (union/intersection/difference) need a
-    // recursive BRepAlgoAPI_* build from leaves. Pass 2 territory.
-    // For pass 1, emit the bbox as a labeled placeholder so the user
-    // sees *something* at the right location during cross-tool review.
-    std::cerr << "warning: synthetic boolean body " << body.id
-              << " exported as bbox placeholder (pass 2 will build the"
-                 " actual CSG)\n";
-    return build_synthetic_box(body);
-}
-
-TopoDS_Shape build_synthetic(const SyntheticBody& body) {
+TopoDS_Shape build_synthetic_primitive(const SyntheticBody& body) {
     switch (body.kind) {
     case SyntheticBodyKind::box:      return build_synthetic_box(body);
     case SyntheticBodyKind::sphere:   return build_synthetic_sphere(body);
@@ -247,23 +239,70 @@ TopoDS_Shape build_synthetic(const SyntheticBody& body) {
     case SyntheticBodyKind::union_body:
     case SyntheticBodyKind::intersection_body:
     case SyntheticBodyKind::difference_body:
-        return build_synthetic_placeholder(body);
+        return {};
     }
     return {};
+}
+
+TopoDS_Shape build_synthetic_recursive(
+    const CadModel& model,
+    const SyntheticBody& body,
+    std::unordered_set<std::string>* resolving) {
+    if (!resolving || !resolving->insert(body.id).second) {
+        return {};
+    }
+
+    const TopoDS_Shape primitive = build_synthetic_primitive(body);
+    if (!primitive.IsNull()) {
+        resolving->erase(body.id);
+        return primitive;
+    }
+
+    const SyntheticBody* left = detail::find_synthetic_body(model, body.left_id);
+    const SyntheticBody* right = detail::find_synthetic_body(model, body.right_id);
+    if (!left || !right) {
+        resolving->erase(body.id);
+        return {};
+    }
+    const TopoDS_Shape left_shape = build_synthetic_recursive(model, *left, resolving);
+    const TopoDS_Shape right_shape = build_synthetic_recursive(model, *right, resolving);
+    if (left_shape.IsNull() || right_shape.IsNull()) {
+        resolving->erase(body.id);
+        return {};
+    }
+
+    TopoDS_Shape result;
+    try {
+        if (body.kind == SyntheticBodyKind::union_body) {
+            BRepAlgoAPI_Fuse op(left_shape, right_shape);
+            op.Build();
+            if (op.IsDone()) result = op.Shape();
+        } else if (body.kind == SyntheticBodyKind::intersection_body) {
+            BRepAlgoAPI_Common op(left_shape, right_shape);
+            op.Build();
+            if (op.IsDone()) result = op.Shape();
+        } else if (body.kind == SyntheticBodyKind::difference_body) {
+            BRepAlgoAPI_Cut op(left_shape, right_shape);
+            op.Build();
+            if (op.IsDone()) result = op.Shape();
+        }
+    } catch (...) {
+        result.Nullify();
+    }
+    resolving->erase(body.id);
+    return result;
 }
 
 } // namespace
 
 namespace detail {
 
-// Shared synthetic-body shape builder. Used by step_export (to write
-// out the simplified geometry) and by the mutation-overlap check
-// in analyze.cpp (to test newly-created synthetic bodies against
-// neighbors). Boolean kinds return the bbox placeholder, same as the
-// step-export path; downstream callers that need exact CSG for the
-// boolean case must reconstruct it themselves.
-TopoDS_Shape build_synthetic_shape(const SyntheticBody& body) {
-    return build_synthetic(body);
+// Shared exact synthetic-body shape builder. Used by STEP export and overlap
+// checks so both paths classify the same recursively materialized geometry.
+TopoDS_Shape build_synthetic_shape(const CadModel& model,
+                                   const SyntheticBody& body) {
+    std::unordered_set<std::string> resolving;
+    return build_synthetic_recursive(model, body, &resolving);
 }
 
 } // namespace detail
@@ -310,15 +349,14 @@ int export_step(const CadModel& model, const std::string& output_path) {
                         &transferred);
     }
 
-    // Synthetic bodies — materialized as OCCT primitives. Booleans are
-    // emitted as bbox placeholders for now.
+    // Synthetic bodies, including recursively materialized Boolean nodes.
     for (const SyntheticBody& body : model.synthetic_bodies) {
         if (!body.emit_as_cell) continue;
-        const TopoDS_Shape shape = build_synthetic(body);
+        const TopoDS_Shape shape = detail::build_synthetic_shape(model, body);
         if (shape.IsNull()) {
-            std::cerr << "warning: synthetic body " << body.id
-                      << " could not be materialized for STEP export\n";
-            continue;
+            std::cerr << "error step_export: synthetic body " << body.id
+                      << " could not be materialized exactly\n";
+            return 1;
         }
         add_named_shape(shape_tool,
                         shape,
@@ -346,4 +384,4 @@ int export_step(const CadModel& model, const std::string& output_path) {
     return 0;
 }
 
-} // namespace cad2csg
+} // namespace csgify

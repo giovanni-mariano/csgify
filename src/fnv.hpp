@@ -9,7 +9,7 @@
 #include <sstream>
 #include <string>
 
-namespace cad2csg {
+namespace csgify {
 
 constexpr std::uint64_t kFnv1aOffset64 = 0xcbf29ce484222325ULL;
 constexpr std::uint64_t kFnv1aPrime64  = 0x100000001b3ULL;
@@ -80,4 +80,4 @@ inline std::string fnv1a128_file_hex(const std::string& path) {
     return to_hex64(h_lo) + to_hex64(h_hi);
 }
 
-} // namespace cad2csg
+} // namespace csgify

@@ -1,4 +1,4 @@
-local s = cad2csg.session()
+local s = csgify.session()
 local doc = s:load_step(arg[1])
 
 local function fail(msg)

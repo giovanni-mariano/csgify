@@ -1,8 +1,8 @@
 -- lua_coverage: confirms Lua bindings cover the CLI verbs added
 -- in the coverage audit:
 --   s:explain               (CLI: explain)
---   cad2csg.compact         (CLI: compact)
---   cad2csg.replay          (CLI: replay)
+--   csgify.compact         (CLI: compact)
+--   csgify.replay          (CLI: replay)
 --   s:write_decision_pack   (CLI: decision-pack)
 --   s:preprocess_safe_all   (CLI: preprocess --safe-all)
 
@@ -15,7 +15,7 @@ local outdir   = arg[2]
 -- s:explain
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/spline_face.step")
     -- analyze first so the solid table is populated.
     s:analyze_table(doc)
@@ -45,7 +45,7 @@ do
 end
 
 ----------------------------------------------------------------------
--- cad2csg.compact + cad2csg.replay
+-- csgify.compact + csgify.replay
 ----------------------------------------------------------------------
 do
     local log_path = outdir .. "/coverage_decisions.json"
@@ -55,7 +55,7 @@ do
     -- block so the session is collectable (and the log file flushed)
     -- before we read it back.
     do
-        local s = cad2csg.session()
+        local s = csgify.session()
         s:attach_decision_log(log_path)
         local doc = s:load_step(fixtures .. "/four_solids.step")
         s:remove_solid(doc .. "/solid:2")
@@ -63,15 +63,15 @@ do
     end
     collectgarbage("collect")  -- force the DecisionLog destructor to fire
 
-    -- Compact to a Lua recipe (text script callable via `cad2csg lua`).
+    -- Compact to a Lua recipe (text script callable via `csgify lua`).
     local recipe_path = outdir .. "/coverage_recipe.lua"
     os.remove(recipe_path)
-    local ok, err = cad2csg.compact(log_path, recipe_path)
-    if not ok then fail("cad2csg.compact failed: " .. tostring(err)) end
+    local ok, err = csgify.compact(log_path, recipe_path)
+    if not ok then fail("csgify.compact failed: " .. tostring(err)) end
     local f = io.open(recipe_path, "r")
     if not f then fail("recipe not written") end
     local body = f:read("*a"); f:close()
-    if not body:find("cad2csg.session") then
+    if not body:find("csgify.session") then
         fail("compacted recipe doesn't look like a Lua script")
     end
 
@@ -85,7 +85,7 @@ do
     local replay_report = outdir .. "/coverage_replay.json"
     os.remove(json_recipe); os.remove(replay_out); os.remove(replay_report)
     local json = string.format([[{
-  "manifest": {"step_path":"%s","step_digest":"","cad2csg_version":"unversioned","occt_version":"8.0.0"},
+  "manifest": {"step_path":"%s","step_digest":"","csgify_version":"unversioned","occt_version":"8.0.0"},
   "ops": [
     {"op":"load_step","target":{"kind":"document","shape_id":"doc:1","component_entry":""},"params":{"step_path":"%s"}},
     {"op":"replace_solid_with_bbox","target":{"kind":"solid","shape_id":"solid:1","component_entry":"0:1:1:1","fingerprint":{"volume":100.0,"surface_area":160.0,"bbox_diagonal":11.358,"face_count":6,"centroid":[5.0,2.5,1.0]}},"params":{}},
@@ -95,9 +95,9 @@ do
     local jf = io.open(json_recipe, "w")
     jf:write(json); jf:close()
 
-    local replay_ok, replay_err = cad2csg.replay(
+    local replay_ok, replay_err = csgify.replay(
         json_recipe, step, replay_out, replay_report)
-    if not replay_ok then fail("cad2csg.replay failed: " .. tostring(replay_err)) end
+    if not replay_ok then fail("csgify.replay failed: " .. tostring(replay_err)) end
     local rf = io.open(replay_out, "r")
     if not rf then fail("replay did not write " .. replay_out) end
     rf:close()
@@ -107,7 +107,7 @@ end
 -- s:write_decision_pack
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/spline_face.step")
     s:analyze_table(doc)  -- populate decision_requests
 
@@ -130,7 +130,7 @@ end
 ----------------------------------------------------------------------
 do
     -- l_shape.step: one non-convex solid the safe BSP can resolve.
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/l_shape.step")
     local summary = s:preprocess_safe_all(doc)
     if type(summary) ~= "table" then fail("safe_all returned " .. type(summary)) end
@@ -140,8 +140,23 @@ do
 end
 
 do
+    -- Missing max_deviation means no approximation, never an unlimited fit.
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/spline_face.step")
+    local summary = s:preprocess_safe_all(doc,
+        { apply_removal_candidates = "", max_depth = 1 })
+    if summary.auto_fit_applied ~= 0 then
+        fail("safe_all auto-fit without an explicit max_deviation")
+    end
+    local report = s:analyze_table(doc)
+    if report.spline_faces == 0 then
+        fail("safe_all silently replaced spline geometry without a budget")
+    end
+end
+
+do
     -- overlapping_boxes.step: should abort the safe-all precheck.
-    local s = cad2csg.session({ allow_overlaps = false })
+    local s = csgify.session({ allow_overlaps = false })
     local doc = s:load_step(fixtures .. "/overlapping_boxes.step")
     local summary = s:preprocess_safe_all(doc, { allow_overlaps = false })
     if summary.ok then fail("safe_all should abort on overlapping_boxes.step") end

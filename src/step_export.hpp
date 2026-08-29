@@ -8,14 +8,13 @@
 //   - every primitive synthetic body (box/sphere/cylinder/cone)
 //     materialized via BRepPrimAPI_*
 //
-// Pass 1 deliberately skips boolean synthetic nodes (union/intersection/
-// difference) — those need recursive BRepAlgoAPI_* builds and add real
-// failure modes that should not block the verification workflow. They
-// are emitted as bbox placeholders in pass 1 with a stderr warning.
+// Boolean synthetic nodes are recursively materialized with OCCT Boolean
+// operations. Export fails if an active synthetic cannot be materialized;
+// it never substitutes a bounding-box placeholder.
 
 #include <string>
 
-namespace cad2csg {
+namespace csgify {
 
 struct CadModel;
 
@@ -23,4 +22,4 @@ struct CadModel;
 // written to stderr.
 int export_step(const CadModel& model, const std::string& output_path);
 
-} // namespace cad2csg
+} // namespace csgify

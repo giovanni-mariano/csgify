@@ -2,7 +2,7 @@
 // work with documents, IDs, commands, and reports. OCCT-backed CadModel state
 // stays behind the Session object.
 
-#include "cad2csg/session.hpp"
+#include "csgify/session.hpp"
 
 #include "decision_log.hpp"
 #include "engine_internal.hpp"
@@ -29,7 +29,7 @@
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 constexpr double kPi = 3.14159265358979323846264338327950288;
@@ -50,6 +50,26 @@ std::string scoped_shape_id(const DocumentId& document_id, const std::string& lo
         return local_id;
     }
     return document_id + "/" + local_id;
+}
+
+std::string scoped_decision_id(const DocumentId& document_id,
+                               const std::string& id,
+                               const std::string& local_target_id) {
+    if (id.empty() || local_target_id.empty()) {
+        return id;
+    }
+    if (id.find(document_id + "/") != std::string::npos) {
+        return id;
+    }
+    std::string out = id;
+    const std::string scoped_target =
+        scoped_shape_id(document_id, local_target_id);
+    std::size_t pos = 0;
+    while ((pos = out.find(local_target_id, pos)) != std::string::npos) {
+        out.replace(pos, local_target_id.size(), scoped_target);
+        pos += scoped_target.size();
+    }
+    return out;
 }
 
 bool parse_scoped_shape_id(const std::string& value,
@@ -127,6 +147,17 @@ ConversionReport scoped_report(const CadDocument& document,
         node.id = scoped_shape_id(document.id, node.id);
         node.parent_id = scoped_shape_id(document.id, node.parent_id);
         node.shape_id = scoped_shape_id(document.id, node.shape_id);
+    }
+
+    for (DecisionRequest& request : report.decision_requests) {
+        const std::string local_target_id = request.target_id;
+        request.target_id = scoped_shape_id(document.id, request.target_id);
+        request.id = scoped_decision_id(document.id, request.id, local_target_id);
+    }
+
+    for (SolidOverlap& overlap : report.overlaps) {
+        overlap.solid_a_id = scoped_shape_id(document.id, overlap.solid_a_id);
+        overlap.solid_b_id = scoped_shape_id(document.id, overlap.solid_b_id);
     }
 
     return report;
@@ -631,22 +662,17 @@ CommandResult analyze(Session& session,
         // intersection passes add up quickly during BSP recursion.
         // The scoped diagnostics + report.overlaps[] are populated
         // here so the caller sees them after `s:analyze(doc)` or
-        // `cad2csg inspect`.
+        // `csgify inspect`.
         detail::detect_solid_overlaps(document.model, document.options,
                                        local_report);
-        // Seed the known-overlap set so subsequent mutation-overlap
-        // checks treat these pairs as pre-existing (not introduced by
-        // the mutation). Each pair is canonicalized (lo<->hi) for
-        // stable lookup.
+        // Refresh the known-overlap set so subsequent mutation checks
+        // treat only the current full-scan pairs as pre-existing.
+        document.known_overlap_pairs.clear();
         for (const SolidOverlap& ov : local_report.overlaps) {
             auto key = ov.solid_a_id < ov.solid_b_id
                 ? std::make_pair(ov.solid_a_id, ov.solid_b_id)
                 : std::make_pair(ov.solid_b_id, ov.solid_a_id);
-            bool exists = false;
-            for (const auto& k : document.known_overlap_pairs) {
-                if (k == key) { exists = true; break; }
-            }
-            if (!exists) document.known_overlap_pairs.push_back(key);
+            document.known_overlap_pairs.push_back(key);
         }
         document.performance.analyze_ms += elapsed_ms(start);
         local_report.performance = document.performance;
@@ -2102,11 +2128,68 @@ CommandResult emit_document(Session& session,
             continue;
         }
         const auto emit_start = Clock::now();
+        ConversionReport readiness_report =
+            analyze_model(document.model, document.options);
+        detail::detect_solid_overlaps(document.model,
+                                      document.options,
+                                      readiness_report);
+        const bool has_overlap_error = std::any_of(
+            readiness_report.diagnostics.begin(),
+            readiness_report.diagnostics.end(),
+            [](const Diagnostic& d) {
+                return d.severity == DiagnosticSeverity::error
+                    && d.code == "solid_overlap";
+            });
+        if (has_overlap_error) {
+            document.performance.emit_ms += elapsed_ms(emit_start);
+            readiness_report.performance = document.performance;
+            document.report = id_mode == ReportIdMode::scoped
+                ? scoped_report(document, readiness_report)
+                : readiness_report;
+            log_document_op(session, document_id, "emit_mcnp", params, false);
+            session.last_report_value = document.report;
+            return {false, document.report};
+        }
+
         ConversionResult conversion = convert_model(document.model, document.options);
+        ConversionReport final_report =
+            analyze_model(document.model, document.options);
+        detail::detect_solid_overlaps(document.model,
+                                      document.options,
+                                      final_report);
+        final_report.solids_converted = conversion.report.solids_converted;
+        final_report.decomposition_attempts =
+            conversion.report.decomposition_attempts;
+        final_report.decomposition_pieces =
+            conversion.report.decomposition_pieces;
+        auto has_diag = [](const ConversionReport& report,
+                           const Diagnostic& diagnostic) {
+            return std::any_of(report.diagnostics.begin(),
+                               report.diagnostics.end(),
+                               [&](const Diagnostic& existing) {
+                                   return existing.severity == diagnostic.severity
+                                       && existing.code == diagnostic.code
+                                       && existing.shape_id == diagnostic.shape_id
+                                       && existing.message == diagnostic.message;
+                               });
+        };
+        for (const Diagnostic& diagnostic : conversion.report.diagnostics) {
+            if (!has_diag(final_report, diagnostic)) {
+                final_report.diagnostics.push_back(diagnostic);
+            }
+        }
+        if (conversion.report.ok()) {
+            for (Diagnostic& diagnostic : final_report.diagnostics) {
+                if (diagnostic.severity == DiagnosticSeverity::error
+                    && diagnostic.code == "nonconvex_solid_requires_decomposition") {
+                    diagnostic.severity = DiagnosticSeverity::warning;
+                }
+            }
+        }
         document.report = id_mode == ReportIdMode::scoped
-            ? scoped_report(document, conversion.report)
-            : conversion.report;
-        if (document.report.ok()) {
+            ? scoped_report(document, final_report)
+            : final_report;
+        if (conversion.report.ok() && document.report.ok()) {
             const int export_status = export_mcnp(conversion.system.get(), output_path);
             if (export_status != 0) {
                 Diagnostic diagnostic = make_error(
@@ -2294,4 +2377,4 @@ std::vector<SolidViewEntry> collect_view_entries(const Session& session) {
     return result;
 }
 
-} // namespace cad2csg
+} // namespace csgify

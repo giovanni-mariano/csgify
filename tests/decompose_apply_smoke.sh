@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end smoke test for `cad2csg decompose-apply`. Runs the batched
+# End-to-end smoke test for `csgify decompose-apply`. Runs the batched
 # command against the L-shape (a single non-convex solid) and verifies:
 #   - the MCNP deck is produced
 #   - the decision log records the decomposition op
@@ -53,7 +53,7 @@ python3 - "$log_out" <<'PY' || exit 1
 import json, sys
 
 with open(sys.argv[1]) as f:
-    records = json.load(f)
+    records = [json.loads(line) for line in f if line.strip()]
 
 ops = [r.get("op") for r in records if r.get("kind") == "decision"]
 decomposition_ops = [o for o in ops

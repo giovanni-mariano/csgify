@@ -32,7 +32,7 @@
 #include <gp_Vec.hxx>
 #include <gp_Torus.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 namespace {
 
 constexpr double kPi = 3.141592653589793238462643383279502884;
@@ -251,7 +251,7 @@ void add_closure_planes_for_face(const TopoDS_Face& face,
     if (type != GeomAbs_Cylinder && type != GeomAbs_Cone) {
         return;
     }
-    Standard_Real u_min = 0.0, u_max = 0.0, v_min = 0.0, v_max = 0.0;
+    double u_min = 0.0, u_max = 0.0, v_min = 0.0, v_max = 0.0;
     BRepTools::UVBounds(face, u_min, u_max, v_min, v_max);
     const double angular_span = std::abs(u_max - u_min);
     // Full revolutions are handled by the quadric cut; near-zero arcs are
@@ -521,4 +521,4 @@ std::vector<TopoDS_Solid> split_solid_by_planes(const TopoDS_Solid& solid,
                         "Multi-plane decomposition did not produce multiple solid pieces.");
 }
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

@@ -2,7 +2,7 @@
 #
 # Pins the diagnostic-code contract that agents and external tooling depend
 # on. Each fixture is a minimal STEP file under tests/fixtures/, generated
-# by the cad2csg_generate_fixtures developer tool.
+# by the csgify_generate_fixtures developer tool.
 set -u
 
 exe="$1"
@@ -371,6 +371,14 @@ fi
 #      face is a B-spline. Auto-fit with a tight budget must convert it
 #      end-to-end (3/3 spline faces accepted, 1/1 solids converted).
 
+if "$exe" auto-fit "$fixtures/spline_face.step" \
+    --out "$outdir/spline_face_unbounded.i" \
+    >"$outdir/spline_face_unbounded.out" 2>&1; then
+    fail "auto-fit accepted an unbounded approximation"
+fi
+grep -q "max_deviation_required" "$outdir/spline_face_unbounded.out" \
+    || fail "unbounded auto-fit did not report max_deviation_required"
+
 "$exe" auto-fit "$fixtures/spline_face.step" \
     --out "$outdir/spline_face_auto.i" \
     --max-deviation 1e-6 \
@@ -390,6 +398,9 @@ assert report["summary"]["spline_faces"] == 0, \
 applied = [d for d in report["diagnostics"]
            if d["code"] == "face_replacement_recorded"]
 assert len(applied) == 3, f"expected 3 face_replacement_recorded; got {len(applied)}"
+materialized = [d for d in report["diagnostics"]
+                if d["code"] == "spline_solid_materialized"]
+assert materialized, "expected fully replaced spline solid to be materialized"
 PY
 if [ "$?" -ne 0 ]; then
     fail "auto-fit contract validation failed"

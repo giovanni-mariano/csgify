@@ -1,9 +1,11 @@
 // Cleanup / Geometric Repair stage. The mutator boundary on `CadModel`:
 // every command here either records a decision (face replacement, removal)
-// or attaches a synthetic body / decomposed piece. The original CAD geometry
-// is never destroyed in-place; conversion is a final read elsewhere.
+// or attaches a synthetic body / decomposed piece. Face replacement records
+// analytic overrides; when all faces of a simple spline primitive are
+// replaced, the original solid is suppressed and a synthetic analytic body is
+// materialized so review/export paths do not keep the source spline surfaces.
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
 #include "analytic_surface.hpp"
 #include "decompose.hpp"
@@ -28,14 +30,17 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Solid.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Sphere.hxx>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
-using namespace cad2csg::detail;
+using namespace csgify::detail;
 
 std::string next_synthetic_id(const CadModel& model) {
     return "synthetic:" + std::to_string(model.synthetic_bodies.size() + 1);
@@ -105,6 +110,11 @@ bool find_solid_by_id(const CadModel& model,
                       std::size_t* index_out) {
     std::size_t target_index = 0;
     if (!parse_solid_id(id, &target_index)) {
+        return false;
+    }
+    const std::string canonical_id = solid_id(target_index);
+    if (contains_id(model.removed_solid_ids, canonical_id)
+        || contains_id(model.removed_solid_ids, id)) {
         return false;
     }
     std::size_t solid_index = 0;
@@ -241,6 +251,256 @@ bool find_face_in_solid(const TopoDS_Solid& solid,
     return false;
 }
 
+SplineFitKind analytic_fit_kind_from_face(const TopoDS_Face& face,
+                                          SplineFaceFit* fit_out) {
+    BRepAdaptor_Surface adaptor(face, false);
+    switch (adaptor.GetType()) {
+    case GeomAbs_Plane: {
+        const gp_Pln plane = adaptor.Plane();
+        const gp_Dir normal = plane.Axis().Direction();
+        fit_out->kind = SplineFitKind::plane;
+        fit_out->available = true;
+        fit_out->origin = {plane.Location().X(),
+                           plane.Location().Y(),
+                           plane.Location().Z()};
+        fit_out->direction = {normal.X(), normal.Y(), normal.Z()};
+        return SplineFitKind::plane;
+    }
+    case GeomAbs_Sphere: {
+        const gp_Sphere sphere = adaptor.Sphere();
+        fit_out->kind = SplineFitKind::sphere;
+        fit_out->available = true;
+        fit_out->origin = {sphere.Location().X(),
+                           sphere.Location().Y(),
+                           sphere.Location().Z()};
+        fit_out->radius = sphere.Radius();
+        return SplineFitKind::sphere;
+    }
+    case GeomAbs_Cylinder: {
+        const gp_Cylinder cylinder = adaptor.Cylinder();
+        const gp_Dir axis = cylinder.Axis().Direction();
+        fit_out->kind = SplineFitKind::cylinder;
+        fit_out->available = true;
+        fit_out->origin = {cylinder.Location().X(),
+                           cylinder.Location().Y(),
+                           cylinder.Location().Z()};
+        fit_out->direction = {axis.X(), axis.Y(), axis.Z()};
+        fit_out->radius = cylinder.Radius();
+        return SplineFitKind::cylinder;
+    }
+    case GeomAbs_Cone: {
+        const gp_Cone cone = adaptor.Cone();
+        gp_Dir axis = cone.Axis().Direction();
+        double half_angle = cone.SemiAngle();
+        if (half_angle < 0.0) {
+            axis.Reverse();
+            half_angle = -half_angle;
+        }
+        const gp_Pnt apex = cone.Apex();
+        fit_out->kind = SplineFitKind::cone;
+        fit_out->available = true;
+        fit_out->origin = {apex.X(), apex.Y(), apex.Z()};
+        fit_out->direction = {axis.X(), axis.Y(), axis.Z()};
+        fit_out->half_angle = half_angle;
+        return SplineFitKind::cone;
+    }
+    default:
+        return SplineFitKind::none;
+    }
+}
+
+bool projected_span(const TopoDS_Solid& solid,
+                    Vec3 origin,
+                    Vec3 axis,
+                    double* min_t_out,
+                    double* max_t_out) {
+    std::vector<Vec3> points;
+    for (const gp_Pnt& p : solid_vertices(solid)) {
+        points.push_back({p.X(), p.Y(), p.Z()});
+    }
+    if (points.empty()) {
+        const BBox bbox = bbox_from_shape(solid);
+        if (!bbox.valid) {
+            return false;
+        }
+        points = bbox_corners(bbox);
+    }
+
+    bool have = false;
+    double min_t = 0.0;
+    double max_t = 0.0;
+    for (Vec3 p : points) {
+        const double t = dot(sub(p, origin), axis);
+        if (!have) {
+            min_t = t;
+            max_t = t;
+            have = true;
+        } else {
+            min_t = std::min(min_t, t);
+            max_t = std::max(max_t, t);
+        }
+    }
+    if (!have || max_t - min_t <= kEps) {
+        return false;
+    }
+    *min_t_out = min_t;
+    *max_t_out = max_t;
+    return true;
+}
+
+bool normalize_vec(Vec3* v) {
+    const double length = vec_len(*v);
+    if (length <= kEps) {
+        return false;
+    }
+    *v = scale(*v, 1.0 / length);
+    return true;
+}
+
+bool materialize_fully_replaced_primitive(CadModel& model,
+                                          const std::string& solid_id_str,
+                                          const TopoDS_Solid& solid,
+                                          std::size_t solid_index,
+                                          const ConversionOptions& options) {
+    if (contains_id(model.removed_solid_ids, solid_id_str)) {
+        return false;
+    }
+
+    std::size_t face_index = 0;
+    std::size_t face_count = 0;
+    std::size_t plane_count = 0;
+    std::size_t cylinder_count = 0;
+    std::size_t cone_count = 0;
+    std::size_t sphere_count = 0;
+    std::size_t replaced_count = 0;
+    SplineFaceFit cylinder_fit;
+    SplineFaceFit cone_fit;
+    SplineFaceFit sphere_fit;
+
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
+         face_exp.More(); face_exp.Next()) {
+        ++face_index;
+        ++face_count;
+        SplineFaceFit fit;
+        SplineFitKind kind = SplineFitKind::none;
+        if (const FaceReplacement* replacement =
+                find_face_replacement(&model.face_replacements,
+                                      solid_index,
+                                      face_index)) {
+            kind = replacement->kind;
+            fit = replacement->fit;
+            ++replaced_count;
+        } else {
+            kind = analytic_fit_kind_from_face(TopoDS::Face(face_exp.Current()), &fit);
+        }
+
+        switch (kind) {
+        case SplineFitKind::plane:
+            ++plane_count;
+            break;
+        case SplineFitKind::sphere:
+            ++sphere_count;
+            sphere_fit = fit;
+            break;
+        case SplineFitKind::cylinder:
+            ++cylinder_count;
+            cylinder_fit = fit;
+            break;
+        case SplineFitKind::cone:
+            ++cone_count;
+            cone_fit = fit;
+            break;
+        case SplineFitKind::none:
+            return false;
+        }
+    }
+
+    if (replaced_count == 0) {
+        return false;
+    }
+
+    if (face_count == 1 && sphere_count == 1
+        && sphere_fit.available && sphere_fit.radius > kEps) {
+        remove_solid(model, solid_id_str);
+        add_synthetic_sphere(model, sphere_fit.origin, sphere_fit.radius,
+                             options.default_material_id,
+                             options.default_density,
+                             next_synthetic_id(model)
+                                 + "/spline_fit_sphere_from_" + solid_id_str);
+        model.diagnostics.push_back({
+            DiagnosticSeverity::info,
+            "spline_solid_materialized",
+            "Fully replaced spline solid was materialized as a synthetic sphere.",
+            solid_id_str
+        });
+        return true;
+    }
+
+    if (face_count == 3 && cylinder_count == 1 && plane_count == 2
+        && cylinder_fit.available && cylinder_fit.radius > kEps) {
+        Vec3 axis = cylinder_fit.direction;
+        if (!normalize_vec(&axis)) {
+            return false;
+        }
+        double min_t = 0.0;
+        double max_t = 0.0;
+        if (!projected_span(solid, cylinder_fit.origin, axis, &min_t, &max_t)) {
+            return false;
+        }
+        const Vec3 base = add(cylinder_fit.origin, scale(axis, min_t));
+        const Vec3 height = scale(axis, max_t - min_t);
+        remove_solid(model, solid_id_str);
+        add_synthetic_cylinder(model, base, height, cylinder_fit.radius,
+                               options.default_material_id,
+                               options.default_density,
+                               next_synthetic_id(model)
+                                   + "/spline_fit_cylinder_from_" + solid_id_str);
+        model.diagnostics.push_back({
+            DiagnosticSeverity::info,
+            "spline_solid_materialized",
+            "Fully replaced spline solid was materialized as a synthetic cylinder.",
+            solid_id_str
+        });
+        return true;
+    }
+
+    if (face_count == 3 && cone_count == 1 && plane_count == 2
+        && cone_fit.available && cone_fit.half_angle > kEps) {
+        Vec3 axis = cone_fit.direction;
+        if (!normalize_vec(&axis)) {
+            return false;
+        }
+        double min_t = 0.0;
+        double max_t = 0.0;
+        if (!projected_span(solid, cone_fit.origin, axis, &min_t, &max_t)) {
+            return false;
+        }
+        const double slope = std::tan(cone_fit.half_angle);
+        const double base_radius = std::abs(min_t) * slope;
+        const double top_radius = std::abs(max_t) * slope;
+        if (base_radius <= kEps && top_radius <= kEps) {
+            return false;
+        }
+        const Vec3 base = add(cone_fit.origin, scale(axis, min_t));
+        const Vec3 height = scale(axis, max_t - min_t);
+        remove_solid(model, solid_id_str);
+        add_synthetic_cone(model, base, height, base_radius, top_radius,
+                           options.default_material_id,
+                           options.default_density,
+                           next_synthetic_id(model)
+                               + "/spline_fit_cone_from_" + solid_id_str);
+        model.diagnostics.push_back({
+            DiagnosticSeverity::info,
+            "spline_solid_materialized",
+            "Fully replaced spline solid was materialized as a synthetic cone.",
+            solid_id_str
+        });
+        return true;
+    }
+
+    return false;
+}
+
 } // namespace
 
 bool remove_solid(CadModel& model, const std::string& id) {
@@ -267,8 +527,8 @@ bool replace_face_with_fit(CadModel& model,
                            bool has_max_deviation,
                            double max_deviation,
                            Diagnostic* diagnostic_out,
-                           const ConversionOptions& /*options*/) {
-    using namespace cad2csg::detail;
+                           const ConversionOptions& options) {
+    using namespace csgify::detail;
     std::string diagnostic_label = face_id_str;
     std::string diagnostic_id = face_id_str;
     auto emit = [&](DiagnosticSeverity sev, const char* code, const std::string& msg) {
@@ -341,6 +601,14 @@ bool replace_face_with_fit(CadModel& model,
          << " (max_deviation=" << selected->max_deviation
          << ", relative=" << selected->relative_max_deviation << ").";
     emit(DiagnosticSeverity::info, "face_replacement_recorded", info.str());
+
+    TopoDS_Solid parent_solid;
+    std::size_t parent_index = 0;
+    const std::string parent_id = solid_id(solid_index);
+    if (find_solid_by_id(model, parent_id, &parent_solid, &parent_index)) {
+        materialize_fully_replaced_primitive(model, parent_id, parent_solid,
+                                             parent_index, options);
+    }
     return true;
 }
 
@@ -348,7 +616,7 @@ AutoFitSummary auto_fit_splines(CadModel& model,
                                 bool has_max_deviation,
                                 double max_deviation,
                                 const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     AutoFitSummary summary;
     if (!model.loaded()) {
         return summary;
@@ -413,7 +681,7 @@ AutoFitSummary auto_fit_splines(CadModel& model,
 bool decompose_solid_by_planar_faces(CadModel& model,
                                      const std::string& id,
                                      const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     TopoDS_Solid solid;
     std::size_t index = 0;
     if (!find_solid_by_id(model, id, &solid, &index)) {
@@ -490,7 +758,7 @@ bool decompose_solid_by_face(CadModel& model,
                              const std::string& solid_id_str,
                              const std::string& face_id_str,
                              const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     DecompositionTarget target;
     if (!find_decomposition_target(model, solid_id_str, &target)) {
         model.diagnostics.push_back({
@@ -636,7 +904,7 @@ bool decompose_solid_by_plane(CadModel& model,
                               const Vec3& origin,
                               const Vec3& normal,
                               const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     DecompositionTarget target;
     if (!find_decomposition_target(model, solid_id_str, &target)) {
         model.diagnostics.push_back({
@@ -738,7 +1006,7 @@ bool decompose_solid_by_planes(CadModel& model,
                                const std::string& solid_id_str,
                                const std::vector<PlaneSpec>& planes,
                                const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     DecompositionTarget target;
     if (!find_decomposition_target(model, solid_id_str, &target)) {
         model.diagnostics.push_back({
@@ -977,7 +1245,7 @@ DecompositionProposal propose_decomposition_candidates_impl(
     bool longest_bbox_axis_only,
     bool include_multi_bbox_fallback,
     bool lazy_first_usable) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     DecompositionProposal proposal;
     proposal.target_id = solid_id_str;
 
@@ -1410,7 +1678,7 @@ bool decomposition_target_exact_csg_supported(const CadModel& model,
                                              const std::string& solid_id_str,
                                              const ConversionOptions& options,
                                              bool* found_out) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
 
     if (found_out) {
         *found_out = false;
@@ -1478,6 +1746,13 @@ std::string add_synthetic_sphere(CadModel& model,
     body.kind = SyntheticBodyKind::sphere;
     body.center = center;
     body.radius = radius;
+    body.bbox.valid = true;
+    body.bbox.xmin = center.x - radius;
+    body.bbox.ymin = center.y - radius;
+    body.bbox.zmin = center.z - radius;
+    body.bbox.xmax = center.x + radius;
+    body.bbox.ymax = center.y + radius;
+    body.bbox.zmax = center.z + radius;
     body.material_id = material_id;
     body.density = density;
     model.synthetic_bodies.push_back(body);
@@ -1527,6 +1802,15 @@ std::string add_synthetic_cone(CadModel& model,
     body.height = height;
     body.radius = base_radius;
     body.top_radius = top_radius;
+    const Vec3 top = add(base, height);
+    const double r = std::max(base_radius, top_radius);
+    body.bbox.valid = true;
+    body.bbox.xmin = std::min(base.x, top.x) - r;
+    body.bbox.ymin = std::min(base.y, top.y) - r;
+    body.bbox.zmin = std::min(base.z, top.z) - r;
+    body.bbox.xmax = std::max(base.x, top.x) + r;
+    body.bbox.ymax = std::max(base.y, top.y) + r;
+    body.bbox.zmax = std::max(base.z, top.z) + r;
     body.material_id = material_id;
     body.density = density;
     model.synthetic_bodies.push_back(body);
@@ -1539,7 +1823,7 @@ std::string add_synthetic_union(CadModel& model,
                                 int material_id,
                                 double density,
                                 const std::string& label) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     SyntheticBody body;
     body.id = next_synthetic_id(model);
     body.label = label.empty() ? body.id + "/union" : label;
@@ -1564,7 +1848,7 @@ std::string add_synthetic_intersection(CadModel& model,
                                        int material_id,
                                        double density,
                                        const std::string& label) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     SyntheticBody body;
     body.id = next_synthetic_id(model);
     body.label = label.empty() ? body.id + "/intersection" : label;
@@ -1589,7 +1873,7 @@ std::string add_synthetic_difference(CadModel& model,
                                      int material_id,
                                      double density,
                                      const std::string& label) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     SyntheticBody body;
     body.id = next_synthetic_id(model);
     body.label = label.empty() ? body.id + "/difference" : label;
@@ -1703,7 +1987,7 @@ ReplacementCheck check_replacement_limits(const CadModel& model,
 bool replace_solid_with_bbox(CadModel& model,
                              const std::string& id,
                              const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     TopoDS_Solid solid;
     std::size_t index = 0;
     if (!find_solid_by_id(model, id, &solid, &index)) {
@@ -1736,7 +2020,7 @@ bool replace_solid_with_bbox(CadModel& model,
 bool replace_solid_with_bbox_cylinder(CadModel& model,
                                       const std::string& id,
                                       const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     TopoDS_Solid solid;
     std::size_t index = 0;
     if (!find_solid_by_id(model, id, &solid, &index)) {
@@ -1825,7 +2109,7 @@ bool replace_solid_with_bbox_cylinder(CadModel& model,
 bool replace_solid_with_fitted_cylinder(CadModel& model,
                                         const std::string& id,
                                         const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     TopoDS_Solid solid;
     std::size_t index = 0;
     if (!find_solid_by_id(model, id, &solid, &index)) {
@@ -1876,7 +2160,7 @@ bool replace_solid_with_fitted_cylinder(CadModel& model,
 bool replace_solid_with_fitted_sphere(CadModel& model,
                                       const std::string& id,
                                       const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     TopoDS_Solid solid;
     std::size_t index = 0;
     if (!find_solid_by_id(model, id, &solid, &index)) {
@@ -1927,7 +2211,7 @@ bool replace_solid_with_fitted_sphere(CadModel& model,
 bool replace_solid_with_fitted_cone(CadModel& model,
                                     const std::string& id,
                                     const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     TopoDS_Solid solid;
     std::size_t index = 0;
     if (!find_solid_by_id(model, id, &solid, &index)) {
@@ -2015,4 +2299,4 @@ bool apply_checked_replacement_operation(CadModel& model,
     return apply_replacement_operation(model, solid_id, operation, options);
 }
 
-} // namespace cad2csg
+} // namespace csgify

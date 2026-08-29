@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Smoke test for `cad2csg simplify ... --out-step ...` (pass 1). Runs a
+# Smoke test for `csgify simplify ... --out-step ...` (pass 1). Runs a
 # bbox simplification on box.step, asserts the resulting .step file
-# loads back through cad2csg and contains the expected solid.
+# loads back through csgify and contains the expected solid.
 set -u
 
 exe="$1"
@@ -74,5 +74,30 @@ grep -q "piece:1" "$decomp_dump" \
     || fail "decomposed STEP did not preserve piece:1 name"
 grep -q "piece:2" "$decomp_dump" \
     || fail "decomposed STEP did not preserve piece:2 name"
+
+# Fully auto-fitted spline primitives should not leak their original
+# B-spline faces into the review STEP.
+spline_step="$outdir/spline_auto_fit.step"
+spline_report="$outdir/spline_auto_fit.json"
+spline_reimport="$outdir/spline_auto_fit_reimport.json"
+"$exe" preprocess "$fixtures/spline_face.step" \
+    --safe-all --max-deviation 1e-6 \
+    --out-step "$spline_step" --report "$spline_report" >/dev/null 2>&1 \
+    || fail "preprocess --safe-all did not export spline auto-fit STEP"
+"$exe" inspect "$spline_step" --report "$spline_reimport" >/dev/null 2>&1 \
+    || fail "could not re-import spline auto-fit STEP"
+python3 - "$spline_reimport" <<'PY'
+import json
+import sys
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    report = json.load(handle)
+splines = [f for f in report["faces"]
+           if f["surface_type"] in ("bspline", "bezier")]
+assert not splines, splines
+assert report["summary"]["spline_faces"] == 0, report["summary"]
+PY
+if [ "$?" -ne 0 ]; then
+    fail "spline auto-fit STEP still contains spline faces"
+fi
 
 echo "step_export_smoke: ok"

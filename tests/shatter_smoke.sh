@@ -5,7 +5,7 @@
 #   - a non-convex L-shape that fails single-cell convex validation gets
 #     subdivided into simple pieces and fully converts, volume preserved;
 #   - the decision log records a `shatter` op that compacts into a Lua recipe
-#     and replays (via `cad2csg lua`) to a byte-identical deck;
+#     and replays (via `csgify lua`) to a byte-identical deck;
 #   - a JSON `replay` recipe carrying a shatter op reproduces the same deck;
 #   - shatter on an already-convex solid is a no-op (solid:N preserved).
 set -u
@@ -25,6 +25,7 @@ step="$fixtures/l_shape.step"
 mcnp="$outdir/shatter.i"
 report="$outdir/shatter.json"
 log="$outdir/shatter_decisions.json"
+rm -f "$log"
 
 # --- 1. shatter the non-convex L-shape ------------------------------------
 "$exe" simplify "$step" --shatter solid:1 --out "$mcnp" \
@@ -137,7 +138,7 @@ if "$exe" shatter "$step" --out "$outdir/none.i" >/dev/null 2>&1; then
     fail "shatter without --all/--target should have failed"
 fi
 
-# --- 2. compact -> Lua recipe -> replay via `cad2csg lua` -----------------
+# --- 2. compact -> Lua recipe -> replay via `csgify lua` -----------------
 recipe="$outdir/recipe.lua"
 "$exe" compact "$log" --out "$recipe" >/dev/null 2>&1 \
     || fail "compact returned non-zero"
@@ -148,7 +149,7 @@ grep -q "s:shatter(" "$recipe" \
 lua_mcnp="$outdir/shatter_lua.i"
 sed "s#$mcnp#$lua_mcnp#" "$recipe" > "$outdir/recipe_run.lua"
 "$exe" lua "$outdir/recipe_run.lua" >/dev/null 2>&1 \
-    || fail "cad2csg lua recipe returned non-zero"
+    || fail "csgify lua recipe returned non-zero"
 diff "$mcnp" "$lua_mcnp" >/dev/null 2>&1 \
     || fail "lua replay deck differs from direct shatter deck"
 
@@ -158,7 +159,7 @@ json_mcnp="$outdir/shatter_replay.i"
 json_report="$outdir/shatter_replay.json"
 cat > "$json_recipe" <<EOF
 {
-  "manifest": {"step_path":"$step","step_digest":"","cad2csg_version":"unversioned","occt_version":"8.0.0"},
+  "manifest": {"step_path":"$step","step_digest":"","csgify_version":"unversioned","occt_version":"8.0.0"},
   "ops": [
     {"op":"load_step","target":{"kind":"document","shape_id":"doc:1","component_entry":""},"params":{"step_path":"$step"}},
     {"op":"shatter","target":{"kind":"solid","shape_id":"solid:1","component_entry":"0:1:1:1","fingerprint":{"volume":750.0,"surface_area":550.0,"bbox_diagonal":17.32,"face_count":8,"centroid":[4.1667,4.1667,5.0]}},"params":{"max_depth":4,"allow_volume_drift":false}},

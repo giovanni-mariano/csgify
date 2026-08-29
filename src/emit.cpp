@@ -2,8 +2,9 @@
 // surfaces, halfspace nodes, and cells. Refuses geometry that isn't ready
 // (non-convex without decomposition, splines without replacement, etc.).
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
+#include "alea_backend.hpp"
 #include "analytic_surface.hpp"
 #include "decompose.hpp"
 #include "engine_internal.hpp"
@@ -32,16 +33,17 @@
 
 #include <alea.h>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
-using namespace cad2csg::detail;
+using namespace csgify::detail;
 
 bool add_face_halfspace(alea_system_t* sys,
                         const TopoDS_Face& face,
                         const gp_Pnt& interior_point,
                         std::size_t solid_index,
                         std::size_t face_index,
+                        const ConversionOptions& options,
                         ConversionReport& report,
                         alea_node_id_t* node_out,
                         const std::vector<FaceReplacement>* replacements = nullptr) {
@@ -111,8 +113,8 @@ bool add_face_halfspace(alea_system_t* sys,
         return false;
     }
 
-    const double value = surface.value_at(interior_point);
-    const int sense = value <= kEps ? -1 : 1;
+    const double distance = surface.signed_distance_at(interior_point);
+    const int sense = distance <= options.linear_tolerance ? -1 : 1;
     const alea_node_id_t node = alea_halfspace(sys, surface_index, sense);
     if (node == ALEA_NODE_ID_INVALID) {
         add_diag(report, DiagnosticSeverity::error, "alea_halfspace_failed",
@@ -189,7 +191,7 @@ bool convert_solid(alea_system_t* sys,
         ++face_index;
         alea_node_id_t node = ALEA_NODE_ID_INVALID;
         if (!add_face_halfspace(sys, TopoDS::Face(face_exp.Current()), interior_point,
-                                solid_index, face_index, report, &node,
+                                solid_index, face_index, options, report, &node,
                                 replacements)) {
             return false;
         }
@@ -243,6 +245,7 @@ alea_node_id_t build_piece_intersection_node(
         const TopoDS_Solid& solid,
         const gp_Pnt& interior_point,
         std::size_t solid_index,
+        const ConversionOptions& options,
         ConversionReport& report,
         const std::vector<FaceReplacement>* replacements) {
     std::vector<alea_node_id_t> nodes;
@@ -251,7 +254,8 @@ alea_node_id_t build_piece_intersection_node(
         ++face_index;
         alea_node_id_t node = ALEA_NODE_ID_INVALID;
         if (!add_face_halfspace(sys, TopoDS::Face(face_exp.Current()), interior_point,
-                                solid_index, face_index, report, &node, replacements)) {
+                                solid_index, face_index, options, report, &node,
+                                replacements)) {
             return ALEA_NODE_ID_INVALID;
         }
         nodes.push_back(node);
@@ -563,7 +567,8 @@ void emit_decomposed_pieces(alea_system_t* sys,
                 break;
             }
             const alea_node_id_t node = build_piece_intersection_node(
-                sys, piece->solid, interior, 100000, scratch, &model.face_replacements);
+                sys, piece->solid, interior, 100000, options, scratch,
+                &model.face_replacements);
             if (node == ALEA_NODE_ID_INVALID) {
                 all_simple = false;
                 break;
@@ -607,7 +612,7 @@ void emit_decomposed_pieces(alea_system_t* sys,
 
 ConversionResult convert_model(const CadModel& model,
                                const ConversionOptions& options) {
-    using namespace cad2csg::detail;
+    using namespace csgify::detail;
     ConversionResult result;
     result.report.diagnostics = model.diagnostics;
     if (model.root.IsNull()) {
@@ -645,13 +650,12 @@ ConversionResult convert_model(const CadModel& model,
     }
 
     if (result.report.solids_converted > 0) {
-        if (options.split_union_cells) {
-            alea_split_union_cells(result.system.get());
-        }
-        alea_flatten_all_cells(result.system.get(), nullptr);
-        if (alea_build_universe_index(result.system.get()) != 0) {
-            add_diag(result.report, DiagnosticSeverity::error, "alea_index_failed",
-                     alea_error()[0] ? alea_error() : "Alea failed to build the universe index.");
+        std::string finalize_error;
+        if (!finalize_alea_system(result.system.get(),
+                                  options.split_union_cells,
+                                  &finalize_error)) {
+            add_diag(result.report, DiagnosticSeverity::error, "alea_finalize_failed",
+                     finalize_error);
         }
     }
 
@@ -664,4 +668,4 @@ ConversionResult convert_step_file(const std::string& step_path,
     return convert_model(model, options);
 }
 
-} // namespace cad2csg
+} // namespace csgify

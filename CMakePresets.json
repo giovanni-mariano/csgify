@@ -8,7 +8,7 @@
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_PREFIX_PATH": "/home/giovanni/OCCT-8_0_0-install",
-        "CAD2CSG_LIBALEA_ROOT": "${sourceDir}/../libalea"
+        "CSGIFY_LIBALEA_ROOT": "${sourceDir}/../libalea"
       }
     }
   ],

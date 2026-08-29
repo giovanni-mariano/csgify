@@ -1,11 +1,11 @@
 #pragma once
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
 #include <cstddef>
 #include <string>
 
-namespace cad2csg {
+namespace csgify {
 
 struct CadModel;
 
@@ -28,4 +28,4 @@ DecisionPackResult write_decision_packs(const ConversionReport& report,
                                         const CadModel& model,
                                         const DecisionPackOptions& options);
 
-} // namespace cad2csg
+} // namespace csgify

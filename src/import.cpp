@@ -37,7 +37,7 @@
 #include <XCAFDoc_LengthUnit.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 void add_diag(ConversionReport& report,
@@ -475,4 +475,4 @@ CadModel load_step_model(const std::string& step_path,
     return model;
 }
 
-} // namespace cad2csg
+} // namespace csgify

@@ -4,7 +4,7 @@
 // OCCT's BOPAlgo_Splitter. Used both as an automatic fallback by the emit
 // stage and as an explicit user-driven cleanup command.
 
-#include "cad2csg/engine.hpp"
+#include "csgify/engine.hpp"
 
 #include <vector>
 
@@ -12,7 +12,7 @@
 #include <TopoDS_Solid.hxx>
 #include <gp_Pln.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 
 double solid_box_span(const TopoDS_Solid& solid);
 
@@ -70,4 +70,4 @@ std::vector<TopoDS_Solid> split_solid_by_planes(const TopoDS_Solid& solid,
                                                 std::size_t solid_index,
                                                 const std::string& label);
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

@@ -9,14 +9,14 @@
 // - parses log JSON written by DecisionLog
 // - drops failed records, supersedes earlier ops on the same target,
 //   skips ops on solids that were later removed
-// - emits a Lua script that calls the existing cad2csg.session() API
+// - emits a Lua script that calls the existing csgify.session() API
 //
 // Geometric fingerprints, soft-match replay against revised STEP, and
 // content-addressed record IDs are deferred to step 3.
 
 #include <string>
 
-namespace cad2csg {
+namespace csgify {
 
 struct CompactRecipeOptions {
     bool include_provenance_header = true;
@@ -29,4 +29,4 @@ int compact_log_to_recipe(const std::string& log_path,
                           const std::string& recipe_path,
                           const CompactRecipeOptions& options = {});
 
-} // namespace cad2csg
+} // namespace csgify

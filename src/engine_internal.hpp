@@ -1,7 +1,7 @@
 #pragma once
 
 // Engine-internal helpers shared across analyze / cleanup / emit stages.
-// Not part of the public API. All under cad2csg::detail.
+// Not part of the public API. All under csgify::detail.
 
 #include "engine_model.hpp"
 
@@ -14,7 +14,7 @@
 #include <TopoDS_Solid.hxx>
 #include <gp_Pnt.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 
 constexpr double kEps = 1.0e-14;
 
@@ -108,7 +108,8 @@ void detect_solid_overlaps(CadModel& model,
 // shape for boolean synthetic bodies (union/intersection/difference)
 // since those require recursive BRepAlgoAPI_* and are out of scope
 // for the geometric tests that call this. Lives in src/step_export.cpp.
-TopoDS_Shape build_synthetic_shape(const SyntheticBody& body);
+TopoDS_Shape build_synthetic_shape(const CadModel& model,
+                                   const SyntheticBody& body);
 
 // Post-mutation overlap check. Walks synthetic bodies added since
 // document.synthetic_body_high_water (and decomposed pieces since
@@ -129,4 +130,4 @@ void detect_mutation_overlaps(
     std::size_t* decomposed_piece_high_water,
     std::vector<std::pair<std::string, std::string>>* known_overlap_pairs);
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

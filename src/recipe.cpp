@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 namespace {
 
 // JSON parsing helpers live in src/json_parser.hpp so the replay
@@ -147,7 +147,7 @@ Decision read_record(const JsonValue& obj) {
 struct Manifest {
     std::string step_path;
     std::string step_digest;
-    std::string cad2csg_version;
+    std::string csgify_version;
     std::string occt_version;
     std::string created_at;
 };
@@ -191,7 +191,7 @@ std::vector<Decision> compact(const std::vector<Decision>& records) {
         if (undone.count(d.seq)) continue;
         // export_step writes the simplified STEP, a side-output rather than a
         // step in the MCNP conversion pipeline. The recipe pins no STEP output
-        // path; `cad2csg replay --out-step` is the knob for that. Dropping it
+        // path; `csgify replay --out-step` is the knob for that. Dropping it
         // keeps recipe.lua, recipe.json, and replay free of an op none of them
         // can act on.
         if (d.op == "export_step") continue;
@@ -437,10 +437,29 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
             return false;
         }
         emit_comment(out, d);
-        out << "s:" << method << "(" << quoted_id << ")\n";
-        // TODO(step 3): emit a ReplacementLimits Lua table when
-        // has_max_*_delta is true so checked replacements can carry
-        // their guards into replay.
+        out << "s:" << method << "(" << quoted_id;
+        if (d.op == "apply_checked_replacement_operation") {
+            bool wrote = false;
+            auto has_abs = d.params.find("has_max_abs_delta");
+            auto max_abs = d.params.find("max_abs_delta");
+            auto has_rel = d.params.find("has_max_rel_delta");
+            auto max_rel = d.params.find("max_rel_delta");
+            out << ", {";
+            if (has_abs != d.params.end() && has_abs->second->as_bool()
+                && max_abs != d.params.end()) {
+                out << "max_abs_delta = "
+                    << format_double(max_abs->second->as_number());
+                wrote = true;
+            }
+            if (has_rel != d.params.end() && has_rel->second->as_bool()
+                && max_rel != d.params.end()) {
+                if (wrote) out << ", ";
+                out << "max_rel_delta = "
+                    << format_double(max_rel->second->as_number());
+            }
+            out << "}";
+        }
+        out << ")\n";
         return true;
     }
     std::cerr << "recipe: unknown solid op " << d.op << "\n";
@@ -616,7 +635,7 @@ bool emit_recipe_json(std::ostream& out,
     out << "  \"manifest\": {";
     out << "\"step_path\":";       emit_json_string(out, manifest.step_path);
     out << ",\"step_digest\":";    emit_json_string(out, manifest.step_digest);
-    out << ",\"cad2csg_version\":";emit_json_string(out, manifest.cad2csg_version);
+    out << ",\"csgify_version\":";emit_json_string(out, manifest.csgify_version);
     out << ",\"occt_version\":";   emit_json_string(out, manifest.occt_version);
     out << "},\n";
     out << "  \"ops\": [\n";
@@ -635,17 +654,17 @@ bool emit_recipe(std::ostream& out,
                  const std::vector<Decision>& ops,
                  const CompactRecipeOptions& options) {
     if (options.include_provenance_header) {
-        out << "-- cad2csg recipe (compacted)\n";
+        out << "-- csgify recipe (compacted)\n";
         out << "-- step_path:        " << manifest.step_path << "\n";
         if (!manifest.step_digest.empty()) {
             out << "-- step_digest:      " << manifest.step_digest << "\n";
         }
-        out << "-- cad2csg_version:  " << manifest.cad2csg_version << "\n";
+        out << "-- csgify_version:  " << manifest.csgify_version << "\n";
         out << "-- occt_version:     " << manifest.occt_version << "\n";
         out << "-- generated_from:   decision log\n";
         out << "\n";
     }
-    out << "local s = cad2csg.session()\n";
+    out << "local s = csgify.session()\n";
     const std::string doc_var = "doc1";
     bool ok = true;
     for (const Decision& d : ops) {
@@ -667,32 +686,66 @@ bool emit_recipe(std::ostream& out,
     return ok;
 }
 
+std::vector<std::shared_ptr<JsonValue>> load_decision_log_entries(
+    const std::string& log_path) {
+    try {
+        std::shared_ptr<JsonValue> root = load_json_file(log_path);
+        if (root && root->kind == JsonKind::array) {
+            return root->arr;
+        }
+    } catch (const std::exception&) {
+        // Fall through to newline-delimited JSON. This keeps compacting
+        // old array logs and new crash-tolerant logs with one code path.
+    }
+
+    std::ifstream in(log_path);
+    if (!in) {
+        throw std::runtime_error("could not open " + log_path);
+    }
+    std::vector<std::shared_ptr<JsonValue>> entries;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::size_t first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        if (line[first] != '{') continue;
+        std::size_t last = line.find_last_not_of(" \t\r\n");
+        if (last != std::string::npos && line[last] == ',') {
+            line.erase(last);
+        }
+        std::shared_ptr<JsonValue> value = JsonParser(line).parse();
+        if (value && value->kind == JsonKind::object) {
+            entries.push_back(value);
+        }
+    }
+    return entries;
+}
+
 } // namespace
 
 int compact_log_to_recipe(const std::string& log_path,
                           const std::string& recipe_path,
                           const CompactRecipeOptions& options) {
-    std::shared_ptr<JsonValue> root;
+    std::vector<std::shared_ptr<JsonValue>> entries;
     try {
-        root = load_json_file(log_path);
+        entries = load_decision_log_entries(log_path);
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         return 1;
     }
-    if (!root || root->kind != JsonKind::array || root->arr.empty()) {
-        std::cerr << "error: decision log is not a non-empty JSON array\n";
+    if (entries.empty()) {
+        std::cerr << "error: decision log is empty or invalid\n";
         return 1;
     }
 
     Manifest manifest;
     std::vector<Decision> records;
-    for (const auto& entry : root->arr) {
+    for (const auto& entry : entries) {
         if (!entry || entry->kind != JsonKind::object) continue;
         const std::string kind = entry->get("kind") ? entry->get("kind")->as_string() : "";
         if (kind == "manifest") {
             if (const JsonValue* v = entry->get("step_path"))       manifest.step_path = v->as_string();
             if (const JsonValue* v = entry->get("step_digest"))     manifest.step_digest = v->as_string();
-            if (const JsonValue* v = entry->get("cad2csg_version")) manifest.cad2csg_version = v->as_string();
+            if (const JsonValue* v = entry->get("csgify_version")) manifest.csgify_version = v->as_string();
             if (const JsonValue* v = entry->get("occt_version"))    manifest.occt_version = v->as_string();
             if (const JsonValue* v = entry->get("created_at"))      manifest.created_at = v->as_string();
             continue;
@@ -731,4 +784,4 @@ int compact_log_to_recipe(const std::string& log_path,
     return ok ? 0 : 1;
 }
 
-} // namespace cad2csg
+} // namespace csgify

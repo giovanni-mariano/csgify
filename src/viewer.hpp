@@ -1,15 +1,15 @@
 #pragma once
 
-#if CAD2CSG_HAVE_TKOPENGL
+#if CSGIFY_HAVE_TKOPENGL
 
-#include "cad2csg/engine.hpp"
-#include "cad2csg/session.hpp"
+#include "csgify/engine.hpp"
+#include "csgify/session.hpp"
 #include "viewer_controller.hpp"  // ViewerReviewContext, ViewerController
 
 #include <string>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 
 // Run the interactive 3D AIS/V3d viewer on the current session state.
 //
@@ -55,6 +55,6 @@ int run_viewer_command(Session& session,
                        const ViewerReviewContext& review = {},
                        const std::string& commit_out_path = {});
 
-} // namespace cad2csg
+} // namespace csgify
 
-#endif // CAD2CSG_HAVE_TKOPENGL
+#endif // CSGIFY_HAVE_TKOPENGL

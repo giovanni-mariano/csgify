@@ -8,7 +8,7 @@
 #include <BRepAdaptor_Surface.hxx>
 #include <gp_Pnt.hxx>
 
-namespace cad2csg::detail {
+namespace csgify::detail {
 namespace {
 
 constexpr double kEps = 1.0e-14;
@@ -676,4 +676,4 @@ SplineFitCandidates fit_spline_face(const TopoDS_Face& face) {
     return out;
 }
 
-} // namespace cad2csg::detail
+} // namespace csgify::detail

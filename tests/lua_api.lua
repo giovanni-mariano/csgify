@@ -9,13 +9,38 @@ local fixtures = arg[1]
 local outdir   = arg[2]
 
 ----------------------------------------------------------------------
+-- Safety options are strict: a misspelled tolerance must not silently use
+-- the default value.
+----------------------------------------------------------------------
+do
+    local ok, err = pcall(function()
+        csgify.session({ linear_tolerence = 1e-3 })
+    end)
+    if ok then fail("unknown conversion option was silently accepted") end
+    if not tostring(err):find("unknown conversion option", 1, true) then
+        fail("unexpected unknown-option error: " .. tostring(err))
+    end
+end
+
+-- Batch approximation must never silently mean "unbounded".
+do
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/spline_face.step")
+    local ok, err = pcall(function() s:auto_fit_splines(doc) end)
+    if ok then fail("auto_fit_splines accepted a missing deviation budget") end
+    if not tostring(err):find("explicit max_deviation", 1, true) then
+        fail("unexpected unbounded auto-fit error: " .. tostring(err))
+    end
+end
+
+----------------------------------------------------------------------
 -- Fix #1: analyze_table on a model with errors must NOT return nil.
 -- Before the fix, any spline / non-convex / missing-emitter STEP
 -- caused the documented `if not report then error(err) end` pattern
 -- to fail.
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/spline_face.step")
     local report, err = s:analyze_table(doc)
     if not report then
@@ -35,7 +60,7 @@ end
 -- have spline errors.
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/spline_face.step")
     local report, err = s:replace_face_with_fit(doc .. "/face:1.1",
                                                   "cylinder", 1e-6)
@@ -52,7 +77,7 @@ end
 -- Fix #2: attach_decision_log opens a log; subsequent ops record.
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local log_path = outdir .. "/lua_api_decisions.json"
     -- Ensure stale logs are gone before this run.
     os.remove(log_path)
@@ -77,12 +102,12 @@ do
 end
 
 ----------------------------------------------------------------------
--- Fix #3: cad2csg.session({ ... }) and s:load_step(path, { ... })
+-- Fix #3: csgify.session({ ... }) and s:load_step(path, { ... })
 -- accept ConversionOptions tables.
 ----------------------------------------------------------------------
 do
     -- Session-level options (units assertion only; no rescale).
-    local s = cad2csg.session({ units = "in" })
+    local s = csgify.session({ units = "in" })
     local doc = s:load_step(fixtures .. "/box.step")
     local report = s:analyze_table(doc)
     if report.units.length_unit ~= "in" then
@@ -94,7 +119,7 @@ end
 do
     -- Per-load options override session defaults; also exercise the
     -- M2 normalize_units path (rescales geometry).
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/box.step",
                             { normalize_units = "cm" })
     local report = s:analyze_table(doc)
@@ -114,7 +139,7 @@ end
 -- replacement_candidates / decomposed_pieces blocks.
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/box.step")
     local report = s:analyze_table(doc)
     if type(report.units) ~= "table"
@@ -147,7 +172,7 @@ end
 -- Fix #5: every mutating op returns a table (not a JSON string).
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/four_solids.step")
     local r = s:remove_solid(doc .. "/solid:2")
     if type(r) ~= "table" then
@@ -159,11 +184,58 @@ do
 end
 
 ----------------------------------------------------------------------
+-- Review fix: removed solids are no longer valid mutation targets.
+----------------------------------------------------------------------
+do
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/box.step")
+    local removed = s:remove_solid(doc .. "/solid:1")
+    if not removed then fail("initial remove_solid failed") end
+    local replaced = s:replace_solid_with_bbox(doc .. "/solid:1")
+    if replaced then
+        fail("replace_solid_with_bbox succeeded on an already removed solid")
+    end
+    local report = s:analyze_table(doc)
+    if report.solids_seen ~= 0 then
+        fail("removed solid reappeared in analysis")
+    end
+end
+
+----------------------------------------------------------------------
+-- Review fix: scoped reports must scope edge/reference ids too.
+----------------------------------------------------------------------
+do
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/overlapping_boxes.step")
+    local report = s:analyze_table(doc)
+    local overlap = report.overlaps[1]
+    if not overlap then fail("expected overlap in overlapping_boxes.step") end
+    if overlap.solid_a_id ~= doc .. "/solid:1"
+       or overlap.solid_b_id ~= doc .. "/solid:2" then
+        fail("overlap ids were not document-scoped")
+    end
+end
+
+do
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/spline_face.step")
+    local report = s:analyze_table(doc)
+    local request = report.decision_requests[1]
+    if not request then fail("expected spline decision request") end
+    if not request.target_id:find("^" .. doc .. "/") then
+        fail("decision request target_id was not document-scoped")
+    end
+    if not request.id:find(doc .. "/", 1, true) then
+        fail("decision request id did not carry scoped target identity")
+    end
+end
+
+----------------------------------------------------------------------
 -- Fix #8: checked replace_solid returns a `check` sub-table with
 -- metrics, so callers can inspect the volume guard outcome directly.
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/four_solids.step")
     -- Tight rel-delta to ensure the check is consulted but still passes
     -- (the box -> bbox replacement is a no-op delta on an axis-aligned box).
@@ -185,7 +257,7 @@ end
 -- Fix #9: export_step writes a STEP file.
 ----------------------------------------------------------------------
 do
-    local s = cad2csg.session()
+    local s = csgify.session()
     local doc = s:load_step(fixtures .. "/four_solids.step")
     s:remove_solid(doc .. "/solid:2")  -- mutate first to exercise the path
     local step_path = outdir .. "/lua_api_export.step"

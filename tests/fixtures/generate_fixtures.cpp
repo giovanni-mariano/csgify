@@ -1,4 +1,4 @@
-// Build canned STEP fixtures for the cad2csg contract tests.
+// Build canned STEP fixtures for the csgify contract tests.
 //
 // Run once after a clean OCCT install; the produced .step files are committed
 // alongside the source, so this binary is a developer tool, not a test
@@ -88,7 +88,7 @@ TopoDS_Shape make_l_shape() {
 }
 
 // A cylinder solid whose every face has been converted to a B-spline surface
-// via OCCT's NurbsConvert. The geometry is unchanged; the cad2csg spline-fit
+// via OCCT's NurbsConvert. The geometry is unchanged; the csgify spline-fit
 // pass should classify the curved face as cylinder with near-zero deviation.
 TopoDS_Shape make_nurbs_cylinder() {
     TopoDS_Shape cyl = BRepPrimAPI_MakeCylinder(2.0, 4.0).Shape();
@@ -97,7 +97,7 @@ TopoDS_Shape make_nurbs_cylinder() {
 }
 
 // A truncated cone solid with all faces NurbsConvert'ed. The curved face
-// should fit cad2csg's cone candidate to near-machine precision.
+// should fit csgify's cone candidate to near-machine precision.
 TopoDS_Shape make_nurbs_cone() {
     TopoDS_Shape cone = BRepPrimAPI_MakeCone(2.0, 1.0, 4.0).Shape();
     BRepBuilderAPI_NurbsConvert convert(cone, true);
@@ -105,7 +105,7 @@ TopoDS_Shape make_nurbs_cone() {
 }
 
 // A solid torus whose axis is along (1,1,1)/sqrt(3) — explicitly not aligned
-// with any global axis. cad2csg's analyze pass must classify this with
+// with any global axis. csgify's analyze pass must classify this with
 // `unsupported_torus_orientation`. The surface-splitting workflow targets
 // exactly this kind of geometry.
 TopoDS_Shape make_tilted_torus() {
@@ -163,7 +163,7 @@ TopoDS_Shape make_l_with_inner_box() {
     return compound;
 }
 
-// Two boxes that physically overlap. Used to test that cad2csg
+// Two boxes that physically overlap. Used to test that csgify
 // detects (or reports) interpenetrating solids -- a modeling error
 // for MCNP, since two cells cannot claim the same point.
 TopoDS_Shape make_overlapping_boxes() {

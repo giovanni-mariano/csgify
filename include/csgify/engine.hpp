@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-namespace cad2csg {
+namespace csgify {
 
 const char* occt_version();
 
@@ -461,13 +461,14 @@ struct ConversionOptions {
     // is cut by the bounded cutter of every one of its own faces until each
     // piece lies on one definite side of every surface. `shatter_max_depth`
     // bounds the recursion that re-feeds any piece still failing convex
-    // validation. `allow_shatter_volume_drift` lets the op proceed when the
-    // summed piece volume drifts past linear_tolerance (default: refuse, to
-    // keep conversion exact -- see docs/PHILOSOPHY.md). When
+    // validation. `shatter_relative_volume_tolerance` is dimensionless and
+    // independently controls the volume-conservation guard;
+    // `allow_shatter_volume_drift` explicitly overrides that guard. When
     // `union_decomposed_pieces` is set, emit groups pieces sharing a
     // source_solid_id into a single Alea union cell instead of one cell per
     // piece; Alea's flatten/dedup then collapses the shared cut surfaces.
     int shatter_max_depth = 8;
+    double shatter_relative_volume_tolerance = 1.0e-7;
     bool allow_shatter_volume_drift = false;
     bool union_decomposed_pieces = false;
     // Overlap detection. Runs during analyze; emits `solid_overlap`
@@ -580,4 +581,4 @@ int write_surface_replacement_proposal_json(
 std::string surface_replacement_proposal_json_string(
     const SurfaceReplacementProposal& proposal);
 
-} // namespace cad2csg
+} // namespace csgify

@@ -20,7 +20,7 @@
 #include <alea.h>
 #include <alea_mcnp.h>
 
-namespace cad2csg {
+namespace csgify {
 
 const char* occt_version() {
     return OCC_VERSION_COMPLETE;
@@ -95,4 +95,4 @@ int export_mcnp(alea_system_t* system, const std::string& output_path) {
     return mcnp_export_system(system, output_path.c_str());
 }
 
-} // namespace cad2csg
+} // namespace csgify

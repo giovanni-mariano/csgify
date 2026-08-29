@@ -4,11 +4,11 @@
 // Include only from session.cpp, session_view.cpp, and viewer.cpp.
 // Not installed as part of the public API.
 
-#include "cad2csg/session.hpp"
+#include "csgify/session.hpp"
 #include "decision_log.hpp"
 #include "engine_model.hpp"
 
-namespace cad2csg {
+namespace csgify {
 
 struct CadDocument {
     DocumentId id;
@@ -47,4 +47,4 @@ struct Session {
     std::unique_ptr<DecisionLog> log;
 };
 
-} // namespace cad2csg
+} // namespace csgify

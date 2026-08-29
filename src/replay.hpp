@@ -16,7 +16,7 @@
 
 #include <string>
 
-namespace cad2csg {
+namespace csgify {
 
 struct ReplayOptions {
     // Relative tolerance applied to volume, surface area, and bbox
@@ -39,4 +39,4 @@ int replay_recipe(const std::string& recipe_json_path,
                   const std::string& step_output_path = {},
                   const ReplayOptions& options = {});
 
-} // namespace cad2csg
+} // namespace csgify
