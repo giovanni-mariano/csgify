@@ -50,6 +50,34 @@ std::string next_decomposed_piece_id(const CadModel& model) {
     return "piece:" + std::to_string(model.decomposed_pieces.size() + 1);
 }
 
+bool decomposition_volume_guard(CadModel& model,
+                                const std::string& shape_id,
+                                double relative_delta,
+                                const ConversionOptions& options) {
+    if (!std::isfinite(options.decomposition_relative_volume_tolerance)
+        || options.decomposition_relative_volume_tolerance < 0.0) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "invalid_decomposition_volume_tolerance",
+            "decomposition_relative_volume_tolerance must be finite and non-negative.",
+            shape_id});
+        return false;
+    }
+    if (relative_delta > options.decomposition_relative_volume_tolerance) {
+        std::ostringstream message;
+        message << "Split relative volume delta " << std::setprecision(17)
+                << relative_delta << " exceeds decomposition tolerance "
+                << options.decomposition_relative_volume_tolerance << ".";
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "decomposition_volume_drift",
+            message.str(),
+            shape_id});
+        return false;
+    }
+    return true;
+}
+
 bool parse_piece_id(const std::string& id, std::size_t* index_out) {
     constexpr const char* prefix = "piece:";
     const std::size_t prefix_len = 6;
@@ -726,6 +754,10 @@ bool decompose_solid_by_planar_faces(CadModel& model,
         relative_delta = absolute_delta / original_volume;
     }
 
+    if (!decomposition_volume_guard(model, id, relative_delta, options)) {
+        return false;
+    }
+
     std::ostringstream msg;
     msg << "Planar decomposition produced " << pieces.size()
         << " pieces. original_volume=" << std::setprecision(10) << original_volume
@@ -865,6 +897,11 @@ bool decompose_solid_by_face(CadModel& model,
         relative_delta = absolute_delta / original_volume;
     }
 
+    if (!decomposition_volume_guard(model, solid_id_str,
+                                    relative_delta, options)) {
+        return false;
+    }
+
     std::ostringstream msg;
     msg << "Directed face decomposition using " << face_id_str
         << " produced " << pieces.size()
@@ -963,6 +1000,11 @@ bool decompose_solid_by_plane(CadModel& model,
     double relative_delta = 0.0;
     if (original_volume > kEps) {
         relative_delta = absolute_delta / original_volume;
+    }
+
+    if (!decomposition_volume_guard(model, solid_id_str,
+                                    relative_delta, options)) {
+        return false;
     }
 
     std::ostringstream msg;
@@ -1082,6 +1124,11 @@ bool decompose_solid_by_planes(CadModel& model,
     double relative_delta = 0.0;
     if (original_volume > kEps) {
         relative_delta = absolute_delta / original_volume;
+    }
+
+    if (!decomposition_volume_guard(model, solid_id_str,
+                                    relative_delta, options)) {
+        return false;
     }
 
     std::ostringstream msg;

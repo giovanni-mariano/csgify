@@ -53,8 +53,14 @@ python3 - "$outdir/box.json" <<'PY'
 import json
 import sys
 report = json.load(open(sys.argv[1], encoding="utf-8"))
+assert report["schema"] == "csgify.report", report.get("schema")
+assert report["schema_version"] == 1, report.get("schema_version")
+assert report["document_revision"] == 0, report.get("document_revision")
 assert "decision_requests" in report, "report must expose decision_requests"
 assert report["decision_requests"] == [], report["decision_requests"]
+certificate = report["solids"][0]["geometry_certificate"]
+assert certificate["certified"], certificate
+assert certificate["faces_checked"] == certificate["boolean_halfspace_checks"], certificate
 PY
 if [ "$?" -ne 0 ]; then
     fail "box decision_requests contract validation failed"
@@ -76,6 +82,8 @@ import json
 import sys
 
 proposal = json.load(open(sys.argv[1], encoding="utf-8"))
+assert proposal["schema"] == "csgify.decomposition-proposal"
+assert proposal["schema_version"] == 1
 fallbacks = [c for c in proposal["candidates"]
              if c["reason"] == "bbox_axis_fallback"]
 # 3 single-axis + 1 multi-axis multi-tool variant
@@ -401,6 +409,11 @@ assert len(applied) == 3, f"expected 3 face_replacement_recorded; got {len(appli
 materialized = [d for d in report["diagnostics"]
                 if d["code"] == "spline_solid_materialized"]
 assert materialized, "expected fully replaced spline solid to be materialized"
+provenance = [p for p in report["provenance"]
+              if p["operation"] == "replace_face_with_fit"]
+assert len(provenance) == 3, provenance
+assert all(p["has_tolerance_budget"] for p in provenance), provenance
+assert all(p["tolerance_budget"] == 1e-6 for p in provenance), provenance
 PY
 if [ "$?" -ne 0 ]; then
     fail "auto-fit contract validation failed"

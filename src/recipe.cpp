@@ -1,6 +1,7 @@
 #include "recipe.hpp"
 
 #include "json_parser.hpp"
+#include "operation_registry.hpp"
 
 #include <cstdint>
 #include <fstream>
@@ -37,6 +38,7 @@ struct Decision {
     std::size_t seq = 0;
     std::string kind;             // "decision" or "undo"
     std::string op;
+    unsigned operation_version = 1; // legacy unversioned logs mean v1
     std::string result;
     std::string target_kind;      // "solid" | "face" | "document"
     std::string target_shape_id;  // scoped, e.g. "doc:1/solid:5"
@@ -49,32 +51,18 @@ struct Decision {
 // Category groups ops that supersede one another on the same target. A
 // later op of the same category replaces an earlier one in the recipe.
 std::string category_for(const std::string& op) {
-    if (op == "remove_solid") return "solid";
-    if (op == "decompose_planar") return "solid";
-    if (op == "decompose_by_face") return "solid";
-    if (op == "decompose_by_plane") return "solid";
-    if (op == "decompose_by_planes") return "solid";
-    if (op == "shatter") return "solid";
-    if (op == "apply_decomposition_candidate") return "solid";
-    if (op == "apply_replacement_operation") return "solid";
-    if (op == "apply_checked_replacement_operation") return "solid";
-    if (op.rfind("replace_solid_with_", 0) == 0) return "solid";
-    if (op == "replace_face_with_fit") return "face";
-    if (op == "auto_fit_splines") return "document";
+    if (const OperationDescriptor* descriptor = find_operation(op)) {
+        return descriptor->category;
+    }
     return op;
 }
 
 // Translates the operation enum recorded by apply_replacement_operation
 // back into the specific named method, so the recipe reads naturally.
 const char* replacement_enum_to_method(int operation) {
-    switch (operation) {
-    case 0: return "replace_solid_with_bbox";
-    case 1: return "replace_solid_with_bbox_cylinder";
-    case 2: return "replace_solid_with_fitted_cylinder";
-    case 3: return "replace_solid_with_fitted_sphere";
-    case 4: return "replace_solid_with_fitted_cone";
-    default: return nullptr;
-    }
+    const OperationDescriptor* descriptor = find_replacement(
+        static_cast<ReplacementOperation>(operation));
+    return descriptor ? descriptor->name : nullptr;
 }
 
 const char* spline_fit_kind_to_lua(int kind) {
@@ -111,6 +99,9 @@ Decision read_record(const JsonValue& obj) {
         d.seq = static_cast<std::size_t>(v->as_number());
     }
     if (const JsonValue* v = obj.get("op")) d.op = v->as_string();
+    if (const JsonValue* v = obj.get("operation_version")) {
+        d.operation_version = static_cast<unsigned>(v->as_number());
+    }
     if (const JsonValue* v = obj.get("result")) d.result = v->as_string();
     if (const JsonValue* v = obj.get("undoes_seq")) {
         d.undoes_seq = static_cast<std::size_t>(v->as_number());
@@ -467,6 +458,23 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
 }
 
 bool emit_face_op(std::ostream& out, const Decision& d) {
+    if (d.op == "apply_surface_replacement_candidate") {
+        auto kind_it = d.params.find("kind");
+        auto budget_it = d.params.find("max_deviation_budget");
+        if (kind_it == d.params.end()
+            || kind_it->second->kind != JsonKind::string
+            || budget_it == d.params.end()
+            || budget_it->second->kind != JsonKind::number) {
+            std::cerr << "recipe: missing replay parameters on " << d.op << "\n";
+            return false;
+        }
+        emit_comment(out, d);
+        out << "s:replace_face_with_fit(\"" << lua_escape(d.target_shape_id)
+            << "\", \"" << lua_escape(kind_it->second->as_string())
+            << "\", { max_deviation = "
+            << format_double(budget_it->second->as_number()) << " })\n";
+        return true;
+    }
     if (d.op != "replace_face_with_fit") {
         std::cerr << "recipe: unknown face op " << d.op << "\n";
         return false;
@@ -557,6 +565,10 @@ bool emit_document_op(std::ostream& out, const Decision& d, const std::string& d
         out << ")\n";
         return true;
     }
+    if (d.op == "undo_last_mutation") {
+        out << "s:undo_last_mutation(" << doc_var << ")\n";
+        return true;
+    }
     std::cerr << "recipe: unknown document op " << d.op << "\n";
     return false;
 }
@@ -615,6 +627,9 @@ void emit_target_json(std::ostream& out, const Decision& d) {
 
 void emit_op_json(std::ostream& out, const Decision& d) {
     out << "{\"op\":";  emit_json_string(out, d.op);
+    const OperationDescriptor* descriptor = find_operation(d.op);
+    out << ",\"operation_version\":"
+        << (descriptor ? descriptor->version : 0);
     out << ",";         emit_target_json(out, d);
     out << ",\"params\":{";
     bool first = true;
@@ -632,6 +647,8 @@ bool emit_recipe_json(std::ostream& out,
                       const Manifest& manifest,
                       const std::vector<Decision>& ops) {
     out << "{\n";
+    out << "  \"schema\": \"csgify.recipe\",\n";
+    out << "  \"schema_version\": 1,\n";
     out << "  \"manifest\": {";
     out << "\"step_path\":";       emit_json_string(out, manifest.step_path);
     out << ",\"step_digest\":";    emit_json_string(out, manifest.step_digest);
@@ -743,6 +760,18 @@ int compact_log_to_recipe(const std::string& log_path,
         if (!entry || entry->kind != JsonKind::object) continue;
         const std::string kind = entry->get("kind") ? entry->get("kind")->as_string() : "";
         if (kind == "manifest") {
+            if (const JsonValue* v = entry->get("schema")) {
+                if (v->as_string() != "csgify.decision-log") {
+                    std::cerr << "error: unsupported decision-log schema\n";
+                    return 1;
+                }
+            }
+            if (const JsonValue* v = entry->get("schema_version")) {
+                if (static_cast<int>(v->as_number()) != 1) {
+                    std::cerr << "error: unsupported decision-log schema_version\n";
+                    return 1;
+                }
+            }
             if (const JsonValue* v = entry->get("step_path"))       manifest.step_path = v->as_string();
             if (const JsonValue* v = entry->get("step_digest"))     manifest.step_digest = v->as_string();
             if (const JsonValue* v = entry->get("csgify_version")) manifest.csgify_version = v->as_string();
@@ -754,6 +783,19 @@ int compact_log_to_recipe(const std::string& log_path,
     }
 
     const std::vector<Decision> ops = compact(records);
+    for (const Decision& op : ops) {
+        const OperationDescriptor* descriptor = find_operation(op.op);
+        if (!descriptor) {
+            std::cerr << "error: operation is not present in this csgify "
+                      << "operation registry: " << op.op << "\n";
+            return 1;
+        }
+        if (op.operation_version != descriptor->version) {
+            std::cerr << "error: unsupported operation version for "
+                      << op.op << "\n";
+            return 1;
+        }
+    }
 
     std::ofstream out(recipe_path);
     if (!out) {

@@ -10,6 +10,13 @@
 
 namespace csgify {
 
+struct DocumentRevisionState {
+    CadModel model;
+    std::size_t synthetic_body_high_water = 0;
+    std::size_t decomposed_piece_high_water = 0;
+    std::vector<std::pair<std::string, std::string>> known_overlap_pairs;
+};
+
 struct CadDocument {
     DocumentId id;
     std::string source_path;
@@ -33,6 +40,14 @@ struct CadDocument {
     // explicit analyze() pass (full pairwise scan) and incrementally
     // by the per-mutation check.
     std::vector<std::pair<std::string, std::string>> known_overlap_pairs;
+
+    // `committed_state` is the rollback boundary. CadModel copies retain
+    // OCCT shapes by handle while copying the small mutation/provenance
+    // vectors, making revision snapshots substantially cheaper than a STEP
+    // round trip.
+    DocumentRevisionState committed_state;
+    std::vector<DocumentRevisionState> revision_history;
+    std::size_t revision = 0;
 };
 
 struct Session {

@@ -87,31 +87,30 @@ PY
 # rails.stp sits at coordinates ~1e4. Before cutters were anchored on the
 # target solid, the bounded cutter face was centered on each surface's
 # intrinsic Location and never reached the part, so the split silently failed
-# and the solid stayed residual. This locks in that fix: solid:16 (a
-# cylinder+plane body that was fully residual) must now decompose into convex
-# pieces with no residual.
+# and the solid stayed residual. The Boolean halfspace certificate now detects
+# a residual that the old vertex-only test missed. The safe contract is to
+# reject the entire mutation and preserve the source model.
 rails="$fixtures/rails.stp"
 if [[ -f "$rails" ]]; then
     rails_report="$outdir/rails16.json"
-    "$exe" simplify "$rails" --shatter solid:16 --out "$outdir/rails16.i" \
-        --report "$rails_report" --max-depth 8 >/dev/null 2>&1 \
-        || fail "shatter on rails solid:16 returned non-zero"
+    if "$exe" simplify "$rails" --shatter solid:16 --out "$outdir/rails16.i" \
+        --report "$rails_report" --max-depth 8 >/dev/null 2>&1; then
+        fail "uncertified rails solid:16 shatter unexpectedly succeeded"
+    fi
     python3 - "$rails_report" <<'PY' || exit 1
 import json, sys
 r = json.load(open(sys.argv[1]))
-pieces = r.get("decomposed_pieces", [])
-if len(pieces) < 2:
-    print(f"rails solid:16: expected >=2 pieces, got {len(pieces)}", file=sys.stderr)
-    sys.exit(1)
-nonexact = [p["id"] for p in pieces if not p.get("exact_csg_supported")]
-if nonexact:
-    print(f"rails solid:16: pieces not exact_csg_supported: {nonexact}", file=sys.stderr)
-    sys.exit(1)
 codes = {d.get("code") for d in r.get("diagnostics", [])}
-for bad in ("shatter_residual_nonconvex", "interior_point_not_found"):
-    if bad in codes:
-        print(f"rails solid:16: unexpected {bad}", file=sys.stderr)
+for required in ("shatter_residual_nonconvex", "mutation_rolled_back"):
+    if required not in codes:
+        print(f"rails solid:16: missing {required}", file=sys.stderr)
         sys.exit(1)
+if r.get("document_revision") != 0:
+    print("rails solid:16: rejected shatter advanced revision", file=sys.stderr)
+    sys.exit(1)
+if r.get("decomposed_pieces"):
+    print("rails solid:16: rejected shatter leaked pieces", file=sys.stderr)
+    sys.exit(1)
 PY
 fi
 

@@ -105,6 +105,29 @@ void write_replacement_metrics_json(std::ostream& out,
     out << indent << "}";
 }
 
+void write_geometry_certificate_json(std::ostream& out,
+                                     const GeometryCertificate& certificate,
+                                     const std::string& indent) {
+    out << "{\n";
+    out << indent << "  \"attempted\": "
+        << (certificate.attempted ? "true" : "false") << ",\n";
+    out << indent << "  \"certified\": "
+        << (certificate.certified ? "true" : "false") << ",\n";
+    out << indent << "  \"faces_checked\": "
+        << certificate.faces_checked << ",\n";
+    out << indent << "  \"boolean_halfspace_checks\": "
+        << certificate.boolean_halfspace_checks << ",\n";
+    out << indent << "  \"source_volume\": " << std::setprecision(17)
+        << certificate.source_volume << ",\n";
+    out << indent << "  \"maximum_outside_volume\": "
+        << std::setprecision(17) << certificate.maximum_outside_volume << ",\n";
+    out << indent << "  \"allowed_outside_volume\": "
+        << std::setprecision(17) << certificate.allowed_outside_volume << ",\n";
+    out << indent << "  \"failure_code\": \""
+        << json_escape(certificate.failure_code) << "\"\n";
+    out << indent << "}";
+}
+
 void write_vec3_json(std::ostream& out, Vec3 v) {
     out << "[" << std::setprecision(17) << v.x << ", " << v.y << ", " << v.z << "]";
 }
@@ -378,6 +401,9 @@ std::string diagnostic_shape_id(const Diagnostic& diagnostic) {
 
 void write_report_json_stream(std::ostream& out, const ConversionReport& report) {
     out << "{\n";
+    out << "  \"schema\": \"csgify.report\",\n";
+    out << "  \"schema_version\": " << report.schema_version << ",\n";
+    out << "  \"document_revision\": " << report.document_revision << ",\n";
     out << "  \"ok\": " << (report.ok() ? "true" : "false") << ",\n";
     out << "  \"occt_version\": \"" << json_escape(occt_version()) << "\",\n";
     out << "  \"alea_version\": \"" << json_escape(alea_version()) << "\",\n";
@@ -501,6 +527,9 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
             << (solid.needs_surface_replacement ? "true" : "false") << ",\n";
         out << "      \"needs_user_decision\": "
             << (solid.needs_user_decision ? "true" : "false") << ",\n";
+        out << "      \"geometry_certificate\": ";
+        write_geometry_certificate_json(out, solid.certificate, "      ");
+        out << ",\n";
         out << "      \"faces\": [";
         for (std::size_t j = 0; j < solid.face_ids.size(); ++j) {
             out << "\"" << json_escape(solid.face_ids[j]) << "\"";
@@ -572,7 +601,10 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         out << "      \"needs_surface_replacement\": "
             << (piece.needs_surface_replacement ? "true" : "false") << ",\n";
         out << "      \"needs_user_decision\": "
-            << (piece.needs_user_decision ? "true" : "false") << "\n";
+            << (piece.needs_user_decision ? "true" : "false") << ",\n";
+        out << "      \"geometry_certificate\": ";
+        write_geometry_certificate_json(out, piece.certificate, "      ");
+        out << "\n";
         out << "    }";
         if (i + 1 < report.decomposed_pieces.size()) {
             out << ",";
@@ -624,6 +656,33 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         if (i + 1 < report.overlaps.size()) {
             out << ",";
         }
+        out << "\n";
+    }
+    out << "  ],\n";
+    out << "  \"provenance\": [\n";
+    for (std::size_t i = 0; i < report.provenance.size(); ++i) {
+        const ProvenanceRecord& record = report.provenance[i];
+        out << "    {\n";
+        out << "      \"entity_id\": \"" << json_escape(record.entity_id)
+            << "\",\n";
+        out << "      \"operation\": \"" << json_escape(record.operation)
+            << "\",\n";
+        out << "      \"source_ids\": [";
+        for (std::size_t j = 0; j < record.source_ids.size(); ++j) {
+            if (j) out << ", ";
+            out << "\"" << json_escape(record.source_ids[j]) << "\"";
+        }
+        out << "],\n";
+        out << "      \"exact\": " << (record.exact ? "true" : "false")
+            << ",\n";
+        out << "      \"approximation\": "
+            << (record.approximation ? "true" : "false") << ",\n";
+        out << "      \"has_tolerance_budget\": "
+            << (record.has_tolerance_budget ? "true" : "false") << ",\n";
+        out << "      \"tolerance_budget\": " << std::setprecision(17)
+            << record.tolerance_budget << "\n";
+        out << "    }";
+        if (i + 1 < report.provenance.size()) out << ",";
         out << "\n";
     }
     out << "  ],\n";
@@ -819,6 +878,8 @@ void write_decomposition_proposal_json_stream(
     std::ostream& out,
     const DecompositionProposal& proposal) {
     out << "{\n";
+    out << "  \"schema\": \"csgify.decomposition-proposal\",\n";
+    out << "  \"schema_version\": 1,\n";
     out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
     out << "  \"target_id\": \"" << json_escape(proposal.target_id) << "\",\n";
     out << "  \"best_candidate_id\": \""
@@ -896,6 +957,8 @@ void write_removal_candidate_json(std::ostream& out,
 void write_removal_proposal_json_stream(std::ostream& out,
                                         const RemovalProposal& proposal) {
     out << "{\n";
+    out << "  \"schema\": \"csgify.removal-proposal\",\n";
+    out << "  \"schema_version\": 1,\n";
     out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
     out << "  \"total_volume\": " << std::setprecision(17)
         << proposal.total_volume << ",\n";
@@ -1008,6 +1071,8 @@ void write_hole_fill_candidate_json(std::ostream& out,
 void write_hole_fill_proposal_json_stream(std::ostream& out,
                                           const HoleFillProposal& proposal) {
     out << "{\n";
+    out << "  \"schema\": \"csgify.hole-fill-proposal\",\n";
+    out << "  \"schema_version\": 1,\n";
     out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
     out << "  \"candidates\": [\n";
     for (std::size_t i = 0; i < proposal.candidates.size(); ++i) {
@@ -1096,6 +1161,8 @@ void write_surface_replacement_proposal_json_stream(
     std::ostream& out,
     const SurfaceReplacementProposal& proposal) {
     out << "{\n";
+    out << "  \"schema\": \"csgify.surface-replacement-proposal\",\n";
+    out << "  \"schema_version\": 1,\n";
     out << "  \"ok\": " << (proposal.ok ? "true" : "false") << ",\n";
     out << "  \"face_id\": \"" << json_escape(proposal.face_id) << "\",\n";
     out << "  \"owner_target_id\": \""

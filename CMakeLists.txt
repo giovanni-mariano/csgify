@@ -120,6 +120,7 @@ add_library(csgify_engine
     src/hole_fill.cpp
     src/import.cpp
     src/lua_runner.cpp
+    src/operation_registry.cpp
     src/recipe.cpp
     src/replay.cpp
     src/report.cpp
@@ -236,6 +237,19 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_synthetic_boolean_step PRIVATE
+        "-Wl,--disable-new-dtags")
+
+    add_executable(csgify_geometric_certificate_property
+        tests/geometric_certificate_property.cpp)
+    target_include_directories(csgify_geometric_certificate_property PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        ${OpenCASCADE_INCLUDE_DIR})
+    target_link_libraries(csgify_geometric_certificate_property PRIVATE
+        csgify_engine)
+    set_target_properties(csgify_geometric_certificate_property PROPERTIES
+        BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
+        INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
+    target_link_options(csgify_geometric_certificate_property PRIVATE
         "-Wl,--disable-new-dtags")
 
     add_test(
@@ -458,6 +472,11 @@ if(BUILD_TESTING)
             "$<TARGET_FILE:csgify_synthetic_boolean_step>"
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/box.step"
             "${CMAKE_CURRENT_BINARY_DIR}/synthetic_boolean.step"
+    )
+
+    add_test(
+        NAME csgify_geometric_certificate_property
+        COMMAND "$<TARGET_FILE:csgify_geometric_certificate_property>"
     )
 
     if(NOT CSGIFY_ENABLE_LUA)

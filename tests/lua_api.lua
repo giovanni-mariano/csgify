@@ -8,6 +8,24 @@ local function fail(msg) error("lua_api: " .. msg, 0) end
 local fixtures = arg[1]
 local outdir   = arg[2]
 
+do
+    local operations = csgify.operations()
+    if type(operations) ~= "table" or #operations < 10 then
+        fail("operation registry is not exposed to Lua")
+    end
+    local seen = {}
+    for _, operation in ipairs(operations) do
+        if seen[operation.name] then fail("duplicate operation: " .. operation.name) end
+        seen[operation.name] = true
+        if operation.version ~= 1 then
+            fail("unexpected operation version for " .. operation.name)
+        end
+    end
+    if not seen.replace_solid_with_bbox or not seen.undo_last_mutation then
+        fail("operation registry is incomplete")
+    end
+end
+
 ----------------------------------------------------------------------
 -- Safety options are strict: a misspelled tolerance must not silently use
 -- the default value.
@@ -30,6 +48,45 @@ do
     if ok then fail("auto_fit_splines accepted a missing deviation budget") end
     if not tostring(err):find("explicit max_deviation", 1, true) then
         fail("unexpected unbounded auto-fit error: " .. tostring(err))
+    end
+end
+
+do
+    local s = csgify.session({ decomposition_relative_volume_tolerance = -1 })
+    local doc = s:load_step(fixtures .. "/l_shape.step")
+    local result, report = s:decompose_planar(doc .. "/solid:1")
+    if result then fail("invalid decomposition tolerance was accepted") end
+    if s:document_revision(doc) ~= 0 then
+        fail("rejected decomposition advanced the revision")
+    end
+    local found = false
+    for _, diagnostic in ipairs(report.diagnostics or {}) do
+        if diagnostic.code == "invalid_decomposition_volume_tolerance" then
+            found = true
+        end
+    end
+    if not found then fail("missing invalid decomposition tolerance diagnostic") end
+end
+
+----------------------------------------------------------------------
+-- Atomic revisions: mutation advances once, undo restores geometry as a
+-- new revision, and the revision counter is exposed consistently.
+----------------------------------------------------------------------
+do
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/box.step")
+    if s:document_revision(doc) ~= 0 then
+        fail("new document revision must be zero")
+    end
+    local removed, err = s:remove_solid(doc .. "/solid:1")
+    if not removed then fail("revision remove failed: " .. tostring(err)) end
+    if s:document_revision(doc) ~= 1 then
+        fail("successful removal did not create revision 1")
+    end
+    local restored, undo_err = s:undo_last_mutation(doc)
+    if not restored then fail("undo failed: " .. tostring(undo_err)) end
+    if restored.document_revision ~= 2 or restored.solids_seen ~= 1 then
+        fail("undo did not restore box as revision 2")
     end
 end
 

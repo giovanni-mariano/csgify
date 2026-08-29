@@ -43,6 +43,21 @@ int main(int argc, char** argv) {
         return fail("expected scoped JSON report");
     }
 
+    const int remove_status =
+        csgify_remove_solid(session, "doc:1/solid:1");
+    const size_t remove_revision = csgify_document_revision(session, doc);
+    if (remove_status != CSGIFY_REPORT_NOT_OK || remove_revision != 1) {
+        fprintf(stderr, "remove_status=%d revision=%zu error=%s\n",
+                remove_status, remove_revision, csgify_last_error(session));
+        csgify_session_destroy(session);
+        return fail("C API mutation did not create revision 1");
+    }
+    if (csgify_undo_last_mutation(session, doc) != CSGIFY_OK
+        || csgify_document_revision(session, doc) != 2) {
+        csgify_session_destroy(session);
+        return fail("C API undo did not restore revision 2");
+    }
+
     if (csgify_emit_document(session, doc, argv[2]) != CSGIFY_OK) {
         fprintf(stderr, "last_error: %s\n", csgify_last_error(session));
         csgify_session_destroy(session);
@@ -52,4 +67,3 @@ int main(int argc, char** argv) {
     csgify_session_destroy(session);
     return EXIT_SUCCESS;
 }
-

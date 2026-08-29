@@ -1,5 +1,11 @@
 # Review Fix Implementation Plan
 
+Status: completed. The original seven fixes are covered by the test suite.
+The subsequent architecture hardening also added atomic revisions/rollback,
+Boolean halfspace geometry certificates, a versioned operation registry,
+versioned JSON contracts, provenance records, and deterministic adversarial
+geometry coverage.
+
 This plan implements the high-risk issues found in the deep review of the
 current working tree.
 

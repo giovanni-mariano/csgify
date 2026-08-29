@@ -17,6 +17,7 @@
 #include <cmath>
 #include <cctype>
 #include <map>
+#include <limits>
 #include <memory>
 #include <set>
 #include <sstream>
@@ -118,6 +119,7 @@ void scope_diagnostic(const CadDocument& document, Diagnostic& diagnostic) {
 ConversionReport scoped_report(const CadDocument& document,
                                const ConversionReport& local_report) {
     ConversionReport report = local_report;
+    report.document_revision = document.revision;
     report.document_id = document.id;
     report.source_path = document.source_path;
     report.performance = document.performance;
@@ -158,6 +160,14 @@ ConversionReport scoped_report(const CadDocument& document,
     for (SolidOverlap& overlap : report.overlaps) {
         overlap.solid_a_id = scoped_shape_id(document.id, overlap.solid_a_id);
         overlap.solid_b_id = scoped_shape_id(document.id, overlap.solid_b_id);
+    }
+
+    for (ProvenanceRecord& provenance : report.provenance) {
+        provenance.entity_id =
+            scoped_shape_id(document.id, provenance.entity_id);
+        for (std::string& source_id : provenance.source_ids) {
+            source_id = scoped_shape_id(document.id, source_id);
+        }
     }
 
     return report;
@@ -613,6 +623,7 @@ DocumentId load_step(Session& session,
     document.options = options;
     const auto start = Clock::now();
     document.model = load_step_model(step_path, options);
+    document.committed_state.model = document.model;
     document.performance.load_step_ms += elapsed_ms(start);
     document.report.diagnostics = document.model.diagnostics;
     document.report = scoped_report(document, document.report);
@@ -674,8 +685,11 @@ CommandResult analyze(Session& session,
                 : std::make_pair(ov.solid_b_id, ov.solid_a_id);
             document.known_overlap_pairs.push_back(key);
         }
+        document.committed_state.known_overlap_pairs =
+            document.known_overlap_pairs;
         document.performance.analyze_ms += elapsed_ms(start);
         local_report.performance = document.performance;
+        local_report.document_revision = document.revision;
         document.report = id_mode == ReportIdMode::scoped
             ? scoped_report(document, local_report)
             : local_report;
@@ -683,6 +697,66 @@ CommandResult analyze(Session& session,
         // analyze always succeeds at producing a report; result.ok means
         // "analysis ran", not "the model is clean". Callers should check
         // `report.ok()` or per-solid flags to decide what's needed next.
+        return {true, document.report};
+    }
+    return session_error(session,
+                         "document_not_found",
+                         "Requested document ID was not found.",
+                         document_id);
+}
+
+std::size_t document_revision(const Session& session,
+                              const DocumentId& document_id) {
+    for (const CadDocument& document : session.documents) {
+        if (document.id == document_id) return document.revision;
+    }
+    return 0;
+}
+
+CommandResult undo_last_mutation(Session& session,
+                                 const DocumentId& document_id,
+                                 ReportIdMode id_mode) {
+    for (CadDocument& document : session.documents) {
+        if (document.id != document_id) continue;
+        if (document.revision_history.empty()) {
+            log_document_op(session, document_id, "undo_last_mutation", {}, false);
+            return session_error(session,
+                                 "revision_history_empty",
+                                 "Document has no committed mutation to undo.",
+                                 document_id);
+        }
+
+        DocumentRevisionState restored =
+            std::move(document.revision_history.back());
+        document.revision_history.pop_back();
+        document.model = restored.model;
+        document.synthetic_body_high_water =
+            restored.synthetic_body_high_water;
+        document.decomposed_piece_high_water =
+            restored.decomposed_piece_high_water;
+        document.known_overlap_pairs = restored.known_overlap_pairs;
+        document.committed_state = std::move(restored);
+        ++document.revision;
+
+        ConversionReport local_report =
+            analyze_model(document.model, document.options);
+        local_report.document_revision = document.revision;
+        local_report.diagnostics.push_back(diagnostic(
+            DiagnosticSeverity::info,
+            "document_revision_restored",
+            "The preceding committed document state was restored as a new revision.",
+            document_id));
+        local_report.performance = document.performance;
+        document.report = id_mode == ReportIdMode::scoped
+            ? scoped_report(document, local_report)
+            : local_report;
+        session.last_report_value = document.report;
+        log_document_op(session,
+                        document_id,
+                        "undo_last_mutation",
+                        {param_int("revision",
+                                   static_cast<long long>(document.revision))},
+                        true);
         return {true, document.report};
     }
     return session_error(session,
@@ -738,7 +812,9 @@ CommandResult shape_target_error(Session& session,
 CommandResult finish_document_mutation(Session& session,
                                        CadDocument& document,
                                        bool ok,
-                                       ReportIdMode id_mode = ReportIdMode::scoped) {
+                                       ReportIdMode id_mode = ReportIdMode::scoped,
+                                       std::size_t transaction_log_start =
+                                           std::numeric_limits<std::size_t>::max()) {
     // CommandResult.ok means "the requested operation applied" -- not
     // "the model is now globally emit-ready". The post-mutation report
     // is returned alongside so the caller can inspect `report.ok()` or
@@ -762,8 +838,78 @@ CommandResult finish_document_mutation(Session& session,
                                       &document.synthetic_body_high_water,
                                       &document.decomposed_piece_high_water,
                                       &document.known_overlap_pairs);
+    const bool introduced_invalid_geometry = std::any_of(
+        local_report.diagnostics.begin(), local_report.diagnostics.end(),
+        [](const Diagnostic& d) {
+            return d.severity == DiagnosticSeverity::error
+                && (d.code == "mutation_introduced_overlap"
+                    || d.code == "overlap_unknown");
+        });
+    if (!ok || introduced_invalid_geometry) {
+        std::vector<Diagnostic> rollback_causes;
+        const std::size_t committed_diagnostic_count =
+            document.committed_state.model.diagnostics.size();
+        for (std::size_t i = committed_diagnostic_count;
+             i < document.model.diagnostics.size(); ++i) {
+            rollback_causes.push_back(document.model.diagnostics[i]);
+        }
+        for (const Diagnostic& d : local_report.diagnostics) {
+            if ((d.code == "mutation_introduced_overlap"
+                 || d.code == "overlap_unknown")
+                && std::none_of(rollback_causes.begin(), rollback_causes.end(),
+                                [&](const Diagnostic& existing) {
+                                    return existing.code == d.code
+                                        && existing.shape_id == d.shape_id
+                                        && existing.message == d.message;
+                                })) {
+                rollback_causes.push_back(d);
+            }
+        }
+        document.model = document.committed_state.model;
+        document.synthetic_body_high_water =
+            document.committed_state.synthetic_body_high_water;
+        document.decomposed_piece_high_water =
+            document.committed_state.decomposed_piece_high_water;
+        document.known_overlap_pairs =
+            document.committed_state.known_overlap_pairs;
+
+        local_report = analyze_model(document.model, document.options);
+        local_report.diagnostics.insert(local_report.diagnostics.end(),
+                                        rollback_causes.begin(),
+                                        rollback_causes.end());
+        Diagnostic rolled_back;
+        rolled_back.severity = introduced_invalid_geometry
+            ? DiagnosticSeverity::error : DiagnosticSeverity::warning;
+        rolled_back.code = "mutation_rolled_back";
+        rolled_back.message = introduced_invalid_geometry
+            ? "Mutation was rolled back because its geometry failed postcondition validation."
+            : "Mutation reported failure; the previous committed document revision was restored.";
+        local_report.diagnostics.push_back(std::move(rolled_back));
+        if (session.log && session.log->last_sequence() > 0) {
+            const std::size_t transaction_log_end =
+                session.log->last_sequence();
+            const std::size_t first =
+                transaction_log_start != std::numeric_limits<std::size_t>::max()
+                ? transaction_log_start + 1 : transaction_log_end;
+            for (std::size_t seq = first; seq <= transaction_log_end; ++seq) {
+                session.log->record_undo(seq);
+            }
+        }
+        ok = false;
+    } else {
+        document.revision_history.push_back(document.committed_state);
+        document.committed_state.model = document.model;
+        document.committed_state.synthetic_body_high_water =
+            document.synthetic_body_high_water;
+        document.committed_state.decomposed_piece_high_water =
+            document.decomposed_piece_high_water;
+        document.committed_state.known_overlap_pairs =
+            document.known_overlap_pairs;
+        ++document.revision;
+    }
     document.performance.analyze_ms += elapsed_ms(start);
     local_report.performance = document.performance;
+    local_report.document_revision = document.revision;
     document.report = id_mode == ReportIdMode::scoped
         ? scoped_report(document, local_report)
         : local_report;
@@ -1373,6 +1519,7 @@ RemovalProposal suggest_removals(Session& session,
         ConversionReport local_report = analyze_model(document.model, document.options);
         document.performance.analyze_ms += elapsed_ms(start);
         local_report.performance = document.performance;
+        local_report.document_revision = document.revision;
         document.report = id_mode == ReportIdMode::scoped
             ? scoped_report(document, local_report)
             : local_report;
@@ -1955,6 +2102,8 @@ CommandResult auto_decompose_bsp(Session& session,
                              "BSP auto-decomposition max_depth must be non-negative.",
                              shape_id);
     }
+    const std::size_t transaction_log_start = session.log
+        ? session.log->last_sequence() : 0;
 
     struct QueueItem {
         std::string local_id;
@@ -2095,25 +2244,13 @@ CommandResult auto_decompose_bsp(Session& session,
     summary.shape_label = target.local_shape_id;
     target.document->model.diagnostics.push_back(summary);
 
-    if (defer_analysis) {
-        // Batched caller (decompose-apply) is responsible for running a
-        // final analyze before emit/export. Skip the costly per-call
-        // analyze_model pass; build a minimal CommandResult that
-        // carries only the diagnostics accumulated so far so the caller
-        // can still inspect outcomes.
-        CommandResult result;
-        result.ok = !stopped;
-        result.report.diagnostics = target.document->model.diagnostics;
-        if (id_mode == ReportIdMode::scoped) {
-            result.report = scoped_report(*target.document, result.report);
-        }
-        return result;
-    }
+    (void)defer_analysis;
 
     return finish_document_mutation(session,
                                     *target.document,
                                     !stopped,
-                                    id_mode);
+                                    id_mode,
+                                    transaction_log_start);
 }
 
 CommandResult emit_document(Session& session,
@@ -2143,6 +2280,7 @@ CommandResult emit_document(Session& session,
         if (has_overlap_error) {
             document.performance.emit_ms += elapsed_ms(emit_start);
             readiness_report.performance = document.performance;
+            readiness_report.document_revision = document.revision;
             document.report = id_mode == ReportIdMode::scoped
                 ? scoped_report(document, readiness_report)
                 : readiness_report;
@@ -2186,6 +2324,7 @@ CommandResult emit_document(Session& session,
                 }
             }
         }
+        final_report.document_revision = document.revision;
         document.report = id_mode == ReportIdMode::scoped
             ? scoped_report(document, final_report)
             : final_report;
@@ -2239,6 +2378,7 @@ CommandResult export_document_step(Session& session,
         ConversionReport local;
         local.diagnostics = document.report.diagnostics;
         local.performance = document.performance;
+        local.document_revision = document.revision;
         document.report = id_mode == ReportIdMode::scoped
             ? scoped_report(document, local)
             : local;

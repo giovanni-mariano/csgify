@@ -138,6 +138,14 @@ if not report.ok then
 end
 ```
 
+Reports use schema `csgify.report` version 1 and include
+`document_revision`, per-solid `geometry_certificate`, and `provenance`.
+Mutations are atomic: a rejected operation returns `(nil, report)` without
+advancing the revision. Use `s:document_revision(doc)` to check and
+`s:undo_last_mutation(doc)` to restore the preceding committed state as a new
+revision. `csgify.operations()` exposes the versioned operation registry used
+by CLI parsing, Lua dispatch, decision logs, compaction, and replay.
+
 Decision logs (matches the CLI `--log decisions.json`):
 
 ```lua

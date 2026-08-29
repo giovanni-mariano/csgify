@@ -10,9 +10,11 @@
 #include <array>
 
 #include <BRepBndLib.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepGProp.hxx>
 #include <BRepGProp_Face.hxx>
+#include <BRepPrimAPI_MakeHalfSpace.hxx>
 #include <Bnd_Box.hxx>
 #include <GProp_GProps.hxx>
 #include <TopAbs_ShapeEnum.hxx>
@@ -22,6 +24,7 @@
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <gp_Vec.hxx>
+#include <Standard_Failure.hxx>
 
 namespace csgify::detail {
 namespace {
@@ -386,13 +389,26 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
                                     bool emit_error,
                                     bool count_decomposition,
                                     bool count_faces,
-                                    const std::vector<FaceReplacement>* replacements) {
+                                    const std::vector<FaceReplacement>* replacements,
+                                    GeometryCertificate* certificate) {
+    GeometryCertificate local_certificate;
+    GeometryCertificate& cert = certificate ? *certificate : local_certificate;
+    cert = {};
+    cert.attempted = true;
+    GProp_GProps solid_props;
+    BRepGProp::VolumeProperties(solid, solid_props);
+    cert.source_volume = std::abs(solid_props.Mass());
+    cert.allowed_outside_volume = std::max(
+        options.linear_tolerance * options.linear_tolerance
+            * options.linear_tolerance,
+        cert.source_volume * 1.0e-10);
     const std::vector<gp_Pnt> vertices = solid_vertices(solid);
     if (vertices.empty()) {
         add_diag(report, DiagnosticSeverity::warning, "convexity_vertex_check_skipped",
                  "Solid has no vertices, so vertex-based convexity validation was skipped.",
                  solid_label(solid_index));
-        return true;
+        cert.failure_code = "convexity_vertex_check_skipped";
+        return false;
     }
     std::size_t face_index = 0;
     for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
@@ -409,6 +425,7 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
         if (count_faces) {
             ++report.analytic_faces;
         }
+        ++cert.faces_checked;
         // Use a geometric (distance-normalized) value so the comparison
         // against linear_tolerance is dimensionally correct for every surface
         // kind -- raw value_at() returns length^2 for quadrics/spheres and
@@ -431,10 +448,57 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
                              "At least one vertex lies outside a face halfspace selected from the solid interior point; emitting one Alea intersection cell would remove valid volume.",
                              solid_label(solid_index));
                 }
+                cert.failure_code = "vertex_outside_halfspace";
                 return false;
             }
         }
+
+        // Boolean certificate: the solid minus the face halfspace selected by
+        // the same interior point must have no measurable volume. Unlike the
+        // legacy vertex test, this examines curved face interiors and edge
+        // extrema through OCCT's B-rep kernel.
+        try {
+            const TopoDS_Face face = TopoDS::Face(face_exp.Current());
+            const TopoDS_Solid halfspace =
+                BRepPrimAPI_MakeHalfSpace(face, interior_point).Solid();
+            BRepAlgoAPI_Cut outside_cut(solid, halfspace);
+            outside_cut.Build();
+            if (!outside_cut.IsDone()) {
+                cert.failure_code = "halfspace_boolean_failed";
+                add_diag(report, DiagnosticSeverity::error,
+                         "convexity_certificate_unknown",
+                         "OCCT could not evaluate a face-halfspace containment check.",
+                         solid_label(solid_index));
+                return false;
+            }
+            ++cert.boolean_halfspace_checks;
+            GProp_GProps outside_props;
+            BRepGProp::VolumeProperties(outside_cut.Shape(), outside_props);
+            const double outside_volume = std::abs(outside_props.Mass());
+            cert.maximum_outside_volume =
+                std::max(cert.maximum_outside_volume, outside_volume);
+            if (outside_volume > cert.allowed_outside_volume) {
+                if (count_decomposition) ++report.solids_requiring_decomposition;
+                cert.failure_code = "volume_outside_halfspace";
+                if (emit_error) {
+                    add_diag(report, DiagnosticSeverity::error,
+                             "nonconvex_solid_requires_decomposition",
+                             "A Boolean containment certificate found solid volume outside a selected face halfspace.",
+                             solid_label(solid_index));
+                }
+                return false;
+            }
+        } catch (const Standard_Failure&) {
+            cert.failure_code = "halfspace_boolean_exception";
+            add_diag(report, DiagnosticSeverity::error,
+                     "convexity_certificate_unknown",
+                     "OCCT raised an exception while certifying face-halfspace containment.",
+                     solid_label(solid_index));
+            return false;
+        }
     }
+    cert.certified = cert.faces_checked > 0
+        && cert.boolean_halfspace_checks == cert.faces_checked;
     return true;
 }
 
@@ -483,6 +547,29 @@ bool find_convexity_failure_face(const TopoDS_Solid& solid,
                 *face_index_out = face_index;
                 return true;
             }
+        }
+        try {
+            const TopoDS_Face face = TopoDS::Face(face_exp.Current());
+            const TopoDS_Solid halfspace =
+                BRepPrimAPI_MakeHalfSpace(face, interior_point).Solid();
+            BRepAlgoAPI_Cut outside_cut(solid, halfspace);
+            outside_cut.Build();
+            if (!outside_cut.IsDone()) continue;
+            GProp_GProps outside_props;
+            BRepGProp::VolumeProperties(outside_cut.Shape(), outside_props);
+            GProp_GProps source_props;
+            BRepGProp::VolumeProperties(solid, source_props);
+            const double source_volume = std::abs(source_props.Mass());
+            const double tolerance = std::max(
+                options.linear_tolerance * options.linear_tolerance
+                    * options.linear_tolerance,
+                source_volume * 1.0e-10);
+            if (std::abs(outside_props.Mass()) > tolerance) {
+                *face_index_out = face_index;
+                return true;
+            }
+        } catch (const Standard_Failure&) {
+            continue;
         }
     }
     return false;

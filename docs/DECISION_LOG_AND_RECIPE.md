@@ -1,5 +1,16 @@
 # Decision Log and Recipe
 
+The implemented formats are explicitly versioned:
+
+- NDJSON decision logs: `csgify.decision-log`, schema version 1;
+- compact JSON recipes: `csgify.recipe`, schema version 1;
+- each decision carries the version from the central operation registry.
+
+Readers accept legacy unversioned files for compatibility and reject unknown
+explicit schema or operation versions. Automatic transaction rollback appends
+an undo record so compaction cannot replay a mutation that failed its geometry
+postconditions.
+
 This document describes how `csgify` should persist preprocessing
 decisions so that a conversion can be reproduced, audited, and re-applied
 to a revised CAD model. It defines two artifacts that serve different

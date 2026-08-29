@@ -70,6 +70,25 @@ int main(int argc, char** argv) {
     if (scoped.report.document_id != "doc:2") {
         return fail("scoped command report should identify the second document");
     }
+    if (csgify::document_revision(*session, "doc:2") != 1
+        || scoped.report.document_revision != 1) {
+        return fail("successful mutation should create revision 1");
+    }
+
+    csgify::CommandResult undone =
+        csgify::undo_last_mutation(*session, "doc:2");
+    if (!undone.ok
+        || csgify::document_revision(*session, "doc:2") != 2
+        || undone.report.document_revision != 2
+        || undone.report.solids_seen != 1) {
+        return fail("undo should restore the source solid as revision 2");
+    }
+
+    csgify::CommandResult no_more_history =
+        csgify::undo_last_mutation(*session, "doc:2");
+    if (no_more_history.ok) {
+        return fail("undo should fail when revision history is empty");
+    }
 
     csgify::VolumeComparison comparison =
         csgify::compare_document_volumes(*session,

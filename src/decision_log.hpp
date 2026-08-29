@@ -68,6 +68,7 @@ public:
     void record_undo(std::size_t undoes_seq);
 
     const std::string& path() const { return path_; }
+    std::size_t last_sequence() const { return seq_; }
 
 private:
     void write_manifest(const std::string& step_path);

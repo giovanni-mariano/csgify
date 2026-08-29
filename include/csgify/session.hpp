@@ -56,6 +56,16 @@ CommandResult analyze(Session& session,
                       const DocumentId& document_id,
                       ReportIdMode id_mode = ReportIdMode::scoped);
 
+// Every successful mutation creates a new immutable document revision.
+// Failed mutations and mutations that introduce an overlap are rolled back
+// automatically. Undo restores the preceding committed state as a new,
+// monotonic revision (there is deliberately no implicit redo stack).
+std::size_t document_revision(const Session& session,
+                              const DocumentId& document_id);
+CommandResult undo_last_mutation(Session& session,
+                                 const DocumentId& document_id,
+                                 ReportIdMode id_mode = ReportIdMode::scoped);
+
 CommandResult remove_solid(Session& session,
                            const std::string& shape_id,
                            ReportIdMode id_mode = ReportIdMode::scoped);
@@ -172,13 +182,8 @@ CommandResult apply_decomposition_candidate(
     const std::string& candidate_id,
     ReportIdMode id_mode = ReportIdMode::scoped);
 
-// Batched callers (decompose-apply) that invoke auto_decompose_bsp once
-// per target can pass defer_analysis=true to skip the trailing full
-// analyze_model() pass. The BSP loop still uses the cheap
-// decomposition_target_exact_csg_supported query internally to decide
-// when each piece is convex; only the final report-shaped analyze is
-// what gets deferred. The caller is then responsible for running one
-// `analyze` at the end before emit/export.
+// `defer_analysis` is retained for source compatibility but validation is
+// never deferred: every mutation must cross the same atomic commit boundary.
 CommandResult auto_decompose_bsp(Session& session,
                                  const std::string& shape_id,
                                  int max_depth = 4,

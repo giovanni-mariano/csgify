@@ -4,6 +4,7 @@
 #include "engine_model.hpp"
 #include "fnv.hpp"
 #include "json_parser.hpp"
+#include "operation_registry.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -33,6 +34,7 @@ struct Fingerprint {
 
 struct RecipeOp {
     std::string op;
+    unsigned operation_version = 1;
     std::string target_kind;     // "solid" | "face" | "document"
     std::string target_shape_id; // scoped or local
     std::string component_entry;
@@ -69,6 +71,17 @@ RecipeFile read_recipe(const std::string& path) {
     if (!root || root->kind != JsonKind::object) {
         throw std::runtime_error("recipe is not a JSON object");
     }
+    if (const JsonValue* schema = root->get("schema")) {
+        if (schema->as_string() != "csgify.recipe") {
+            throw std::runtime_error("unsupported recipe schema: "
+                                     + schema->as_string());
+        }
+    }
+    if (const JsonValue* version = root->get("schema_version")) {
+        if (static_cast<int>(version->as_number()) != 1) {
+            throw std::runtime_error("unsupported recipe schema_version");
+        }
+    }
     if (const JsonValue* m = root->get("manifest")) {
         if (const JsonValue* v = m->get("step_path"))   out.step_path = v->as_string();
         if (const JsonValue* v = m->get("step_digest")) out.step_digest = v->as_string();
@@ -81,6 +94,9 @@ RecipeFile read_recipe(const std::string& path) {
         if (!entry || entry->kind != JsonKind::object) continue;
         RecipeOp o;
         if (const JsonValue* v = entry->get("op")) o.op = v->as_string();
+        if (const JsonValue* v = entry->get("operation_version")) {
+            o.operation_version = static_cast<unsigned>(v->as_number());
+        }
         if (const JsonValue* t = entry->get("target")) {
             if (const JsonValue* v = t->get("kind"))            o.target_kind = v->as_string();
             if (const JsonValue* v = t->get("shape_id"))        o.target_shape_id = v->as_string();
@@ -445,6 +461,34 @@ bool dispatch_solid_op(Session& session,
 bool dispatch_face_op(Session& session,
                       const RecipeOp& op,
                       std::string* error_out) {
+    if (op.op == "apply_surface_replacement_candidate") {
+        std::string kind_name;
+        double budget = 0.0;
+        bool has_budget = false;
+        if (op.params && op.params->kind == JsonKind::object) {
+            if (const JsonValue* v = op.params->get("kind"))
+                kind_name = v->as_string();
+            if (const JsonValue* v = op.params->get("max_deviation_budget")) {
+                budget = v->as_number();
+                has_budget = true;
+            }
+        }
+        SplineFitKind kind = SplineFitKind::none;
+        if (kind_name == "plane") kind = SplineFitKind::plane;
+        else if (kind_name == "sphere") kind = SplineFitKind::sphere;
+        else if (kind_name == "cylinder") kind = SplineFitKind::cylinder;
+        else if (kind_name == "cone") kind = SplineFitKind::cone;
+        if (kind == SplineFitKind::none || !has_budget
+            || !std::isfinite(budget) || budget < 0.0) {
+            *error_out = "missing or invalid replay parameters on " + op.op;
+            return false;
+        }
+        const CommandResult r = replace_face_with_fit(
+            session, op.target_shape_id, kind, true, budget,
+            ReportIdMode::local);
+        if (!r.ok) *error_out = "apply_surface_replacement_candidate failed";
+        return r.ok;
+    }
     if (op.op != "replace_face_with_fit") {
         *error_out = "unknown face op: " + op.op;
         return false;
@@ -520,6 +564,8 @@ void write_report(const std::string& path,
         return;
     }
     out << "{\n";
+    out << "  \"schema\": \"csgify.replay-report\",\n";
+    out << "  \"schema_version\": 1,\n";
     out << "  \"recipe_step_path\": \""    << json_escape(recipe.step_path) << "\",\n";
     out << "  \"recipe_step_digest\": \""  << json_escape(recipe.step_digest) << "\",\n";
     out << "  \"replay_step_path\": \""    << json_escape(step_path) << "\",\n";
@@ -631,6 +677,23 @@ int replay_recipe(const std::string& recipe_json_path,
         rec.original_shape_id = op.target_shape_id;
         rec.component_entry = op.component_entry;
 
+        const OperationDescriptor* operation_descriptor = find_operation(op.op);
+        if (!operation_descriptor) {
+            rec.outcome = Outcome::dispatch_failed;
+            rec.error = "operation is not present in this csgify operation registry: "
+                + op.op;
+            records.push_back(std::move(rec));
+            exit_status = 1;
+            continue;
+        }
+        if (op.operation_version != operation_descriptor->version) {
+            rec.outcome = Outcome::dispatch_failed;
+            rec.error = "unsupported operation version for " + op.op;
+            records.push_back(std::move(rec));
+            exit_status = 1;
+            continue;
+        }
+
         // Skip the recipe's own load_step (we already loaded above with
         // the override). Mark it as applied for the report.
         if (op.op == "load_step") {
@@ -679,6 +742,17 @@ int replay_recipe(const std::string& recipe_json_path,
             if (!r.ok) rec.error = "auto_fit_splines failed";
             rec.resolved_shape_id = doc;
             records.push_back(std::move(rec));
+            continue;
+        }
+
+        if (op.op == "undo_last_mutation") {
+            CommandResult r = undo_last_mutation(session, doc,
+                                                  ReportIdMode::local);
+            rec.outcome = r.ok ? Outcome::applied : Outcome::dispatch_failed;
+            if (!r.ok) rec.error = "undo_last_mutation failed";
+            rec.resolved_shape_id = doc;
+            records.push_back(std::move(rec));
+            if (!r.ok) exit_status = 1;
             continue;
         }
 

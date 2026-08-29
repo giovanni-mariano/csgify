@@ -97,6 +97,27 @@ struct AnalyzedFace {
     std::string hierarchy_path;
 };
 
+struct GeometryCertificate {
+    bool attempted = false;
+    bool certified = false;
+    std::size_t faces_checked = 0;
+    std::size_t boolean_halfspace_checks = 0;
+    double source_volume = 0.0;
+    double maximum_outside_volume = 0.0;
+    double allowed_outside_volume = 0.0;
+    std::string failure_code;
+};
+
+struct ProvenanceRecord {
+    std::string entity_id;
+    std::string operation;
+    std::vector<std::string> source_ids;
+    bool exact = true;
+    bool approximation = false;
+    bool has_tolerance_budget = false;
+    double tolerance_budget = 0.0;
+};
+
 struct ReplacementMetrics {
     bool available = false;
     double volume = 0.0;
@@ -187,6 +208,7 @@ struct AnalyzedSolid {
     bool needs_spline_replacement = false;
     bool needs_surface_replacement = false;
     bool needs_user_decision = false;
+    GeometryCertificate certificate;
     std::vector<std::string> face_ids;
     std::string name;
     std::string hierarchy_path;
@@ -205,6 +227,7 @@ struct AnalyzedDecomposedPiece {
     bool needs_spline_replacement = false;
     bool needs_surface_replacement = false;
     bool needs_user_decision = false;
+    GeometryCertificate certificate;
 };
 
 struct DecompositionCandidatePiece {
@@ -457,6 +480,9 @@ struct ConversionOptions {
     bool require_convex_cells = true;
     bool try_planar_decomposition = true;
     bool split_union_cells = true;
+    // Dimensionless conservation guard shared by directed planar/face/plane
+    // decomposition. A split that exceeds it is rejected before mutation.
+    double decomposition_relative_volume_tolerance = 1.0e-6;
     // Exhaustive surface-driven subdivision (the `shatter` op). Each solid
     // is cut by the bounded cutter of every one of its own faces until each
     // piece lies on one definite side of every surface. `shatter_max_depth`
@@ -515,6 +541,11 @@ struct SolidOverlap {
 };
 
 struct ConversionReport {
+    // Stable machine-readable contract version. Increment only for breaking
+    // JSON/report-shape changes; additive fields keep the same version.
+    std::size_t schema_version = 1;
+    // Monotonic session revision of the document represented by this report.
+    std::size_t document_revision = 0;
     std::string document_id;
     std::string source_path;
     // STEP length unit metadata. `length_unit` is a short label
@@ -542,6 +573,7 @@ struct ConversionReport {
     std::vector<AssemblyNode> assembly;
     std::vector<DecisionRequest> decision_requests;
     std::vector<SolidOverlap> overlaps;
+    std::vector<ProvenanceRecord> provenance;
     PerformanceMetrics performance;
 
     bool ok() const;

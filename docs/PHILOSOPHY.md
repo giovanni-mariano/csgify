@@ -34,26 +34,24 @@ The public API should remain boring: input path, options, result, diagnostics.
 
 The implementation plan names six conceptual stages (Import, Analyze, Semantic
 Cleanup, Geometric Repair, Emit CSG, Export). The current code implements
-those stages but does not enforce them as a typed pipeline — semantic cleanup
-and geometric repair mutate `CadModel` in place, and conversion reads from
-the mutated model.
+those stages through separate translation units. Semantic cleanup and geometric
+repair operate on a working `CadModel`, but the session exposes only committed,
+monotonic document revisions.
 
 This is a deliberate choice for the current scope:
 
-- **State lives in `CadModel`.** Loaded geometry, removed solid IDs, synthetic
-  bodies, decomposed pieces, and face replacements all hang off the same
-  value. Commands mutate it; conversion is a final read.
-- **Refusal is enforced at the emit boundary.** `convert_solid` rejects
-  geometry it cannot turn into a valid CSG cell. The "geometry must be ready"
-  rule is a runtime check, not a type-system check.
-- **Why this over a pipeline of immutable values:** a typed pipeline
-  (`RawModel → AnalyzedModel → CleanedModel → RepairedModel → AleaSystem`)
-  is more rigorous and would surface mistakes earlier, but with one frontend
-  (the CLI) the extra plumbing is currently overhead. The trade is "one
-  mutation in flight, refusal at the gate" rather than "one type per stage,
-  refusal as a constructor postcondition."
+- **Working state lives in `CadModel`.** Commands construct a candidate state;
+  the session validates it before replacing the committed revision.
+- **Every mutation is transactional.** Operation failure, an introduced
+  overlap, an unknown Boolean result, volume drift, or an incomplete geometric
+  certificate restores the previous committed state. Successful mutations
+  advance `document_revision`; undo restores history as a new monotonic
+  revision.
+- **Refusal is enforced twice.** Mutation postconditions guard the commit, and
+  `convert_solid` independently refuses geometry that cannot become a valid CSG
+  cell. The emitter never legitimizes an uncertified working state.
 
-This choice is **revisitable** when any of the following becomes true:
+The internal representation can still evolve into distinct typed values when:
 
 - A second frontend exists (Lua, HTTP, Python binding) and needs to drive the
   stages independently.
@@ -63,9 +61,8 @@ This choice is **revisitable** when any of the following becomes true:
 - A stage needs to be re-run cheaply on a subset of solids without redoing
   the whole import.
 
-Until then, keep `CadModel` as the state, document each command's mutation
-contract on the function that performs it, and write tests that pin the
-post-mutation report.
+Until then, keep `CadModel` behind the session revision boundary, document each
+operation in the central registry, and pin both commit and rollback reports.
 
 ## Internal code layout
 

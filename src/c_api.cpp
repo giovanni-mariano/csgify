@@ -119,6 +119,24 @@ int csgify_analyze(csgify_session_t* session,
     }
 }
 
+size_t csgify_document_revision(csgify_session_t* session,
+                                const char* document_id) {
+    if (!session || !document_id) return 0;
+    return csgify::document_revision(*session->session, document_id);
+}
+
+int csgify_undo_last_mutation(csgify_session_t* session,
+                              const char* document_id) {
+    if (!session || !document_id) return fail(session, "invalid argument");
+    try {
+        return finish_command(
+            session,
+            csgify::undo_last_mutation(*session->session, document_id));
+    } catch (const std::exception& e) {
+        return fail(session, e.what());
+    }
+}
+
 int csgify_remove_solid(csgify_session_t* session,
                          const char* shape_id) {
     if (!session || !shape_id) {

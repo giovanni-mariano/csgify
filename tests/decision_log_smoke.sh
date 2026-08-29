@@ -38,6 +38,9 @@ if not records or records[0].get("kind") != "manifest":
     sys.exit(1)
 
 manifest = records[0]
+if manifest.get("schema") != "csgify.decision-log" or manifest.get("schema_version") != 1:
+    print(f"unexpected decision-log schema: {manifest}", file=sys.stderr)
+    sys.exit(1)
 for required in ("csgify_version", "occt_version", "step_path",
                  "step_digest", "created_at"):
     if required not in manifest:
@@ -62,6 +65,9 @@ if missing:
 for r in records[1:]:
     if r.get("kind") != "decision":
         continue
+    if r.get("operation_version") != 1:
+        print(f"decision has unknown operation version: {r}", file=sys.stderr)
+        sys.exit(1)
     target = r.get("target") or {}
     if not target.get("kind") or "shape_id" not in target:
         print(f"record missing target fields: {r}", file=sys.stderr)

@@ -163,17 +163,35 @@ replacement, while `apply_checked_replacement_operation(...)` validates limits
 and mutates the model only if the check passes. This keeps future Lua or agent
 bindings on the same decision path as the CLI.
 
+Every session mutation is atomic. Successful operations create a monotonic
+document revision; failed operations and geometry that introduces overlaps are
+rolled back. C++, C, and Lua expose the current revision and undo operation:
+
+```lua
+print(s:document_revision(doc)) -- 0 after load
+s:remove_solid(doc .. "/solid:2")
+s:undo_last_mutation(doc)       -- restored state, new revision
+```
+
+Machine-readable outputs carry explicit schema names and versions. Conversion
+reports include `geometry_certificate` records for solids and `provenance[]`
+records connecting replacements, decomposed pieces, Boolean bodies, and
+removals to source IDs and tolerance budgets. Lua can inspect the same central
+operation contract with `csgify.operations()`.
+
 Phase 2 has started with explicit planar decomposition:
 `--decompose-planar` splits a selected solid using its planar faces, suppresses
 the original solid, and converts the resulting pieces. The command writes
 volume-preservation diagnostics and a structured `decomposed_pieces[]` report
-section with per-piece volume, bbox, face count, and convertibility flags. This
-first decomposition pass is intentionally limited: pieces may still fail
-conversion if they remain non-convex or contain unsupported surfaces.
+section with per-piece volume, bbox, face count, and convertibility flags.
+Directed splits are volume-guarded, and final pieces must pass Boolean
+face-halfspace containment certificates. Intermediate pieces may still require
+further decomposition or surface replacement; uncertified mutations are
+rejected atomically.
 Axis-aligned torus faces are supported through libalea `TX`, `TY`, and `TZ`
 surfaces; arbitrary-axis tori still require replacement or a future
 transform-aware emitter.
 
-The engine deliberately stops on spline faces for now. That is the right place
-to add the agent/user loop for simplification choices: remove, replace with an
-analytic surrogate, approximate under tolerance, or keep for manual handling.
+The engine deliberately stops on unresolved spline faces. It proposes analytic
+fits and applies them only under an explicit per-operation deviation budget;
+otherwise the face remains a recorded user decision.

@@ -29,10 +29,34 @@ rm -f "$log" "$recipe" "$orig" "$replay"
 
 [[ -s "$log" ]] || fail "decision log was not produced"
 
+# A versioned log must never be silently reinterpreted when an operation's
+# contract has moved ahead of this binary.
+future_log="$outdir/future-operation.json"
+python3 - "$log" "$future_log" <<'PY' || exit 1
+import sys
+source, destination = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+text = text.replace('"operation_version":1', '"operation_version":999', 1)
+open(destination, "w", encoding="utf-8").write(text)
+PY
+if "$exe" compact "$future_log" --out "$outdir/future.lua" \
+    >/dev/null 2>"$outdir/future.err"; then
+    fail "compact accepted an unsupported operation version"
+fi
+grep -q "unsupported operation version" "$outdir/future.err" \
+    || fail "unsupported operation version did not fail clearly"
+
 "$exe" compact "$log" --out "$recipe" >/dev/null 2>&1 \
     || fail "compact returned non-zero"
 
 [[ -s "$recipe" ]] || fail "recipe file was not produced"
+
+python3 - "${recipe%.lua}.json" <<'PY' || exit 1
+import json, sys
+recipe = json.load(open(sys.argv[1], encoding="utf-8"))
+assert recipe.get("schema") == "csgify.recipe", recipe
+assert recipe.get("schema_version") == 1, recipe
+PY
 
 # Rewrite the emit() path so the replay does not overwrite the original.
 # Portable in-place sed (GNU/BSD differ on -i semantics).

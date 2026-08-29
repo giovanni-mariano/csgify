@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -261,7 +262,8 @@ void inspect_solid(const TopoDS_Solid& solid,
 
     if (options.require_convex_cells
         && !validate_convex_halfspace_cell(solid, interior_point, solid_index,
-                                           options, report, false, true, false)) {
+                                           options, report, false, true, false,
+                                           nullptr, &analyzed_solid.certificate)) {
         analyzed_solid.needs_decomposition = true;
         analyzed_solid.needs_user_decision = true;
         add_diag(report, DiagnosticSeverity::error,
@@ -542,7 +544,8 @@ AnalyzedDecomposedPiece analyze_decomposed_piece(const DecomposedSolidPiece& pie
     ConversionReport scratch;
     const bool convex =
         validate_convex_halfspace_cell(piece.solid, interior_point, report_solid_index,
-                                       options, scratch, false, false, false);
+                                       options, scratch, false, false, false,
+                                       nullptr, &analyzed.certificate);
     analyzed.needs_decomposition = !convex;
     analyzed.exact_csg_supported =
         all_faces_supported
@@ -1110,6 +1113,46 @@ AnalysisReport analyze_model(const CadModel& model,
     }
 
     for (const SyntheticBody& body : model.synthetic_bodies) {
+        ProvenanceRecord provenance;
+        provenance.entity_id = body.id;
+        provenance.exact = true;
+        if (body.kind == SyntheticBodyKind::union_body) {
+            provenance.operation = "synthetic_union";
+            provenance.source_ids = {body.left_id, body.right_id};
+        } else if (body.kind == SyntheticBodyKind::intersection_body) {
+            provenance.operation = "synthetic_intersection";
+            provenance.source_ids = {body.left_id, body.right_id};
+        } else if (body.kind == SyntheticBodyKind::difference_body) {
+            provenance.operation = "synthetic_difference";
+            provenance.source_ids = {body.left_id, body.right_id};
+        } else if (body.role == "hole_fill") {
+            provenance.operation = "fill_hole";
+            if (!body.host_solid_id.empty())
+                provenance.source_ids.push_back(body.host_solid_id);
+            if (!body.source_solid_id.empty())
+                provenance.source_ids.push_back(body.source_solid_id);
+        } else {
+            const struct PrefixOperation { const char* prefix; const char* op; } mappings[] = {
+                {"bbox_from_", "replace_solid_with_bbox"},
+                {"bbox_cylinder_from_", "replace_solid_with_bbox_cylinder"},
+                {"fitted_cylinder_from_", "replace_solid_with_fitted_cylinder"},
+                {"fitted_sphere_from_", "replace_solid_with_fitted_sphere"},
+                {"fitted_cone_from_", "replace_solid_with_fitted_cone"},
+            };
+            provenance.operation = "add_synthetic_primitive";
+            for (const PrefixOperation& mapping : mappings) {
+                const std::size_t pos = body.label.find(mapping.prefix);
+                if (pos != std::string::npos) {
+                    provenance.operation = mapping.op;
+                    provenance.source_ids.push_back(
+                        body.label.substr(pos + std::strlen(mapping.prefix)));
+                    provenance.approximation = true;
+                    provenance.exact = false;
+                    break;
+                }
+            }
+        }
+        report.provenance.push_back(std::move(provenance));
         if (!body.emit_as_cell) {
             continue;
         }
@@ -1139,9 +1182,28 @@ AnalysisReport analyze_model(const CadModel& model,
         report.total_volume += piece.volume;
         ++report.solids_seen;
         ++report.decomposition_pieces;
+        report.provenance.push_back({piece.id, "decompose",
+                                     {piece.source_solid_id}, true, false,
+                                     false, 0.0});
         if (analyzed_piece.needs_decomposition) {
             ++report.solids_requiring_decomposition;
         }
+    }
+
+    for (const std::string& removed_id : model.removed_solid_ids) {
+        report.provenance.push_back({removed_id, "remove_solid",
+                                     {removed_id}, true, false, false, 0.0});
+    }
+    for (const FaceReplacement& replacement : model.face_replacements) {
+        ProvenanceRecord provenance;
+        provenance.entity_id = replacement.face_id;
+        provenance.operation = "replace_face_with_fit";
+        provenance.source_ids = {replacement.face_id};
+        provenance.approximation = replacement.fit.max_deviation > 0.0;
+        provenance.exact = !provenance.approximation;
+        provenance.has_tolerance_budget = replacement.has_max_deviation;
+        provenance.tolerance_budget = replacement.max_deviation;
+        report.provenance.push_back(std::move(provenance));
     }
 
     finalize_cleanup_metrics(report, options);

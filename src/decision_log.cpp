@@ -2,6 +2,7 @@
 
 #include "csgify/engine.hpp"  // occt_version()
 #include "fnv.hpp"
+#include "operation_registry.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -141,6 +142,8 @@ void DecisionLog::write_manifest(const std::string& step_path) {
     }
     out_ << "{"
          << "\"kind\":\"manifest\","
+         << "\"schema\":\"csgify.decision-log\","
+         << "\"schema_version\":1,"
          << "\"seq\":0,"
          << "\"csgify_version\":\"unversioned\","
          << "\"occt_version\":" << quote(occt_version()) << ","
@@ -160,6 +163,7 @@ void DecisionLog::record(const DecisionTarget& target,
         return;
     }
     ++seq_;
+    const OperationDescriptor* descriptor = find_operation(op);
 
     out_ << "{"
          << "\"kind\":\"decision\","
@@ -182,6 +186,8 @@ void DecisionLog::record(const DecisionTarget& target,
     }
     out_ << "},"
          << "\"op\":" << quote(op) << ","
+         << "\"operation_version\":"
+         << (descriptor ? descriptor->version : 0) << ","
          << "\"params\":{";
     for (std::size_t i = 0; i < params.size(); ++i) {
         if (i) out_ << ",";

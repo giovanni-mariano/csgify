@@ -30,6 +30,19 @@ report_applied="$outdir/applied.json"
 report_soft="$outdir/soft.json"
 report_unmatched="$outdir/unmatched.json"
 
+# Explicitly versioned formats fail closed when a newer incompatible schema
+# is presented. Legacy unversioned recipes below remain readable.
+bad_schema="$outdir/bad_schema.json"
+cat >"$bad_schema" <<EOF
+{"schema":"csgify.recipe","schema_version":999,"manifest":{"step_path":"$step"},"ops":[]}
+EOF
+if "$exe" replay "$bad_schema" --out "$outdir/bad.i" \
+    --report "$outdir/bad.json" >/dev/null 2>"$outdir/bad.err"; then
+    fail "replay accepted an unsupported recipe schema"
+fi
+grep -q "recipe_parse_failed" "$outdir/bad.err" \
+    || fail "unsupported schema did not produce recipe_parse_failed"
+
 # --- applied: hand-craft a recipe.json with the correct component_entry.
 # box.step has solid:1 with component_entry "0:1:1:1" (verified in
 # decision_log_smoke). We don't need a real fingerprint for the primary

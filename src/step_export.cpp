@@ -15,6 +15,7 @@
 #include <BRepPrimAPI_MakeCone.hxx>
 #include <BRepPrimAPI_MakeCylinder.hxx>
 #include <BRepPrimAPI_MakeSphere.hxx>
+#include <ShapeUpgrade_UnifySameDomain.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
@@ -288,6 +289,11 @@ TopoDS_Shape build_synthetic_recursive(
         }
     } catch (...) {
         result.Nullify();
+    }
+    if (!result.IsNull()) {
+        ShapeUpgrade_UnifySameDomain unify(result, true, true, true);
+        unify.Build();
+        if (!unify.Shape().IsNull()) result = unify.Shape();
     }
     resolving->erase(body.id);
     return result;

@@ -25,6 +25,11 @@ int csgify_load_step(csgify_session_t* session,
 int csgify_analyze(csgify_session_t* session,
                     const char* document_id);
 
+size_t csgify_document_revision(csgify_session_t* session,
+                                const char* document_id);
+int csgify_undo_last_mutation(csgify_session_t* session,
+                              const char* document_id);
+
 int csgify_remove_solid(csgify_session_t* session,
                          const char* shape_id);
 
@@ -47,4 +52,3 @@ const char* csgify_last_error(csgify_session_t* session);
 #ifdef __cplusplus
 }
 #endif
-

@@ -6,6 +6,7 @@
 #include "engine_model.hpp"
 #include "hole_fill.hpp"
 #include "lua_runner.hpp"
+#include "operation_registry.hpp"
 #include "recipe.hpp"
 #include "replay.hpp"
 
@@ -571,28 +572,13 @@ void print_diagnostics(const csgify::ConversionReport& report) {
     }
 }
 
-struct SolidActionEntry {
-    const char* flag;
-    csgify::ReplacementOperation op;
-};
-
-constexpr SolidActionEntry kSolidActions[] = {
-    {"--replace-solid-bbox",            csgify::ReplacementOperation::bbox},
-    {"--replace-solid-bbox-cylinder",   csgify::ReplacementOperation::bbox_cylinder},
-    {"--replace-solid-fitted-cylinder", csgify::ReplacementOperation::fitted_cylinder},
-    {"--replace-solid-fitted-sphere",   csgify::ReplacementOperation::fitted_sphere},
-    {"--replace-solid-fitted-cone",     csgify::ReplacementOperation::fitted_cone},
-};
-
 bool operation_from_action(const std::string& action,
                            csgify::ReplacementOperation* operation) {
-    for (const SolidActionEntry& entry : kSolidActions) {
-        if (action == entry.flag) {
-            *operation = entry.op;
-            return true;
-        }
-    }
-    return false;
+    const csgify::OperationDescriptor* descriptor =
+        csgify::find_replacement_by_cli_flag(action);
+    if (!descriptor) return false;
+    *operation = descriptor->replacement_operation;
+    return true;
 }
 
 struct FaceActionEntry {

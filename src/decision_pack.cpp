@@ -383,6 +383,8 @@ std::string manifest_json(const DecisionRequest& request,
                           const std::string& overview_path = {}) {
     std::ostringstream out;
     out << "{\n";
+    out << "  \"schema\": \"csgify.decision-pack\",\n";
+    out << "  \"schema_version\": 1,\n";
     out << "  \"decision_id\": \"" << json_escape(request.id) << "\",\n";
     out << "  \"kind\": \"" << json_escape(request.kind) << "\",\n";
     out << "  \"target_id\": \"" << json_escape(request.target_id) << "\",\n";

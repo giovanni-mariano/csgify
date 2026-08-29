@@ -70,7 +70,8 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
                                     bool emit_error,
                                     bool count_decomposition,
                                     bool count_faces,
-                                    const std::vector<FaceReplacement>* replacements = nullptr);
+                                    const std::vector<FaceReplacement>* replacements = nullptr,
+                                    GeometryCertificate* certificate = nullptr);
 bool find_convexity_failure_face(const TopoDS_Solid& solid,
                                  std::size_t solid_index,
                                  const ConversionOptions& options,

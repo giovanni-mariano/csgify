@@ -63,14 +63,42 @@ assert "intersection_volume=" in msg, msg
 PY
 [ "$?" -eq 0 ] || fail "mutation_introduced_overlap not detected"
 
-# ---- Resolving the overlapping neighbor and re-analyzing must clear
-#      the live mutation-overlap error from the report.
+# The decision journal must encode the automatic rollback too; otherwise a
+# compacted recipe could resurrect geometry the live transaction rejected.
+rollback_log="$outdir/rollback-decisions.ndjson"
+rollback_recipe="$outdir/rollback.lua"
+"$exe" simplify "$step" --replace-solid-bbox solid:1 \
+    --out "$outdir/rollback.i" --max-rel-delta 100.0 \
+    --log "$rollback_log" >/dev/null 2>&1 || true
+"$exe" compact "$rollback_log" --out "$rollback_recipe" \
+    >/dev/null 2>&1 || fail "could not compact rollback log"
+python3 - "$rollback_log" "$outdir/rollback.json" <<'PY' || exit 1
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1]) if line.strip()]
+decisions = [r for r in records if r.get("kind") == "decision"
+             and r.get("op") == "apply_checked_replacement_operation"]
+undos = [r for r in records if r.get("kind") == "undo"]
+assert decisions and undos, (decisions, undos)
+recipe = json.load(open(sys.argv[2]))
+assert not any(op.get("op") == "apply_checked_replacement_operation"
+               for op in recipe["ops"]), recipe["ops"]
+PY
+
+# ---- The invalid mutation is atomic: it must already have rolled back.
+#      Removing the neighbor first then permits the replacement.
 cat >"$outdir/resolve_mutation_overlap.lua" <<'LUA'
 local s = csgify.session()
 local doc = s:load_step(arg[1])
 local r, err = s:replace_solid(doc .. "/solid:1", "bbox", { max_rel_delta = 100.0 })
+if r then error("overlap-producing replacement was not rolled back", 0) end
+r, err = s:analyze(doc)
 if not r then error(err, 0) end
+if r.document_revision ~= 0 then
+    error("rejected mutation advanced the document revision", 0)
+end
 r, err = s:remove_solid(doc .. "/solid:2")
+if not r then error(err, 0) end
+r, err = s:replace_solid(doc .. "/solid:1", "bbox", { max_rel_delta = 100.0 })
 if not r then error(err, 0) end
 r, err = s:analyze(doc)
 if not r then error(err, 0) end

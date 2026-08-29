@@ -6,6 +6,7 @@
 #include "recipe.hpp"
 #include "replay.hpp"
 #include "engine_model.hpp"
+#include "operation_registry.hpp"
 #include "session_impl.hpp"
 
 #include <cmath>
@@ -82,7 +83,8 @@ ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
          "angular_tolerance", "small_volume_fraction", "small_bbox_fraction",
          "thin_plate_ratio", "long_body_ratio", "heal_shape",
          "require_convex_cells", "try_planar_decomposition",
-         "split_union_cells", "shatter_relative_volume_tolerance",
+         "split_union_cells", "decomposition_relative_volume_tolerance",
+         "shatter_relative_volume_tolerance",
          "check_overlaps", "allow_overlaps", "overlap_volume_threshold",
          "overlap_volume_fraction"},
         "conversion");
@@ -127,6 +129,8 @@ ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
     take_bool("split_union_cells",      &options.split_union_cells);
     take_double("shatter_relative_volume_tolerance",
                 &options.shatter_relative_volume_tolerance);
+    take_double("decomposition_relative_volume_tolerance",
+                &options.decomposition_relative_volume_tolerance);
     take_bool("check_overlaps",         &options.check_overlaps);
     take_bool("allow_overlaps",         &options.allow_overlaps);
     take_double("overlap_volume_threshold", &options.overlap_volume_threshold);
@@ -199,6 +203,22 @@ void push_diagnostic_table(lua_State* L, const Diagnostic& diagnostic) {
     set_string_field(L, "local_shape_id", diagnostic.local_shape_id);
 }
 
+void push_geometry_certificate_table(lua_State* L,
+                                     const GeometryCertificate& certificate) {
+    lua_newtable(L);
+    set_boolean_field(L, "attempted", certificate.attempted);
+    set_boolean_field(L, "certified", certificate.certified);
+    set_integer_field(L, "faces_checked", certificate.faces_checked);
+    set_integer_field(L, "boolean_halfspace_checks",
+                      certificate.boolean_halfspace_checks);
+    set_number_field(L, "source_volume", certificate.source_volume);
+    set_number_field(L, "maximum_outside_volume",
+                     certificate.maximum_outside_volume);
+    set_number_field(L, "allowed_outside_volume",
+                     certificate.allowed_outside_volume);
+    set_string_field(L, "failure_code", certificate.failure_code);
+}
+
 void push_solid_table(lua_State* L, const AnalyzedSolid& solid) {
     lua_newtable(L);
     set_string_field(L, "id", solid.id);
@@ -226,6 +246,8 @@ void push_solid_table(lua_State* L, const AnalyzedSolid& solid) {
     set_boolean_field(L, "needs_spline_replacement", solid.needs_spline_replacement);
     set_boolean_field(L, "needs_surface_replacement", solid.needs_surface_replacement);
     set_boolean_field(L, "needs_user_decision", solid.needs_user_decision);
+    push_geometry_certificate_table(L, solid.certificate);
+    lua_setfield(L, -2, "geometry_certificate");
 
     lua_newtable(L);
     for (std::size_t i = 0; i < solid.face_ids.size(); ++i) {
@@ -291,6 +313,8 @@ void push_decomposed_piece_table(lua_State* L,
     set_boolean_field(L, "needs_spline_replacement", piece.needs_spline_replacement);
     set_boolean_field(L, "needs_surface_replacement", piece.needs_surface_replacement);
     set_boolean_field(L, "needs_user_decision", piece.needs_user_decision);
+    push_geometry_certificate_table(L, piece.certificate);
+    lua_setfield(L, -2, "geometry_certificate");
 }
 
 void push_performance_table(lua_State* L, const PerformanceMetrics& perf) {
@@ -669,6 +693,8 @@ void push_surface_replacement_proposal_table(
 void push_report_table(lua_State* L, const ConversionReport& report) {
     lua_newtable(L);
     set_boolean_field(L, "ok", report.ok());
+    set_integer_field(L, "schema_version", report.schema_version);
+    set_integer_field(L, "document_revision", report.document_revision);
     set_string_field(L, "document_id", report.document_id);
     set_string_field(L, "source_path", report.source_path);
     set_number_field(L, "total_volume", report.total_volume);
@@ -746,6 +772,27 @@ void push_report_table(lua_State* L, const ConversionReport& report) {
     lua_setfield(L, -2, "overlaps");
 
     lua_newtable(L);
+    for (std::size_t i = 0; i < report.provenance.size(); ++i) {
+        const ProvenanceRecord& record = report.provenance[i];
+        lua_newtable(L);
+        set_string_field(L, "entity_id", record.entity_id);
+        set_string_field(L, "operation", record.operation);
+        set_boolean_field(L, "exact", record.exact);
+        set_boolean_field(L, "approximation", record.approximation);
+        set_boolean_field(L, "has_tolerance_budget",
+                          record.has_tolerance_budget);
+        set_number_field(L, "tolerance_budget", record.tolerance_budget);
+        lua_newtable(L);
+        for (std::size_t j = 0; j < record.source_ids.size(); ++j) {
+            lua_pushstring(L, record.source_ids[j].c_str());
+            lua_rawseti(L, -2, static_cast<lua_Integer>(j + 1));
+        }
+        lua_setfield(L, -2, "source_ids");
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "provenance");
+
+    lua_newtable(L);
     for (std::size_t i = 0; i < report.decision_requests.size(); ++i) {
         push_decision_request_table(L, report.decision_requests[i]);
         lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
@@ -813,11 +860,8 @@ SplineFitKind fit_kind_from_lua(lua_State* L, int index) {
 
 ReplacementOperation replacement_operation_from_lua(lua_State* L, int index) {
     const std::string op = luaL_checkstring(L, index);
-    if (op == "bbox") return ReplacementOperation::bbox;
-    if (op == "bbox_cylinder") return ReplacementOperation::bbox_cylinder;
-    if (op == "fitted_cylinder") return ReplacementOperation::fitted_cylinder;
-    if (op == "fitted_sphere") return ReplacementOperation::fitted_sphere;
-    if (op == "fitted_cone") return ReplacementOperation::fitted_cone;
+    const OperationDescriptor* descriptor = find_replacement_by_lua_value(op);
+    if (descriptor) return descriptor->replacement_operation;
     luaL_error(L, "unknown replacement operation: %s", op.c_str());
     return ReplacementOperation::bbox;
 }
@@ -994,6 +1038,21 @@ int l_analyze_table(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* document_id = luaL_checkstring(L, 2);
     return push_command_result_table(L, analyze(*s->session, document_id));
+}
+
+int l_document_revision(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    lua_pushinteger(L, static_cast<lua_Integer>(
+        document_revision(*s->session, document_id)));
+    return 1;
+}
+
+int l_undo_last_mutation(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    return push_command_result(L,
+                               undo_last_mutation(*s->session, document_id));
 }
 
 int l_suggest_removals(lua_State* L) {
@@ -1752,6 +1811,10 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "analyze");
     lua_pushcfunction(L, l_analyze_table);
     lua_setfield(L, -2, "analyze_table");
+    lua_pushcfunction(L, l_document_revision);
+    lua_setfield(L, -2, "document_revision");
+    lua_pushcfunction(L, l_undo_last_mutation);
+    lua_setfield(L, -2, "undo_last_mutation");
     lua_pushcfunction(L, l_suggest_removals);
     lua_setfield(L, -2, "suggest_removals");
     lua_pushcfunction(L, l_propose_hole_fills);
@@ -1860,6 +1923,28 @@ int l_module_replay(lua_State* L) {
     return 1;
 }
 
+int l_module_operations(lua_State* L) {
+    lua_newtable(L);
+    const auto& registry = operation_registry();
+    for (std::size_t i = 0; i < registry.size(); ++i) {
+        const OperationDescriptor& descriptor = registry[i];
+        lua_newtable(L);
+        set_string_field(L, "name", descriptor.name);
+        set_string_field(L, "category", descriptor.category);
+        const char* target = descriptor.target == OperationTargetKind::document
+            ? "document"
+            : descriptor.target == OperationTargetKind::solid ? "solid" : "face";
+        set_string_field(L, "target_kind", target);
+        set_boolean_field(L, "mutating", descriptor.mutating);
+        set_boolean_field(L, "approximate", descriptor.approximate);
+        set_integer_field(L, "version", descriptor.version);
+        set_string_field(L, "cli_flag", descriptor.cli_flag);
+        set_string_field(L, "lua_value", descriptor.lua_value);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    return 1;
+}
+
 void register_csgify(lua_State* L) {
     register_session(L);
     lua_newtable(L);
@@ -1869,6 +1954,8 @@ void register_csgify(lua_State* L) {
     lua_setfield(L, -2, "compact");
     lua_pushcfunction(L, l_module_replay);
     lua_setfield(L, -2, "replay");
+    lua_pushcfunction(L, l_module_operations);
+    lua_setfield(L, -2, "operations");
     lua_setglobal(L, "csgify");
 }
 
