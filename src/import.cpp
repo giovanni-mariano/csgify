@@ -3,12 +3,15 @@
 // and emit stages. Pure import — no Alea, no traversal of solids.
 
 #include "engine_model.hpp"
+#include "fnv.hpp"
+#include "occt_document_guard.hpp"
 
 #include <cmath>
 #include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <Bnd_Box.hxx>
@@ -16,6 +19,7 @@
 #include <BRepBuilderAPI_Transform.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepGProp.hxx>
+#include <BRepTools.hxx>
 #include <GProp_GProps.hxx>
 #include <gp_Trsf.hxx>
 #include <TCollection_AsciiString.hxx>
@@ -29,6 +33,7 @@
 #include <STEPCAFControl_Reader.hxx>
 #include <STEPControl_Reader.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopLoc_Location.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp_Explorer.hxx>
 #include <UnitsMethods_LengthUnit.hxx>
@@ -66,6 +71,42 @@ std::string node_id(std::size_t index) {
     std::ostringstream out;
     out << "asm:" << index;
     return out.str();
+}
+
+std::string semantic_id(const char* prefix, const std::string& value) {
+    return std::string(prefix) + fnv1a128_hex(fnv1a128(value.data(), value.size()));
+}
+
+InstanceTransform instance_transform(const TDF_Label& label) {
+    InstanceTransform result;
+    const gp_Trsf transform = XCAFDoc_ShapeTool::GetLocation(label).Transformation();
+    std::size_t offset = 0;
+    for (int row = 1; row <= 3; ++row) {
+        for (int column = 1; column <= 4; ++column) {
+            result.values[offset++] = transform.Value(row, column);
+        }
+    }
+    return result;
+}
+
+std::string local_geometry_digest(const TDF_Label& definition_label) {
+    TopoDS_Shape shape = XCAFDoc_ShapeTool::GetShape(definition_label);
+    if (shape.IsNull()) {
+        return {};
+    }
+    // Prototype geometry is hashed in local coordinates and without mesh data,
+    // so occurrence placement and triangulation do not invalidate reuse.
+    shape.Location(TopLoc_Location());
+    std::ostringstream serialized;
+    BRepTools::Write(shape, serialized,
+                     /*theWithTriangles=*/false,
+                     /*theWithNormals=*/false,
+                     TopTools_FormatVersion_CURRENT);
+    if (!serialized) {
+        return {};
+    }
+    const std::string bytes = serialized.str();
+    return fnv1a128_hex(fnv1a128(bytes.data(), bytes.size()));
 }
 
 // Walk parent chain to build a path that disambiguates instances: at each
@@ -123,6 +164,20 @@ void collect_assembly_node(const Handle(XCAFDoc_ShapeTool)& shape_tool,
     node.label_entry = label_entry(label);
     node.kind = XCAFDoc_ShapeTool::IsAssembly(label) ? "assembly" : "shape";
     node.path = path;
+    TDF_Label referred_definition;
+    if (XCAFDoc_ShapeTool::GetReferredShape(label, referred_definition)
+        && !referred_definition.IsNull()) {
+        node.definition_entry = label_entry(referred_definition);
+        node.geometry_digest = local_geometry_digest(referred_definition);
+    } else {
+        node.definition_entry = node.label_entry;
+        node.geometry_digest = local_geometry_digest(label);
+    }
+    node.geometry_digest_verified = !node.geometry_digest.empty();
+    node.definition_id = semantic_id("def:", node.definition_entry);
+    node.instance_id = semantic_id(
+        "inst:", parent_id + "|" + node.label_entry + "|" + node.path);
+    node.transform = instance_transform(label);
     nodes->push_back(node);
 
     if (XCAFDoc_ShapeTool::IsAssembly(label)) {
@@ -142,6 +197,10 @@ void collect_assembly_node(const Handle(XCAFDoc_ShapeTool)& shape_tool,
                                       next_node_index, nodes);
                 if (before < nodes->size()) {
                     (*nodes)[before].label_entry = saved_entry;
+                    (*nodes)[before].instance_id = semantic_id(
+                        "inst:", id + "|" + saved_entry + "|"
+                            + (*nodes)[before].path);
+                    (*nodes)[before].transform = instance_transform(component);
                 }
             } else {
                 collect_assembly_node(shape_tool, component, id, path,
@@ -211,9 +270,21 @@ void populate_solid_metadata(const Handle(XCAFDoc_ShapeTool)& shape_tool,
                                    /*findComponent=*/true,
                                    /*findSubShape=*/true)
                 && !label.IsNull()) {
-                m.component_entry = label_entry(label);
-                m.name = label_name(label);
-                m.hierarchy_path = build_path_from_label(label);
+                // Search may return a definition subshape label for a solid
+                // nested inside a multi-solid occurrence. Assembly semantic
+                // nodes, however, are keyed by the owning component label.
+                // Walk to that occurrence so every local solid can be joined
+                // to its definition and share recognition/certification with
+                // rigidly transformed repetitions.
+                TDF_Label owner = label;
+                while (!owner.IsNull() && owner.Depth() > 0
+                       && !XCAFDoc_ShapeTool::IsComponent(owner)) {
+                    owner = owner.Father();
+                }
+                if (owner.IsNull() || owner.Depth() == 0) owner = label;
+                m.component_entry = label_entry(owner);
+                m.name = label_name(owner);
+                m.hierarchy_path = build_path_from_label(owner);
             }
         }
 
@@ -225,14 +296,81 @@ void populate_solid_metadata(const Handle(XCAFDoc_ShapeTool)& shape_tool,
 
 struct ImportedShape {
     TopoDS_Shape shape;
+    std::string source_digest;
     std::vector<AssemblyNode> assembly;
     std::vector<ShapeMetadata> solid_metadata;
+    StringTable strings;
+    std::vector<EntityMetadata> metadata;
+    std::vector<ComponentDefinition> component_definitions;
+    std::vector<ComponentInstance> component_instances;
     // Length unit captured from the XCAF document (or via the
     // XCAFDoc_LengthUnit attribute if the document carries one). Empty
     // name + 1.0 factor means "could not determine; assume native".
     std::string length_unit;
     double length_unit_to_mm = 1.0;
 };
+
+void populate_semantic_model(ImportedShape* imported) {
+    std::unordered_set<std::string> definitions;
+    for (AssemblyNode& node : imported->assembly) {
+        const std::string source_key = imported->source_digest.empty()
+            ? std::string("unknown-source") : imported->source_digest;
+        node.definition_id = semantic_id(
+            "def:", source_key + "|" + node.definition_entry);
+        node.instance_id = semantic_id(
+            "inst:", source_key + "|" + node.parent_id + "|"
+                + node.label_entry + "|" + node.path);
+        EntityMetadata metadata;
+        metadata.id = static_cast<MetadataId>(imported->metadata.size() + 1);
+        metadata.stable_name = imported->strings.intern(
+            node.kind == "shape"
+                ? node.instance_id
+                : semantic_id("assembly:", source_key + "|" + node.path));
+        metadata.display_name = imported->strings.intern(node.name);
+        metadata.source_cad_label = imported->strings.intern(node.label_entry);
+        metadata.source_component_path = imported->strings.intern(node.path);
+        metadata.annotations.push_back({
+            imported->strings.intern("source_definition_entry"),
+            imported->strings.intern(node.definition_entry),
+            AnnotationOrigin::cad,
+            MetadataReviewState::informational,
+            false,
+        });
+        metadata.annotations.push_back({
+            imported->strings.intern("source_document_digest"),
+            imported->strings.intern(imported->source_digest),
+            AnnotationOrigin::csgify,
+            MetadataReviewState::informational,
+            false,
+        });
+        node.metadata_id = metadata.id;
+        imported->metadata.push_back(std::move(metadata));
+
+        if (node.kind != "shape") {
+            continue;
+        }
+
+        if (definitions.insert(node.definition_id).second) {
+            ComponentDefinition definition;
+            definition.id = node.definition_id;
+            definition.source_definition_key =
+                imported->strings.intern(node.definition_entry);
+            definition.geometry_digest = node.geometry_digest;
+            definition.geometry_digest_verified = node.geometry_digest_verified;
+            definition.metadata_id = node.metadata_id;
+            imported->component_definitions.push_back(std::move(definition));
+        }
+
+        ComponentInstance instance;
+        instance.id = node.instance_id;
+        instance.definition_id = node.definition_id;
+        instance.parent_assembly_id = node.parent_id;
+        instance.source_shape_id = node.shape_id;
+        instance.transform = node.transform;
+        instance.metadata_id = node.metadata_id;
+        imported->component_instances.push_back(std::move(instance));
+    }
+}
 
 // Map the meter-scale factor returned by XCAFDoc_DocumentTool::GetLengthUnit
 // to a short unit label (the value is the size of one internal unit in
@@ -257,6 +395,7 @@ const char* unit_name_from_meter_factor(double f) {
 }
 
 ImportedShape read_step_shape(const std::string& step_path, ConversionReport& report) {
+    const std::string source_digest = fnv1a128_file_hex(step_path);
     STEPCAFControl_Reader reader;
     const IFSelect_ReturnStatus status = reader.ReadFile(step_path.c_str());
     if (status != IFSelect_RetDone) {
@@ -267,7 +406,10 @@ ImportedShape read_step_shape(const std::string& step_path, ConversionReport& re
 
     const int roots = reader.NbRootsForTransfer();
     Handle(TDocStd_Document) doc;
-    XCAFApp_Application::GetApplication()->NewDocument("MDTV-XCAF", doc);
+    const Handle(XCAFApp_Application) application =
+        XCAFApp_Application::GetApplication();
+    application->NewDocument("MDTV-XCAF", doc);
+    detail::XcafDocumentGuard document_guard(application, doc);
     if (roots <= 0 || !reader.Transfer(doc)) {
         add_diag(report, DiagnosticSeverity::error, "step_transfer_failed",
                  "OCCT did not transfer any STEP roots.");
@@ -275,6 +417,7 @@ ImportedShape read_step_shape(const std::string& step_path, ConversionReport& re
     }
 
     ImportedShape imported;
+    imported.source_digest = source_digest;
     imported.shape = reader.Reader().OneShape();
 
     // STEP length unit. Prefer the XCAFDoc_LengthUnit attribute if the
@@ -331,6 +474,7 @@ ImportedShape read_step_shape(const std::string& step_path, ConversionReport& re
                 node.shape_id = it->second;
             }
         }
+        populate_semantic_model(&imported);
     }
     return imported;
 }
@@ -388,9 +532,32 @@ CadModel load_step_model(const std::string& step_path,
     model.root = imported.shape;
     model.assembly = imported.assembly;
     model.solid_metadata = imported.solid_metadata;
+    model.strings = std::move(imported.strings);
+    model.metadata = std::move(imported.metadata);
+    model.component_definitions = std::move(imported.component_definitions);
+    model.component_instances = std::move(imported.component_instances);
     model.length_unit = imported.length_unit;
     model.length_unit_to_mm = imported.length_unit_to_mm;
     model.diagnostics = load_report.diagnostics;
+
+    MaterialDefinition default_material;
+    default_material.id = "material:" + std::to_string(options.default_material_id);
+    EntityMetadata material_metadata;
+    material_metadata.id = static_cast<MetadataId>(model.metadata.size() + 1);
+    material_metadata.stable_name = model.strings.intern(default_material.id);
+    material_metadata.display_name = model.strings.intern("default material");
+    material_metadata.annotations.push_back({
+        model.strings.intern("material_source"),
+        model.strings.intern("conversion_default"),
+        AnnotationOrigin::csgify,
+        MetadataReviewState::informational,
+        false,
+    });
+    model.metadata.push_back(std::move(material_metadata));
+    default_material.metadata_id = model.metadata.back().id;
+    default_material.phase = MaterialPhase::unknown;
+    default_material.density = options.default_density;
+    model.materials.push_back(std::move(default_material));
 
     // --units NAME overrides the asserted unit name (no geometry change).
     // --scale X overrides the scale-to-mm factor (no geometry change).

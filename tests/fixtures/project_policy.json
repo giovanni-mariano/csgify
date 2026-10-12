@@ -1,0 +1,50 @@
+{
+  "schema": "csgify.project-policy",
+  "schema_version": 1,
+  "project_id": "fixture-l-shape",
+  "intended_analysis": "geometry-prototype",
+  "preparation": {
+    "heal_shape": false,
+    "unit_override": "mm",
+    "unit_scale_to_mm_override": 0.0,
+    "normalize_to_unit": ""
+  },
+  "authority": {
+    "mode": "propose",
+    "allow_high_confidence_decomposition": true,
+    "allow_certified_intermediate_decomposition": false,
+    "allow_exact_surface_replacement": true,
+    "allow_approximate_surface_replacement": false,
+    "allow_removal": false,
+    "allow_contained_medium_generation": false,
+    "contained_medium_materials": [],
+    "max_relative_volume_delta": 1e-8,
+    "max_intermediate_relative_volume_delta": 0.0,
+    "min_piece_volume_fraction": 1e-8,
+    "max_surface_deviation": 0.0,
+    "max_removal_volume_fraction": 0.0,
+    "max_auto_actions": 32,
+    "max_intermediate_pieces": 64,
+    "max_intermediate_residual_pieces": 4,
+    "approximation": {
+      "enabled": false,
+      "global_limit": 0.0,
+      "body_limit": 0.0,
+      "action_limit": 0.0,
+      "global_added_limit": 0.0,
+      "global_removed_limit": 0.0,
+      "body_added_limit": 0.0,
+      "body_removed_limit": 0.0,
+      "surface_deviation_limit": 0.0,
+      "allow_surface_replacement": false,
+      "allow_sliver_removal": false,
+      "allow_bbox_replacement": false,
+      "allow_numerical_shatter_loss": false,
+      "allow_overlap_resolution": false,
+      "require_containment_preservation": true,
+      "require_topology_preservation": true,
+      "protected_target_ids": [],
+      "protected_material_ids": []
+    }
+  }
+}

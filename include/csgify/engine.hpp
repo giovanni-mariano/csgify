@@ -1,11 +1,16 @@
 #pragma once
 
+#include "csgify/assembly.hpp"
+#include "csgify/approximation.hpp"
+#include "csgify/medium.hpp"
+
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace csgify {
 
+const char* csgify_version();
 const char* occt_version();
 
 enum class DiagnosticSeverity {
@@ -61,6 +66,9 @@ enum class SplineFitKind {
 struct SplineFaceFit {
     SplineFitKind kind = SplineFitKind::none;
     bool available = false;
+    // True only when max_deviation is an independently established upper
+    // bound. A sampled residual alone must never be promoted to exactness.
+    bool deviation_certified = false;
     std::size_t sample_count = 0;
     double max_deviation = 0.0;
     double rms_deviation = 0.0;
@@ -106,6 +114,102 @@ struct GeometryCertificate {
     double maximum_outside_volume = 0.0;
     double allowed_outside_volume = 0.0;
     std::string failure_code;
+};
+
+struct ShellTopology {
+    std::size_t index = 0;
+    std::string role;
+    std::size_t vertex_count = 0;
+    std::size_t edge_count = 0;
+    std::size_t face_count = 0;
+    std::size_t face_inner_wire_count = 0;
+    long long raw_euler_characteristic = 0;
+    long long euler_characteristic = 0;
+    bool closed = false;
+    bool genus_known = false;
+    long long genus = 0;
+};
+
+struct RecognitionCandidate {
+    std::string kind;
+    std::string strategy;
+    std::string confidence;
+    double score = 0.0;
+    bool exact = false;
+    std::vector<std::string> reason_codes;
+};
+
+struct PipePortTopology {
+    std::string id;
+    Vec3 center;
+    Vec3 normal;
+    double radius = 0.0;
+};
+
+struct PipeAnnulusTopology {
+    bool candidate = false;
+    bool conical = false;
+    Vec3 axis_origin;
+    Vec3 axis_direction;
+    double inner_radius = 0.0;
+    double outer_radius = 0.0;
+    double top_inner_radius = 0.0;
+    double top_outer_radius = 0.0;
+    double axial_length = 0.0;
+    std::size_t cylindrical_face_count = 0;
+    std::size_t conical_face_count = 0;
+    std::size_t planar_end_face_count = 0;
+    std::vector<PipePortTopology> ports;
+};
+
+struct RevolutionTopology {
+    bool candidate = false;
+    bool full_revolution = false;
+    Vec3 axis_origin;
+    Vec3 axis_direction;
+    double angular_extent = 0.0;
+    std::size_t axial_level_count = 0;
+    std::size_t cylindrical_face_count = 0;
+    std::size_t conical_face_count = 0;
+    std::size_t toroidal_face_count = 0;
+    std::size_t spherical_face_count = 0;
+    std::size_t radial_seam_face_count = 0;
+};
+
+struct SolidTopology {
+    std::size_t vertex_count = 0;
+    std::size_t edge_count = 0;
+    std::size_t face_count = 0;
+    std::size_t shell_count = 0;
+    std::size_t closed_shell_count = 0;
+    std::size_t cavity_shell_count = 0;
+    std::size_t face_inner_wire_count = 0;
+    std::size_t manifold_edge_count = 0;
+    std::size_t boundary_edge_count = 0;
+    std::size_t nonmanifold_edge_count = 0;
+    std::size_t linear_edge_count = 0;
+    std::size_t planar_face_count = 0;
+    std::size_t concave_edge_count = 0;
+    std::size_t convex_edge_count = 0;
+    std::size_t tangent_or_unknown_edge_count = 0;
+    long long raw_euler_characteristic = 0;
+    long long euler_characteristic = 0;
+    std::size_t unique_plane_count = 0;
+    std::size_t normal_direction_count = 0;
+    double bbox_fill_ratio = 0.0;
+    bool prismatic_candidate = false;
+    Vec3 prism_axis;
+    std::size_t axial_level_count = 0;
+    std::size_t axial_end_face_count = 0;
+    std::size_t extrusion_profile_hole_count = 0;
+    bool constant_cross_section_candidate = false;
+    PipeAnnulusTopology pipe_annulus;
+    RevolutionTopology revolution;
+    std::vector<RecognitionCandidate> recognition_candidates;
+    std::string selected_recognition_kind;
+    std::string recommended_strategy;
+    std::vector<std::string> reason_codes;
+    std::vector<ShellTopology> shells;
 };
 
 struct ProvenanceRecord {
@@ -183,6 +287,8 @@ struct FittedConeCandidate {
 struct AnalyzedSolid {
     std::string id;
     std::string label;
+    ComponentInstanceId component_instance_id;
+    ComponentDefinitionId component_definition_id;
     std::size_t index = 0;
     double volume = 0.0;
     double volume_fraction = 0.0;
@@ -208,7 +314,11 @@ struct AnalyzedSolid {
     bool needs_spline_replacement = false;
     bool needs_surface_replacement = false;
     bool needs_user_decision = false;
+    // The lean fixed-point pass may postpone curved face/half-space OCCT
+    // Booleans. This is never an exact result and cannot pass emission.
+    bool convexity_certificate_deferred = false;
     GeometryCertificate certificate;
+    SolidTopology topology;
     std::vector<std::string> face_ids;
     std::string name;
     std::string hierarchy_path;
@@ -241,6 +351,7 @@ struct DecompositionCandidatePiece {
     bool needs_spline_replacement = false;
     bool needs_surface_replacement = false;
     bool needs_user_decision = false;
+    std::size_t halfspace_violation_count = 0;
 };
 
 struct DecompositionCandidate {
@@ -289,6 +400,9 @@ struct DecompositionCandidate {
     double min_piece_volume_fraction = 0.0;
     double max_piece_volume_fraction = 0.0;
     double volume_balance = 0.0;
+    std::size_t parent_halfspace_violation_count = 0;
+    std::size_t max_piece_halfspace_violation_count = 0;
+    double progress_ratio = 0.0;
     std::vector<DecompositionCandidatePiece> pieces;
     std::vector<Diagnostic> diagnostics;
 };
@@ -304,6 +418,8 @@ struct DecompositionProposal {
 struct RemovalCandidate {
     std::string id;
     std::string solid_id;
+    ComponentInstanceId component_instance_id;
+    ComponentDefinitionId component_definition_id;
     std::string label;
     std::string name;
     std::string hierarchy_path;
@@ -403,6 +519,22 @@ struct HoleFillProposal {
     std::vector<Diagnostic> diagnostics;
 };
 
+struct MediumGenerationProposal {
+    bool ok = false;
+    bool conical = false;
+    MediumGenerationRequest request;
+    std::string host_shape_id;
+    std::string host_component_id;
+    Vec3 base;
+    Vec3 height;
+    double radius = 0.0;
+    double top_radius = 0.0;
+    MediumNetworkTopology network;
+    DerivedRegionCertificate certificate;
+    std::vector<DecisionRequest> decision_requests;
+    std::vector<Diagnostic> diagnostics;
+};
+
 struct SurfaceReplacementCandidate {
     std::string id;
     std::string face_id;
@@ -412,6 +544,7 @@ struct SurfaceReplacementCandidate {
     std::string confidence;
     std::string reason;
     bool exact = false;
+    bool deviation_certified = false;
     bool usable = false;
     double score = 0.0;
     double max_deviation = 0.0;
@@ -440,6 +573,7 @@ struct DecompositionPolicy {
     bool allow_high_confidence_face_auto = true;
     bool allow_bbox_fallback_auto = false;
     bool allow_medium_confidence_auto = false;
+    bool allow_low_confidence_auto = false;
     double max_relative_delta = 1.0e-8;
     double min_piece_volume_fraction = 1.0e-8;
     std::size_t max_splits_per_target = 16;
@@ -453,6 +587,15 @@ struct AssemblyNode {
     std::string shape_id;
     std::string kind;
     std::string path;
+    // Additive semantic identity fields. Legacy asm:N IDs remain available
+    // while definitions and occurrences gain stable, source-derived IDs.
+    std::string definition_entry;
+    ComponentDefinitionId definition_id;
+    ComponentInstanceId instance_id;
+    std::string geometry_digest;
+    bool geometry_digest_verified = false;
+    InstanceTransform transform;
+    MetadataId metadata_id = kInvalidMetadataId;
 };
 
 struct PerformanceMetrics {
@@ -465,6 +608,39 @@ struct PerformanceMetrics {
     std::size_t candidates_evaluated = 0;
     std::size_t splitter_calls = 0;
     std::size_t pieces_produced = 0;
+    std::size_t spatial_candidate_pairs = 0;
+    std::size_t exact_overlap_tests = 0;
+    // Recognition is computed once per verified geometry definition and then
+    // transported to rigidly transformed occurrences of that definition.
+    std::size_t definition_recognition_cache_hits = 0;
+    std::size_t definition_recognition_cache_misses = 0;
+    std::size_t definition_conversion_cache_hits = 0;
+    std::size_t definition_conversion_cache_published = 0;
+    // Fixed-point decomposition diagnostics. Exposing local proof and global
+    // reconciliation costs guards against accidentally reintroducing copied
+    // whole-model candidate trials.
+    double local_analysis_ms = 0.0;
+    double local_certificate_ms = 0.0;
+    double local_overlap_ms = 0.0;
+    double full_reconciliation_ms = 0.0;
+    double full_analysis_ms = 0.0;
+    double full_overlap_ms = 0.0;
+    double full_ledger_ms = 0.0;
+    std::size_t local_trials_generated = 0;
+    std::size_t local_trials_certified = 0;
+    std::size_t local_trials_rejected = 0;
+    std::size_t parallel_plane_batches = 0;
+    std::size_t local_overlap_candidates = 0;
+    std::size_t local_exact_overlap_tests = 0;
+    std::size_t local_overlap_containment_proofs = 0;
+    std::size_t overlap_pair_cache_hits = 0;
+    std::size_t overlap_pair_cache_misses = 0;
+    std::size_t local_partition_boolean_calls = 0;
+    std::size_t body_certificate_cache_hits = 0;
+    std::size_t body_certificate_cache_misses = 0;
+    std::size_t full_reconciliations = 0;
+    std::size_t whole_model_trial_copies = 0;
+    std::size_t peak_local_pieces = 0;
 };
 
 struct ConversionOptions {
@@ -476,9 +652,25 @@ struct ConversionOptions {
     double long_body_ratio = 10.0;
     int default_material_id = 1;
     double default_density = 0.0;
+    ApproximationPolicy approximation;
     bool heal_shape = true;
     bool require_convex_cells = true;
-    bool try_planar_decomposition = true;
+    // Detailed topology probes, face areas/bboxes, spline fit proposals, and
+    // fitted primitive replacement candidates are useful for interactive
+    // inspection but are not inputs to exact fixed-point decomposition. The
+    // coordinator disables them on its internal passes for large-model
+    // throughput. Exact convexity and partition certificates remain enabled.
+    bool analyze_topology_metrics = true;
+    bool analyze_face_metrics = true;
+    bool analyze_fitted_replacements = true;
+    bool defer_curved_halfspace_certificates = false;
+    // Geometry mutation belongs in explicit preprocessing operations.  Emit
+    // is pure by default; the legacy transient planar split remains available
+    // only to callers that deliberately opt in.
+    bool try_planar_decomposition = false;
+    // Decomposed pieces are first reunited and Boolean-simplified.  Only a
+    // genuine union that cannot be reduced to one half-space intersection is
+    // split into separate output cells.
     bool split_union_cells = true;
     // Dimensionless conservation guard shared by directed planar/face/plane
     // decomposition. A split that exceeds it is rejected before mutation.
@@ -490,13 +682,19 @@ struct ConversionOptions {
     // validation. `shatter_relative_volume_tolerance` is dimensionless and
     // independently controls the volume-conservation guard;
     // `allow_shatter_volume_drift` explicitly overrides that guard. When
-    // `union_decomposed_pieces` is set, emit groups pieces sharing a
-    // source_solid_id into a single Alea union cell instead of one cell per
-    // piece; Alea's flatten/dedup then collapses the shared cut surfaces.
+    // Group pieces sharing a source_solid_id into one Alea union before final
+    // simplification.  This lets complementary artificial cut surfaces cancel
+    // and coalesces every union that is representable as one intersection.
+    // Set false only when deliberately preserving the raw partition.
     int shatter_max_depth = 8;
     double shatter_relative_volume_tolerance = 1.0e-7;
     bool allow_shatter_volume_drift = false;
-    bool union_decomposed_pieces = false;
+    bool union_decomposed_pieces = true;
+    std::size_t prismatic_max_pieces = 4096;
+    std::size_t prismatic_max_splitter_calls = 10000;
+    // Optional read-only analysis filter. IDs retain their original solid:N
+    // numbering; conversion and mutation never consult this field.
+    std::vector<std::string> analysis_target_ids;
     // Overlap detection. Runs during analyze; emits `solid_overlap`
     // diagnostics for pairs whose intersection volume exceeds
     // overlap_volume_threshold (absolute) OR overlap_volume_fraction
@@ -513,9 +711,17 @@ struct ConversionOptions {
     // (e.g., during incremental simplification where the overlap is
     // expected to be resolved by a later op).
     bool check_overlaps = true;
+    // Independent OCCT Common operations are evaluated concurrently, while
+    // results are merged in deterministic pair order. Keep this bounded: one
+    // Boolean can itself use substantial memory on ITER-scale components.
+    std::size_t overlap_parallelism = 4;
     bool allow_overlaps = false;
     double overlap_volume_threshold = 1.0e-9;
     double overlap_volume_fraction = 1.0e-6;
+    // Optional non-emitting container used to prove modeled-domain coverage.
+    // The selected active body is excluded from MCNP material-cell emission.
+    std::string mcnp_domain_id;
+    bool require_domain_coverage = false;
     // Unit overrides applied at STEP import. Per docs/PHILOSOPHY.md
     // ("make failure visible"), the default is report-only: the
     // importer captures the declared STEP unit but does not silently
@@ -538,6 +744,36 @@ struct SolidOverlap {
     double volume_b = 0.0;
     double intersection_volume = 0.0;
     double min_fraction = 0.0;
+};
+
+enum class CoverageStatus { not_configured, certified, gap, unknown };
+
+struct McnpGeometrySafetyReport {
+    bool validated = false;
+    bool safe_to_emit = false;
+    std::size_t overlap_count = 0;
+    std::size_t overlap_unknown_count = 0;
+    CoverageStatus coverage_status = CoverageStatus::not_configured;
+    std::string domain_id;
+    double domain_volume = 0.0;
+    double uncovered_volume = 0.0;
+    double outside_domain_volume = 0.0;
+    std::string failure_code;
+};
+
+struct AleaHandoffSummary {
+    bool attempted = false;
+    bool compatible = false;
+    std::size_t schema_major = 0;
+    std::size_t schema_minor = 0;
+    std::string libalea_version;
+    std::string contract_digest;
+    std::size_t cell_count = 0;
+    std::size_t surface_count = 0;
+    std::size_t universe_count = 0;
+    std::size_t sidecar_entity_count = 0;
+    std::size_t chunk_count = 0;
+    std::vector<std::string> missing_capabilities;
 };
 
 struct ConversionReport {
@@ -571,9 +807,20 @@ struct ConversionReport {
     std::vector<AnalyzedFace> faces;
     std::vector<AnalyzedDecomposedPiece> decomposed_pieces;
     std::vector<AssemblyNode> assembly;
+    StringTable strings;
+    std::vector<EntityMetadata> metadata;
+    std::vector<ComponentDefinition> component_definitions;
+    std::vector<ComponentInstance> component_instances;
+    std::vector<MaterialDefinition> materials;
+    std::vector<MediumGenerationRequest> medium_requests;
+    std::vector<DerivedRegionRecord> derived_regions;
     std::vector<DecisionRequest> decision_requests;
     std::vector<SolidOverlap> overlaps;
     std::vector<ProvenanceRecord> provenance;
+    ApproximationPolicy approximation_policy;
+    ApproximationLedger approximation_ledger;
+    McnpGeometrySafetyReport mcnp_geometry_safety;
+    AleaHandoffSummary alea_handoff;
     PerformanceMetrics performance;
 
     bool ok() const;

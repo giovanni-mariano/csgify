@@ -1,0 +1,61 @@
+{
+  "schema": "csgify.decomposition-benchmark-cases",
+  "schema_version": 1,
+  "cases": {
+    "triangle": {
+      "description": "229-component analytic assembly used for the GEOUNED comparison",
+      "input": "/home/giovanni/projects/cad_examples/geouned_steps/geo_large/Triangle.stp",
+      "sha256": "e660b7a9b1ef1da724c1a037fc14bae329cba6c9ff5df9db506174e2c1223c32",
+      "timeout_seconds": 420,
+      "arguments": [
+        "--fixed-point",
+        "--policy", "medium",
+        "--max-elapsed-ms", "300000"
+      ]
+    },
+    "fwtbm1": {
+      "description": "Thin-walled planar/prismatic FWTBM component that previously exhausted memory",
+      "input": "/home/giovanni/projects/cad_examples/geouned_steps/new_FWTBM1/FWTBM1.step",
+      "sha256": "377e221dfc76fc2cb349574a72c6dab7b2ef6a234209e0cd9325c3823d0f7872",
+      "timeout_seconds": 420,
+      "arguments": [
+        "--fixed-point",
+        "--policy", "medium",
+        "--max-elapsed-ms", "300000"
+      ]
+    },
+    "toy_car": {
+      "description": "15-body toy-car assembly with analytic non-convex components and a tiny input overlap",
+      "input": "/home/giovanni/Downloads/toy-car-assembly-3.snapshot.2/Toy car .STEP",
+      "sha256": "3bf45e784efbb244e387911593c6fe0d83e8e89aea5e1186f6a606be37f0add9",
+      "timeout_seconds": 420,
+      "arguments": [
+        "--fixed-point",
+        "--policy", "medium",
+        "--max-depth", "6",
+        "--max-elapsed-ms", "300000"
+      ]
+    },
+    "iter_shielding": {
+      "description": "68 MiB IVCA/shielding assembly representative of ITER port-scale repeated rails, covers, brackets, and locking hardware",
+      "input": "tests/fixtures/SHIELDING_ASSY_5638_assembly.stp",
+      "sha256": "ed616d7724c519f23e82d9edb0b404970e60f429918dcba1e86e48c590dd7fe0",
+      "timeout_seconds": 900,
+      "arguments": [
+        "--fixed-point",
+        "--policy", "medium",
+        "--max-depth", "6",
+        "--max-active-pieces", "8192",
+        "--max-residual-pieces", "2048",
+        "--max-candidates-per-target", "64",
+        "--max-elapsed-ms", "300000"
+      ]
+    },
+    "l_shape": {
+      "description": "Small checked fixture for validating the benchmark harness",
+      "input": "tests/fixtures/l_shape.step",
+      "timeout_seconds": 60,
+      "arguments": ["--fixed-point", "--policy", "medium"]
+    }
+  }
+}

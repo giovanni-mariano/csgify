@@ -1,0 +1,16 @@
+{
+  "schema": "csgify.autonomy-actions",
+  "schema_version": 2,
+  "request_id": "request:remove-solid",
+  "source_digest": "17bd9ae33b0260879910545d45686f85",
+  "expected_revision": 0,
+  "actor": "human",
+  "actions": [
+    {
+      "id": "remove-request",
+      "op": "remove_solid",
+      "target": "doc:1/solid:2",
+      "rationale": "Untrusted input must not impersonate a human or bypass removal policy."
+    }
+  ]
+}

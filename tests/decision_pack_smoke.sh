@@ -29,7 +29,7 @@ manifest = json.load(open(sys.argv[1], encoding="utf-8"))
 assert manifest["decision_id"] == "decision:decomposition:solid:1", manifest
 assert manifest["kind"] == "decomposition", manifest
 assert manifest["target_id"] == "solid:1", manifest
-assert manifest["recommended_action"] == "decompose-suggest", manifest
+assert manifest["recommended_action"] == "prismatic_decomposition", manifest
 assert manifest["images"]["target"] == "target.svg", manifest
 assert manifest["candidates"], manifest
 PY

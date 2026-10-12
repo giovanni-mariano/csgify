@@ -108,6 +108,7 @@ PY
 
 # ---- normalize logged into decision log ----------------------------------
 logged_log="$outdir/log.json"
+rm -f "$logged_log"
 "$exe" inspect "$step" --normalize-units m \
     --log "$logged_log" --report "$outdir/box_norm_m.json" \
     >/dev/null 2>&1 || fail "inspect --normalize-units m --log failed"

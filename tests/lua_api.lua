@@ -27,6 +27,152 @@ do
 end
 
 ----------------------------------------------------------------------
+-- Phase 5: typed fluid material and contained-medium proposal bindings.
+----------------------------------------------------------------------
+do
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/box.step")
+    local defined = s:define_material(doc, {
+        id = "material:7", phase = "liquid", density = 0.997
+    })
+    if type(defined) ~= "table" then
+        fail("define_material should return a report table")
+    end
+    local proposal = s:propose_contained_medium(doc, {
+        id = "medium:not-a-pipe",
+        material_id = "material:7",
+        host_component_ids = { "inst:missing" },
+        ports = {
+            { port_id = "port:1", disposition = "cap_here" },
+            { port_id = "port:2", disposition = "cap_here" },
+        }
+    })
+    if type(proposal) ~= "table" or proposal.ok ~= false
+       or type(proposal.diagnostics) ~= "table" then
+        fail("contained-medium proposal binding returned an invalid shape")
+    end
+    local staged = s:stage_contained_medium_request(doc, {
+        id = "medium:pending",
+        material_id = "material:7",
+        host_component_ids = { "inst:missing" },
+        ports = {
+            { port_id = "port:1", disposition = "unresolved" },
+        }
+    })
+    if type(staged) ~= "table" then
+        fail("stage_contained_medium_request should return a report table")
+    end
+end
+
+----------------------------------------------------------------------
+-- Batch removal is one atomic revision and one undo restores the batch.
+-- A bad target must leave both the geometry and revision untouched.
+----------------------------------------------------------------------
+do
+    local s = csgify.session()
+    local doc = s:load_step(fixtures .. "/four_solids.step")
+
+    local rejected = s:remove_solids({
+        doc .. "/solid:2",
+        doc .. "/solid:999",
+        doc .. "/solid:3",
+    })
+    if rejected then fail("invalid removal batch unexpectedly succeeded") end
+    if s:document_revision(doc) ~= 0 then
+        fail("invalid removal batch changed the document revision")
+    end
+    local unchanged = s:analyze_table(doc)
+    if unchanged.solids_seen ~= 4 then
+        fail("invalid removal batch partially changed the model")
+    end
+
+    local removed, err = s:remove_solids({
+        doc .. "/solid:2",
+        doc .. "/solid:3",
+        doc .. "/solid:2", -- duplicate IDs are idempotent within a batch
+    })
+    if not removed then fail("batch removal failed: " .. tostring(err)) end
+    if removed.document_revision ~= 1 or removed.solids_seen ~= 2 then
+        fail("batch removal did not commit exactly one two-solid revision")
+    end
+
+    local restored, undo_err = s:undo_last_mutation(doc)
+    if not restored then fail("batch removal undo failed: " .. tostring(undo_err)) end
+    if restored.document_revision ~= 2 or restored.solids_seen ~= 4 then
+        fail("one undo did not restore the complete removal batch")
+    end
+end
+
+do
+    local s = csgify.session()
+    local first = s:load_step(fixtures .. "/box.step")
+    local second = s:load_step(fixtures .. "/box.step")
+    local mixed = s:remove_solids({
+        first .. "/solid:1",
+        second .. "/solid:1",
+    })
+    if mixed then fail("mixed-document removal batch unexpectedly succeeded") end
+    if s:document_revision(first) ~= 0 or s:document_revision(second) ~= 0 then
+        fail("mixed-document removal batch changed a document revision")
+    end
+end
+
+----------------------------------------------------------------------
+-- Consecutive removal decisions stay batched in generated Lua recipes and
+-- machine replay accepts the individual stable-target records atomically.
+----------------------------------------------------------------------
+do
+    local log_path = outdir .. "/batch_remove_decisions.json"
+    local recipe_path = outdir .. "/batch_remove_recipe.lua"
+    local recipe_json = outdir .. "/batch_remove_recipe.json"
+    local replay_out = outdir .. "/batch_remove_replay.i"
+    local replay_report = outdir .. "/batch_remove_replay.json"
+    os.remove(log_path)
+    os.remove(recipe_path)
+    os.remove(recipe_json)
+    os.remove(replay_out)
+    os.remove(replay_report)
+
+    local s = csgify.session()
+    s:attach_decision_log(log_path, fixtures .. "/four_solids.step")
+    local doc = s:load_step(fixtures .. "/four_solids.step")
+    local removed = s:remove_solids({
+        doc .. "/solid:2",
+        doc .. "/solid:3",
+    })
+    if not removed then fail("logged batch removal failed") end
+    s = nil
+    collectgarbage("collect")
+
+    local compacted, compact_err = csgify.compact(log_path, recipe_path)
+    if not compacted then
+        fail("batch removal compact failed: " .. tostring(compact_err))
+    end
+    local recipe = io.open(recipe_path, "r")
+    if not recipe then fail("batch removal recipe was not written") end
+    local recipe_body = recipe:read("*a")
+    recipe:close()
+    if not recipe_body:find("s:remove_solids({", 1, true) then
+        fail("generated recipe did not preserve batch removal")
+    end
+    if recipe_body:find("s:remove_solid(", 1, true) then
+        fail("generated recipe regressed to sequential removal")
+    end
+
+    local replayed, replay_err = csgify.replay(
+        recipe_json,
+        fixtures .. "/four_solids.step",
+        replay_out,
+        replay_report)
+    if not replayed then
+        fail("machine replay of batch removal failed: " .. tostring(replay_err))
+    end
+    local deck = io.open(replay_out, "r")
+    if not deck then fail("batch removal replay did not emit an output deck") end
+    deck:close()
+end
+
+----------------------------------------------------------------------
 -- Safety options are strict: a misspelled tolerance must not silently use
 -- the default value.
 ----------------------------------------------------------------------

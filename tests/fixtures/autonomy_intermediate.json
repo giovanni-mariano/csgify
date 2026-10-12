@@ -1,0 +1,17 @@
+{
+  "schema": "csgify.autonomy-actions",
+  "schema_version": 2,
+  "request_id": "request:certified-intermediate",
+  "source_digest": "b2ef122e8611147c11822eacb6e5b89e",
+  "expected_revision": 0,
+  "actor": "llm:test",
+  "actions": [
+    {
+      "id": "certified-intermediate",
+      "op": "apply_decomposition_candidate",
+      "target": "doc:1/solid:1",
+      "candidate": "candidate:8",
+      "rationale": "Exercise the explicit certified-intermediate policy gate."
+    }
+  ]
+}

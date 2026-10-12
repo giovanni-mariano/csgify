@@ -128,6 +128,164 @@ void write_geometry_certificate_json(std::ostream& out,
     out << indent << "}";
 }
 
+void write_topology_json(std::ostream& out,
+                         const SolidTopology& topology,
+                         const std::string& indent) {
+    out << "{\n";
+    auto count = [&](const char* name, std::size_t value, bool comma = true) {
+        out << indent << "  \"" << name << "\": " << value
+            << (comma ? "," : "") << "\n";
+    };
+    count("vertex_count", topology.vertex_count);
+    count("edge_count", topology.edge_count);
+    count("face_count", topology.face_count);
+    count("shell_count", topology.shell_count);
+    count("closed_shell_count", topology.closed_shell_count);
+    count("cavity_shell_count", topology.cavity_shell_count);
+    count("face_inner_wire_count", topology.face_inner_wire_count);
+    count("manifold_edge_count", topology.manifold_edge_count);
+    count("boundary_edge_count", topology.boundary_edge_count);
+    count("nonmanifold_edge_count", topology.nonmanifold_edge_count);
+    count("linear_edge_count", topology.linear_edge_count);
+    count("planar_face_count", topology.planar_face_count);
+    count("concave_edge_count", topology.concave_edge_count);
+    count("convex_edge_count", topology.convex_edge_count);
+    count("tangent_or_unknown_edge_count", topology.tangent_or_unknown_edge_count);
+    out << indent << "  \"raw_euler_characteristic\": "
+        << topology.raw_euler_characteristic << ",\n";
+    out << indent << "  \"euler_characteristic\": "
+        << topology.euler_characteristic << ",\n";
+    count("unique_plane_count", topology.unique_plane_count);
+    count("normal_direction_count", topology.normal_direction_count);
+    out << indent << "  \"bbox_fill_ratio\": " << std::setprecision(17)
+        << topology.bbox_fill_ratio << ",\n";
+    out << indent << "  \"prismatic_candidate\": "
+        << (topology.prismatic_candidate ? "true" : "false") << ",\n";
+    out << indent << "  \"prism_axis\": ["
+        << topology.prism_axis.x << ", " << topology.prism_axis.y << ", "
+        << topology.prism_axis.z << "],\n";
+    count("axial_level_count", topology.axial_level_count);
+    count("axial_end_face_count", topology.axial_end_face_count);
+    count("extrusion_profile_hole_count",
+          topology.extrusion_profile_hole_count);
+    out << indent << "  \"constant_cross_section_candidate\": "
+        << (topology.constant_cross_section_candidate ? "true" : "false")
+        << ",\n";
+    const PipeAnnulusTopology& pipe = topology.pipe_annulus;
+    out << indent << "  \"pipe_annulus\": {\n";
+    out << indent << "    \"candidate\": "
+        << (pipe.candidate ? "true" : "false") << ",\n";
+    out << indent << "    \"conical\": "
+        << (pipe.conical ? "true" : "false") << ",\n";
+    out << indent << "    \"axis_origin\": [" << pipe.axis_origin.x << ", "
+        << pipe.axis_origin.y << ", " << pipe.axis_origin.z << "],\n";
+    out << indent << "    \"axis_direction\": [" << pipe.axis_direction.x
+        << ", " << pipe.axis_direction.y << ", " << pipe.axis_direction.z
+        << "],\n";
+    out << indent << "    \"inner_radius\": " << pipe.inner_radius << ",\n";
+    out << indent << "    \"outer_radius\": " << pipe.outer_radius << ",\n";
+    out << indent << "    \"top_inner_radius\": "
+        << pipe.top_inner_radius << ",\n";
+    out << indent << "    \"top_outer_radius\": "
+        << pipe.top_outer_radius << ",\n";
+    out << indent << "    \"axial_length\": " << pipe.axial_length << ",\n";
+    out << indent << "    \"cylindrical_face_count\": "
+        << pipe.cylindrical_face_count << ",\n";
+    out << indent << "    \"conical_face_count\": "
+        << pipe.conical_face_count << ",\n";
+    out << indent << "    \"planar_end_face_count\": "
+        << pipe.planar_end_face_count << ",\n";
+    out << indent << "    \"ports\": [";
+    for (std::size_t i = 0; i < pipe.ports.size(); ++i) {
+        if (i) out << ", ";
+        const PipePortTopology& port = pipe.ports[i];
+        out << "{\"id\":\"" << json_escape(port.id) << "\",\"center\":["
+            << port.center.x << "," << port.center.y << "," << port.center.z
+            << "],\"normal\":[" << port.normal.x << "," << port.normal.y
+            << "," << port.normal.z << "],\"radius\":" << port.radius << "}";
+    }
+    out << "]\n" << indent << "  },\n";
+    const RevolutionTopology& revolution = topology.revolution;
+    out << indent << "  \"revolution\": {\n";
+    out << indent << "    \"candidate\": "
+        << (revolution.candidate ? "true" : "false") << ",\n";
+    out << indent << "    \"full_revolution\": "
+        << (revolution.full_revolution ? "true" : "false") << ",\n";
+    out << indent << "    \"axis_origin\": [" << revolution.axis_origin.x
+        << ", " << revolution.axis_origin.y << ", "
+        << revolution.axis_origin.z << "],\n";
+    out << indent << "    \"axis_direction\": ["
+        << revolution.axis_direction.x << ", " << revolution.axis_direction.y
+        << ", " << revolution.axis_direction.z << "],\n";
+    out << indent << "    \"angular_extent\": "
+        << revolution.angular_extent << ",\n";
+    out << indent << "    \"axial_level_count\": "
+        << revolution.axial_level_count << ",\n";
+    out << indent << "    \"cylindrical_face_count\": "
+        << revolution.cylindrical_face_count << ",\n";
+    out << indent << "    \"conical_face_count\": "
+        << revolution.conical_face_count << ",\n";
+    out << indent << "    \"toroidal_face_count\": "
+        << revolution.toroidal_face_count << ",\n";
+    out << indent << "    \"spherical_face_count\": "
+        << revolution.spherical_face_count << ",\n";
+    out << indent << "    \"radial_seam_face_count\": "
+        << revolution.radial_seam_face_count << "\n";
+    out << indent << "  },\n";
+    out << indent << "  \"recognition_candidates\": [";
+    for (std::size_t i = 0; i < topology.recognition_candidates.size(); ++i) {
+        if (i) out << ", ";
+        const RecognitionCandidate& candidate = topology.recognition_candidates[i];
+        out << "{\"kind\":\"" << json_escape(candidate.kind)
+            << "\",\"strategy\":\"" << json_escape(candidate.strategy)
+            << "\",\"confidence\":\"" << json_escape(candidate.confidence)
+            << "\",\"score\":" << candidate.score
+            << ",\"exact\":" << (candidate.exact ? "true" : "false")
+            << ",\"reason_codes\":[";
+        for (std::size_t j = 0; j < candidate.reason_codes.size(); ++j) {
+            if (j) out << ",";
+            out << "\"" << json_escape(candidate.reason_codes[j]) << "\"";
+        }
+        out << "]}";
+    }
+    out << "],\n";
+    out << indent << "  \"selected_recognition_kind\": \""
+        << json_escape(topology.selected_recognition_kind) << "\",\n";
+    out << indent << "  \"recommended_strategy\": \""
+        << json_escape(topology.recommended_strategy) << "\",\n";
+    out << indent << "  \"reason_codes\": [";
+    for (std::size_t i = 0; i < topology.reason_codes.size(); ++i) {
+        if (i) out << ", ";
+        out << "\"" << json_escape(topology.reason_codes[i]) << "\"";
+    }
+    out << "],\n";
+    out << indent << "  \"shells\": [\n";
+    for (std::size_t i = 0; i < topology.shells.size(); ++i) {
+        const ShellTopology& shell = topology.shells[i];
+        out << indent << "    {\n";
+        out << indent << "      \"index\": " << shell.index << ",\n";
+        out << indent << "      \"role\": \"" << json_escape(shell.role) << "\",\n";
+        out << indent << "      \"vertex_count\": " << shell.vertex_count << ",\n";
+        out << indent << "      \"edge_count\": " << shell.edge_count << ",\n";
+        out << indent << "      \"face_count\": " << shell.face_count << ",\n";
+        out << indent << "      \"face_inner_wire_count\": "
+            << shell.face_inner_wire_count << ",\n";
+        out << indent << "      \"raw_euler_characteristic\": "
+            << shell.raw_euler_characteristic << ",\n";
+        out << indent << "      \"euler_characteristic\": "
+            << shell.euler_characteristic << ",\n";
+        out << indent << "      \"closed\": "
+            << (shell.closed ? "true" : "false") << ",\n";
+        out << indent << "      \"genus_known\": "
+            << (shell.genus_known ? "true" : "false") << ",\n";
+        out << indent << "      \"genus\": " << shell.genus << "\n";
+        out << indent << "    }" << (i + 1 < topology.shells.size() ? "," : "")
+            << "\n";
+    }
+    out << indent << "  ]\n";
+    out << indent << "}";
+}
+
 void write_vec3_json(std::ostream& out, Vec3 v) {
     out << "[" << std::setprecision(17) << v.x << ", " << v.y << ", " << v.z << "]";
 }
@@ -407,6 +565,36 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
     out << "  \"ok\": " << (report.ok() ? "true" : "false") << ",\n";
     out << "  \"occt_version\": \"" << json_escape(occt_version()) << "\",\n";
     out << "  \"alea_version\": \"" << json_escape(alea_version()) << "\",\n";
+    out << "  \"alea_handoff\": {\n";
+    out << "    \"attempted\": "
+        << (report.alea_handoff.attempted ? "true" : "false") << ",\n";
+    out << "    \"compatible\": "
+        << (report.alea_handoff.compatible ? "true" : "false") << ",\n";
+    out << "    \"schema_major\": " << report.alea_handoff.schema_major
+        << ",\n";
+    out << "    \"schema_minor\": " << report.alea_handoff.schema_minor
+        << ",\n";
+    out << "    \"libalea_version\": \""
+        << json_escape(report.alea_handoff.libalea_version) << "\",\n";
+    out << "    \"contract_digest\": \""
+        << json_escape(report.alea_handoff.contract_digest) << "\",\n";
+    out << "    \"cell_count\": " << report.alea_handoff.cell_count << ",\n";
+    out << "    \"surface_count\": " << report.alea_handoff.surface_count
+        << ",\n";
+    out << "    \"universe_count\": " << report.alea_handoff.universe_count
+        << ",\n";
+    out << "    \"sidecar_entity_count\": "
+        << report.alea_handoff.sidecar_entity_count << ",\n";
+    out << "    \"chunk_count\": " << report.alea_handoff.chunk_count
+        << ",\n";
+    out << "    \"missing_capabilities\": [";
+    for (std::size_t i = 0;
+         i < report.alea_handoff.missing_capabilities.size(); ++i) {
+        if (i) out << ',';
+        out << '\"' << json_escape(report.alea_handoff.missing_capabilities[i])
+            << '\"';
+    }
+    out << "]\n  },\n";
     if (!report.document_id.empty() || !report.source_path.empty()) {
         out << "  \"document\": {\n";
         out << "    \"id\": \"" << json_escape(report.document_id) << "\",\n";
@@ -430,6 +618,345 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
     out << "    \"spline_faces\": " << report.spline_faces << ",\n";
     out << "    \"total_volume\": " << std::setprecision(17) << report.total_volume << "\n";
     out << "  },\n";
+    out << "  \"semantic_model\": {\n";
+    out << "    \"summary\": {\n";
+    out << "      \"metadata_entities\": " << report.metadata.size() << ",\n";
+    out << "      \"component_definitions\": "
+        << report.component_definitions.size() << ",\n";
+    out << "      \"component_instances\": "
+        << report.component_instances.size() << ",\n";
+    out << "      \"reused_instances\": "
+        << (report.component_instances.size() > report.component_definitions.size()
+                ? report.component_instances.size() - report.component_definitions.size()
+                : 0)
+        << "\n";
+    out << "    },\n";
+    out << "    \"string_table\": [";
+    for (std::size_t i = 0; i < report.strings.values().size(); ++i) {
+        if (i) out << ',';
+        out << '"' << json_escape(report.strings.values()[i]) << '"';
+    }
+    out << "],\n";
+    out << "    \"metadata\": [\n";
+    for (std::size_t i = 0; i < report.metadata.size(); ++i) {
+        const EntityMetadata& metadata = report.metadata[i];
+        out << "      {\"id\":" << metadata.id
+            << ",\"stable_name\":" << metadata.stable_name
+            << ",\"display_name\":" << metadata.display_name
+            << ",\"description\":" << metadata.description
+            << ",\"engineering_role\":" << metadata.engineering_role
+            << ",\"subsystem\":" << metadata.subsystem
+            << ",\"source_cad_label\":" << metadata.source_cad_label
+            << ",\"source_component_path\":"
+            << metadata.source_component_path << ",\"tags\":[";
+        for (std::size_t tag = 0; tag < metadata.tags.size(); ++tag) {
+            if (tag) out << ',';
+            out << metadata.tags[tag];
+        }
+        out << "],\"annotations\":[";
+        for (std::size_t annotation_index = 0;
+             annotation_index < metadata.annotations.size();
+             ++annotation_index) {
+            if (annotation_index) out << ',';
+            const Annotation& annotation = metadata.annotations[annotation_index];
+            out << "{\"key\":" << annotation.key
+                << ",\"value\":" << annotation.value
+                << ",\"origin\":\""
+                << annotation_origin_name(annotation.origin)
+                << "\",\"review_state\":\""
+                << metadata_review_state_name(annotation.review_state)
+                << "\",\"user_verified\":"
+                << (annotation.user_verified ? "true" : "false") << '}';
+        }
+        out << "]}";
+        if (i + 1 < report.metadata.size()) out << ',';
+        out << '\n';
+    }
+    out << "    ],\n";
+    out << "    \"component_definitions\": [\n";
+    for (std::size_t i = 0; i < report.component_definitions.size(); ++i) {
+        const ComponentDefinition& definition = report.component_definitions[i];
+        out << "      {\"id\":\"" << json_escape(definition.id)
+            << "\",\"source_definition_key\":"
+            << definition.source_definition_key
+            << ",\"geometry_digest\":\""
+            << json_escape(definition.geometry_digest)
+            << "\",\"geometry_digest_verified\":"
+            << (definition.geometry_digest_verified ? "true" : "false")
+            << ",\"metadata_id\":" << definition.metadata_id << '}';
+        if (i + 1 < report.component_definitions.size()) out << ',';
+        out << '\n';
+    }
+    out << "    ],\n";
+    out << "    \"component_instances\": [\n";
+    for (std::size_t i = 0; i < report.component_instances.size(); ++i) {
+        const ComponentInstance& instance = report.component_instances[i];
+        out << "      {\"id\":\"" << json_escape(instance.id)
+            << "\",\"definition_id\":\""
+            << json_escape(instance.definition_id)
+            << "\",\"parent_assembly_id\":\""
+            << json_escape(instance.parent_assembly_id)
+            << "\",\"source_shape_id\":\""
+            << json_escape(instance.source_shape_id)
+            << "\",\"transform\":[";
+        for (std::size_t value = 0; value < instance.transform.values.size(); ++value) {
+            if (value) out << ',';
+            out << std::setprecision(17) << instance.transform.values[value];
+        }
+        out << "],\"metadata_id\":" << instance.metadata_id
+            << ",\"material_override\":\""
+            << json_escape(instance.material_override)
+            << "\",\"active\":" << (instance.active ? "true" : "false")
+            << '}';
+        if (i + 1 < report.component_instances.size()) out << ',';
+        out << '\n';
+    }
+    out << "    ],\n";
+    out << "    \"materials\": [\n";
+    for (std::size_t i = 0; i < report.materials.size(); ++i) {
+        const MaterialDefinition& material = report.materials[i];
+        out << "      {\"id\":\"" << json_escape(material.id)
+            << "\",\"metadata_id\":" << material.metadata_id
+            << ",\"phase\":\"" << material_phase_name(material.phase)
+            << "\",\"density\":" << std::setprecision(17)
+            << material.density << ",\"density_unit\":"
+            << material.density_unit << ",\"composition_reference\":"
+            << material.composition_reference << '}';
+        if (i + 1 < report.materials.size()) out << ',';
+        out << '\n';
+    }
+    out << "    ]\n";
+    out << "  },\n";
+    out << "  \"contained_media\": {\n";
+    out << "    \"requests\": [\n";
+    for (std::size_t i = 0; i < report.medium_requests.size(); ++i) {
+        const MediumGenerationRequest& request = report.medium_requests[i];
+        out << "      {\"id\":\"" << json_escape(request.id)
+            << "\",\"metadata_id\":" << request.metadata_id
+            << ",\"material_id\":\"" << json_escape(request.material_id)
+            << "\",\"complement_material_id\":\""
+            << json_escape(request.complement_material_id)
+            << "\",\"fill_mode\":\""
+            << medium_fill_mode_name(request.fill_mode)
+            << "\",\"require_exact_geometry\":"
+            << (request.require_exact_geometry ? "true" : "false")
+            << ",\"host_component_ids\":[";
+        for (std::size_t host = 0; host < request.host_component_ids.size(); ++host) {
+            if (host) out << ',';
+            out << '"' << json_escape(request.host_component_ids[host]) << '"';
+        }
+        out << "],\"gravity_direction\":["
+            << request.gravity_direction[0] << ','
+            << request.gravity_direction[1] << ','
+            << request.gravity_direction[2] << "],\"fill_level\":";
+        if (request.fill_level) out << *request.fill_level;
+        else out << "null";
+        out << ",\"target_volume_fraction\":";
+        if (request.target_volume_fraction) out << *request.target_volume_fraction;
+        else out << "null";
+        out << ",\"ports\":[";
+        for (std::size_t port_index = 0; port_index < request.ports.size(); ++port_index) {
+            if (port_index) out << ',';
+            const MediumPortDecision& port = request.ports[port_index];
+            out << "{\"port_id\":\"" << json_escape(port.port_id)
+                << "\",\"disposition\":\""
+                << medium_port_disposition_name(port.disposition)
+                << "\",\"peer_port_id\":\""
+                << json_escape(port.peer_port_id)
+                << "\",\"metadata_id\":" << port.metadata_id
+                << ",\"valve_state\":\""
+                << medium_valve_state_name(port.valve_state) << "\"}";
+        }
+        out << "],\"internal_components_to_subtract\":[";
+        for (std::size_t component = 0;
+             component < request.internal_components_to_subtract.size();
+             ++component) {
+            if (component) out << ',';
+            out << '"' << json_escape(
+                request.internal_components_to_subtract[component]) << '"';
+        }
+        out << "],\"seed_points_or_faces\":[";
+        for (std::size_t seed_index = 0;
+             seed_index < request.seed_points_or_faces.size(); ++seed_index) {
+            if (seed_index) out << ',';
+            const GeometricSeed& seed =
+                request.seed_points_or_faces[seed_index];
+            out << "{\"kind\":\"" << geometric_seed_kind_name(seed.kind)
+                << "\",\"entity_id\":\"" << json_escape(seed.entity_id)
+                << "\",\"point\":[" << seed.point[0] << ','
+                << seed.point[1] << ',' << seed.point[2] << "]}";
+        }
+        out << "],\"allow_disconnected_pockets\":"
+            << (request.allow_disconnected_pockets ? "true" : "false")
+            << ",\"max_worker_count\":" << request.max_worker_count << '}';
+        if (i + 1 < report.medium_requests.size()) out << ',';
+        out << '\n';
+    }
+    out << "    ],\n";
+    out << "    \"derived_regions\": [\n";
+    for (std::size_t i = 0; i < report.derived_regions.size(); ++i) {
+        const DerivedRegionRecord& region = report.derived_regions[i];
+        const DerivedRegionCertificate& certificate = region.certificate;
+        out << "      {\"region_id\":\"" << json_escape(region.region_id)
+            << "\",\"request_id\":\"" << json_escape(region.request_id)
+            << "\",\"operation\":" << region.operation
+            << ",\"material_id\":\"" << json_escape(region.material_id)
+            << "\",\"user_approved\":"
+            << (region.user_approved ? "true" : "false")
+            << ",\"metadata_id\":" << region.metadata_id
+            << ",\"host_components\":[";
+        for (std::size_t host = 0; host < region.host_components.size(); ++host) {
+            if (host) out << ',';
+            out << '"' << json_escape(region.host_components[host]) << '"';
+        }
+        out << "],\"connected_ports\":[";
+        for (std::size_t port = 0; port < region.connected_ports.size(); ++port) {
+            if (port) out << ',';
+            out << '"' << json_escape(region.connected_ports[port]) << '"';
+        }
+        out << "],\"capped_ports\":[";
+        for (std::size_t port = 0; port < region.capped_ports.size(); ++port) {
+            if (port) out << ',';
+            out << '"' << json_escape(region.capped_ports[port]) << '"';
+        }
+        out << "]"
+            << ",\"certificate\":{\"solid_valid\":"
+            << (certificate.solid_valid ? "true" : "false")
+            << ",\"closed\":" << (certificate.closed ? "true" : "false")
+            << ",\"leak_test_passed\":"
+            << (certificate.leak_test_passed ? "true" : "false")
+            << ",\"overlap_test_passed\":"
+            << (certificate.overlap_test_passed ? "true" : "false")
+            << ",\"unresolved_port_count\":"
+            << certificate.unresolved_port_count
+            << ",\"generated_volume\":" << std::setprecision(17)
+            << certificate.generated_volume
+            << ",\"material_overlap_volume\":"
+            << certificate.material_overlap_volume
+            << ",\"network_segment_count\":"
+            << certificate.network_segment_count
+            << ",\"network_connection_count\":"
+            << certificate.network_connection_count
+            << ",\"network_connected_component_count\":"
+            << certificate.network_connected_component_count
+            << ",\"obstacle_subtraction_passed\":"
+            << (certificate.obstacle_subtraction_passed ? "true" : "false")
+            << ",\"phase_coverage_passed\":"
+            << (certificate.phase_coverage_passed ? "true" : "false")
+            << ",\"protected_interface_passed\":"
+            << (certificate.protected_interface_passed ? "true" : "false")
+            << ",\"liquid_volume\":" << certificate.liquid_volume
+            << ",\"gas_volume\":" << certificate.gas_volume
+            << ",\"phase_coverage_delta\":"
+            << certificate.phase_coverage_delta
+            << ",\"phase_overlap_volume\":"
+            << certificate.phase_overlap_volume
+            << ",\"liquid_pocket_count\":"
+            << certificate.liquid_pocket_count
+            << ",\"gas_pocket_count\":"
+            << certificate.gas_pocket_count
+            << ",\"worker_count_used\":"
+            << certificate.worker_count_used << "}}";
+        if (i + 1 < report.derived_regions.size()) out << ',';
+        out << '\n';
+    }
+    out << "    ]\n";
+    out << "  },\n";
+    const McnpGeometrySafetyReport& safety = report.mcnp_geometry_safety;
+    const char* coverage = safety.coverage_status == CoverageStatus::certified
+        ? "certified" : safety.coverage_status == CoverageStatus::gap
+            ? "gap" : safety.coverage_status == CoverageStatus::unknown
+                ? "unknown" : "not_configured";
+    out << "  \"mcnp_geometry_safety\": {\n";
+    out << "    \"validated\": " << (safety.validated ? "true" : "false") << ",\n";
+    out << "    \"safe_to_emit\": " << (safety.safe_to_emit ? "true" : "false") << ",\n";
+    out << "    \"overlap_count\": " << safety.overlap_count << ",\n";
+    out << "    \"overlap_unknown_count\": " << safety.overlap_unknown_count << ",\n";
+    out << "    \"coverage_status\": \"" << coverage << "\",\n";
+    out << "    \"domain_id\": \"" << json_escape(safety.domain_id) << "\",\n";
+    out << "    \"domain_volume\": " << std::setprecision(17)
+        << safety.domain_volume << ",\n";
+    out << "    \"uncovered_volume\": " << safety.uncovered_volume << ",\n";
+    out << "    \"outside_domain_volume\": "
+        << safety.outside_domain_volume << ",\n";
+    out << "    \"failure_code\": \""
+        << json_escape(safety.failure_code) << "\"\n";
+    out << "  },\n";
+    const ApproximationPolicy& ap = report.approximation_policy;
+    const ApproximationLedger& al = report.approximation_ledger;
+    out << "  \"approximation\": {\n";
+    out << "    \"enabled\": " << (ap.enabled ? "true" : "false") << ",\n";
+    out << "    \"policy\": {\n";
+    out << "      \"max_global_changed_volume_fraction\": "
+        << std::setprecision(17) << ap.max_global_changed_volume_fraction << ",\n";
+    out << "      \"max_body_changed_volume_fraction\": "
+        << ap.max_body_changed_volume_fraction << ",\n";
+    out << "      \"max_action_changed_volume_fraction\": "
+        << ap.max_action_changed_volume_fraction << ",\n";
+    out << "      \"max_global_added_volume_fraction\": "
+        << ap.max_global_added_volume_fraction << ",\n";
+    out << "      \"max_global_removed_volume_fraction\": "
+        << ap.max_global_removed_volume_fraction << ",\n";
+    out << "      \"max_body_added_volume_fraction\": "
+        << ap.max_body_added_volume_fraction << ",\n";
+    out << "      \"max_body_removed_volume_fraction\": "
+        << ap.max_body_removed_volume_fraction << ",\n";
+    out << "      \"max_surface_deviation\": "
+        << ap.max_surface_deviation << ",\n";
+    out << "      \"allow_surface_replacement\": "
+        << (ap.allow_surface_replacement ? "true" : "false") << ",\n";
+    out << "      \"allow_sliver_removal\": "
+        << (ap.allow_sliver_removal ? "true" : "false") << ",\n";
+    out << "      \"allow_bbox_replacement\": "
+        << (ap.allow_bbox_replacement ? "true" : "false") << ",\n";
+    out << "      \"allow_numerical_shatter_loss\": "
+        << (ap.allow_numerical_shatter_loss ? "true" : "false") << ",\n";
+    out << "      \"allow_overlap_resolution\": "
+        << (ap.allow_overlap_resolution ? "true" : "false") << ",\n";
+    out << "      \"require_containment_preservation\": "
+        << (ap.require_containment_preservation ? "true" : "false") << ",\n";
+    out << "      \"require_topology_preservation\": "
+        << (ap.require_topology_preservation ? "true" : "false") << ",\n";
+    out << "      \"protected_target_ids\": [";
+    for (std::size_t i = 0; i < ap.protected_target_ids.size(); ++i) {
+        if (i) out << ',';
+        out << '"' << json_escape(ap.protected_target_ids[i]) << '"';
+    }
+    out << "],\n";
+    out << "      \"protected_material_ids\": [";
+    for (std::size_t i = 0; i < ap.protected_material_ids.size(); ++i) {
+        if (i) out << ',';
+        out << ap.protected_material_ids[i];
+    }
+    out << "]\n";
+    out << "    },\n";
+    out << "    \"ledger\": {\n";
+    out << "      \"document_baseline_volume\": "
+        << al.document_baseline_volume << ",\n";
+    out << "      \"cumulative_changed_volume\": "
+        << al.cumulative_changed_volume << ",\n";
+    out << "      \"cumulative_added_volume\": "
+        << al.cumulative_added_volume << ",\n";
+    out << "      \"cumulative_removed_volume\": "
+        << al.cumulative_removed_volume << ",\n";
+    out << "      \"bodies\": [";
+    for (std::size_t i = 0; i < al.bodies.size(); ++i) {
+        const ApproximationLedgerEntry& entry = al.bodies[i];
+        if (i > 0) out << ',';
+        out << "{\"source_solid_id\":\""
+            << json_escape(entry.source_solid_id)
+            << "\",\"baseline_volume\":" << entry.baseline_volume
+            << ",\"cumulative_changed_volume\":"
+            << entry.cumulative_changed_volume
+            << ",\"cumulative_added_volume\":"
+            << entry.cumulative_added_volume
+            << ",\"cumulative_removed_volume\":"
+            << entry.cumulative_removed_volume
+            << ",\"accepted_actions\":" << entry.accepted_actions << '}';
+    }
+    out << "]\n";
+    out << "    }\n";
+    out << "  },\n";
     out << "  \"performance\": {\n";
     out << "    \"load_step_ms\": " << std::setprecision(17)
         << report.performance.load_step_ms << ",\n";
@@ -448,7 +975,63 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
     out << "    \"splitter_calls\": "
         << report.performance.splitter_calls << ",\n";
     out << "    \"pieces_produced\": "
-        << report.performance.pieces_produced << "\n";
+        << report.performance.pieces_produced << ",\n";
+    out << "    \"spatial_candidate_pairs\": "
+        << report.performance.spatial_candidate_pairs << ",\n";
+    out << "    \"exact_overlap_tests\": "
+        << report.performance.exact_overlap_tests << ",\n";
+    out << "    \"definition_recognition_cache_hits\": "
+        << report.performance.definition_recognition_cache_hits << ",\n";
+    out << "    \"definition_recognition_cache_misses\": "
+        << report.performance.definition_recognition_cache_misses << ",\n";
+    out << "    \"definition_conversion_cache_hits\": "
+        << report.performance.definition_conversion_cache_hits << ",\n";
+    out << "    \"definition_conversion_cache_published\": "
+        << report.performance.definition_conversion_cache_published << ",\n";
+    out << "    \"local_analysis_ms\": " << std::setprecision(17)
+        << report.performance.local_analysis_ms << ",\n";
+    out << "    \"local_certificate_ms\": " << std::setprecision(17)
+        << report.performance.local_certificate_ms << ",\n";
+    out << "    \"local_overlap_ms\": " << std::setprecision(17)
+        << report.performance.local_overlap_ms << ",\n";
+    out << "    \"full_reconciliation_ms\": " << std::setprecision(17)
+        << report.performance.full_reconciliation_ms << ",\n";
+    out << "    \"full_analysis_ms\": " << std::setprecision(17)
+        << report.performance.full_analysis_ms << ",\n";
+    out << "    \"full_overlap_ms\": " << std::setprecision(17)
+        << report.performance.full_overlap_ms << ",\n";
+    out << "    \"full_ledger_ms\": " << std::setprecision(17)
+        << report.performance.full_ledger_ms << ",\n";
+    out << "    \"local_trials_generated\": "
+        << report.performance.local_trials_generated << ",\n";
+    out << "    \"local_trials_certified\": "
+        << report.performance.local_trials_certified << ",\n";
+    out << "    \"local_trials_rejected\": "
+        << report.performance.local_trials_rejected << ",\n";
+    out << "    \"parallel_plane_batches\": "
+        << report.performance.parallel_plane_batches << ",\n";
+    out << "    \"local_overlap_candidates\": "
+        << report.performance.local_overlap_candidates << ",\n";
+    out << "    \"local_exact_overlap_tests\": "
+        << report.performance.local_exact_overlap_tests << ",\n";
+    out << "    \"local_overlap_containment_proofs\": "
+        << report.performance.local_overlap_containment_proofs << ",\n";
+    out << "    \"overlap_pair_cache_hits\": "
+        << report.performance.overlap_pair_cache_hits << ",\n";
+    out << "    \"overlap_pair_cache_misses\": "
+        << report.performance.overlap_pair_cache_misses << ",\n";
+    out << "    \"local_partition_boolean_calls\": "
+        << report.performance.local_partition_boolean_calls << ",\n";
+    out << "    \"body_certificate_cache_hits\": "
+        << report.performance.body_certificate_cache_hits << ",\n";
+    out << "    \"body_certificate_cache_misses\": "
+        << report.performance.body_certificate_cache_misses << ",\n";
+    out << "    \"full_reconciliations\": "
+        << report.performance.full_reconciliations << ",\n";
+    out << "    \"whole_model_trial_copies\": "
+        << report.performance.whole_model_trial_copies << ",\n";
+    out << "    \"peak_local_pieces\": "
+        << report.performance.peak_local_pieces << "\n";
     out << "  },\n";
     out << "  \"solid_volumes\": [\n";
     for (std::size_t i = 0; i < report.solid_volumes.size(); ++i) {
@@ -469,6 +1052,10 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         out << "    {\n";
         out << "      \"id\": \"" << json_escape(solid.id) << "\",\n";
         out << "      \"label\": \"" << json_escape(solid.label) << "\",\n";
+        out << "      \"component_instance_id\": \""
+            << json_escape(solid.component_instance_id) << "\",\n";
+        out << "      \"component_definition_id\": \""
+            << json_escape(solid.component_definition_id) << "\",\n";
         out << "      \"name\": \"" << json_escape(solid.name) << "\",\n";
         out << "      \"hierarchy_path\": \"" << json_escape(solid.hierarchy_path) << "\",\n";
         out << "      \"index\": " << solid.index << ",\n";
@@ -527,8 +1114,14 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
             << (solid.needs_surface_replacement ? "true" : "false") << ",\n";
         out << "      \"needs_user_decision\": "
             << (solid.needs_user_decision ? "true" : "false") << ",\n";
+        out << "      \"convexity_certificate_deferred\": "
+            << (solid.convexity_certificate_deferred ? "true" : "false")
+            << ",\n";
         out << "      \"geometry_certificate\": ";
         write_geometry_certificate_json(out, solid.certificate, "      ");
+        out << ",\n";
+        out << "      \"topology\": ";
+        write_topology_json(out, solid.topology, "      ");
         out << ",\n";
         out << "      \"faces\": [";
         for (std::size_t j = 0; j < solid.face_ids.size(); ++j) {
@@ -622,7 +1215,18 @@ void write_report_json_stream(std::ostream& out, const ConversionReport& report)
         out << "      \"label_entry\": \"" << json_escape(node.label_entry) << "\",\n";
         out << "      \"shape_id\": \"" << json_escape(node.shape_id) << "\",\n";
         out << "      \"kind\": \"" << json_escape(node.kind) << "\",\n";
-        out << "      \"path\": \"" << json_escape(node.path) << "\"\n";
+        out << "      \"path\": \"" << json_escape(node.path) << "\",\n";
+        out << "      \"definition_entry\": \""
+            << json_escape(node.definition_entry) << "\",\n";
+        out << "      \"definition_id\": \""
+            << json_escape(node.definition_id) << "\",\n";
+        out << "      \"instance_id\": \""
+            << json_escape(node.instance_id) << "\",\n";
+        out << "      \"geometry_digest\": \""
+            << json_escape(node.geometry_digest) << "\",\n";
+        out << "      \"geometry_digest_verified\": "
+            << (node.geometry_digest_verified ? "true" : "false") << ",\n";
+        out << "      \"metadata_id\": " << node.metadata_id << "\n";
         out << "    }";
         if (i + 1 < report.assembly.size()) {
             out << ",";
@@ -753,7 +1357,9 @@ void write_decomposition_candidate_piece_json(
     out << indent << "  \"needs_surface_replacement\": "
         << (piece.needs_surface_replacement ? "true" : "false") << ",\n";
     out << indent << "  \"needs_user_decision\": "
-        << (piece.needs_user_decision ? "true" : "false") << "\n";
+        << (piece.needs_user_decision ? "true" : "false") << ",\n";
+    out << indent << "  \"halfspace_violation_count\": "
+        << piece.halfspace_violation_count << "\n";
     out << indent << "}";
 }
 
@@ -850,6 +1456,12 @@ void write_decomposition_candidate_json(
         << std::setprecision(17) << candidate.max_piece_volume_fraction << ",\n";
     out << indent << "  \"volume_balance\": " << std::setprecision(17)
         << candidate.volume_balance << ",\n";
+    out << indent << "  \"parent_halfspace_violation_count\": "
+        << candidate.parent_halfspace_violation_count << ",\n";
+    out << indent << "  \"max_piece_halfspace_violation_count\": "
+        << candidate.max_piece_halfspace_violation_count << ",\n";
+    out << indent << "  \"progress_ratio\": " << std::setprecision(17)
+        << candidate.progress_ratio << ",\n";
     out << indent << "  \"pieces\": [\n";
     for (std::size_t i = 0; i < candidate.pieces.size(); ++i) {
         out << indent << "    ";
@@ -926,6 +1538,10 @@ void write_removal_candidate_json(std::ostream& out,
     out << indent << "  \"id\": \"" << json_escape(candidate.id) << "\",\n";
     out << indent << "  \"solid_id\": \""
         << json_escape(candidate.solid_id) << "\",\n";
+    out << indent << "  \"component_instance_id\": \""
+        << json_escape(candidate.component_instance_id) << "\",\n";
+    out << indent << "  \"component_definition_id\": \""
+        << json_escape(candidate.component_definition_id) << "\",\n";
     out << indent << "  \"label\": \"" << json_escape(candidate.label) << "\",\n";
     out << indent << "  \"name\": \"" << json_escape(candidate.name) << "\",\n";
     out << indent << "  \"hierarchy_path\": \""
@@ -1122,6 +1738,8 @@ void write_surface_replacement_candidate_json(
         << json_escape(candidate.confidence) << "\",\n";
     out << indent << "  \"reason\": \"" << json_escape(candidate.reason) << "\",\n";
     out << indent << "  \"exact\": " << (candidate.exact ? "true" : "false") << ",\n";
+    out << indent << "  \"deviation_certified\": "
+        << (candidate.deviation_certified ? "true" : "false") << ",\n";
     out << indent << "  \"usable\": " << (candidate.usable ? "true" : "false") << ",\n";
     out << indent << "  \"score\": " << std::setprecision(17)
         << candidate.score << ",\n";

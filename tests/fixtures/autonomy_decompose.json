@@ -1,0 +1,17 @@
+{
+  "schema": "csgify.autonomy-actions",
+  "schema_version": 2,
+  "request_id": "request:exact-l-split",
+  "source_digest": "dff5aa386cae4b29b05d6da4ac0c2f8f",
+  "expected_revision": 0,
+  "actor": "llm:test",
+  "actions": [
+    {
+      "id": "exact-l-split",
+      "op": "apply_decomposition_candidate",
+      "target": "doc:1/solid:1",
+      "candidate": "best",
+      "rationale": "Apply the exact volume-certified candidate."
+    }
+  ]
+}

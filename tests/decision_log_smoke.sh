@@ -47,6 +47,11 @@ for required in ("csgify_version", "occt_version", "step_path",
         print(f"manifest missing field: {required}", file=sys.stderr)
         sys.exit(1)
 
+if not manifest["csgify_version"] or manifest["csgify_version"] == "unversioned":
+    print(f"decision log has no concrete csgify version: {manifest}",
+          file=sys.stderr)
+    sys.exit(1)
+
 if not manifest["step_digest"].startswith("fnv1a128:"):
     print(f"step_digest missing algorithm prefix: {manifest['step_digest']}",
           file=sys.stderr)

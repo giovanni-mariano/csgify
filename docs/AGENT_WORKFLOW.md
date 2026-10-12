@@ -1,7 +1,46 @@
 # Agent Workflow
 
-csgify is meant to be driven by agents through batch scripts, not through an
-interactive REPL. The current preferred interface is:
+csgify supports two distinct agent boundaries. Codex, Pi, Claude, and other
+external planners use the strict `context`/`autonomy`/`queue` CLI workflow in
+[CLI_AGENT_PROTOTYPE.md](CLI_AGENT_PROTOTYPE.md). It binds requests to source
+and policy identity and does not give the planner general scripting authority.
+
+## Embedded project conversation
+
+The Qt project workspace can answer questions about the loaded model through
+an embedded OpenAI provider. The key is read from the process environment,
+kept in memory, and never written to the project database. An explicit model
+identifier is also required; csgify does not silently select or change models.
+
+```sh
+cmake -S . -B build -DCSGIFY_ENABLE_QT_VIEWER=ON
+cmake --build build -j2
+
+export OPENAI_API_KEY='<your-api-key>'
+export CSGIFY_OPENAI_MODEL='<model-id-available-to-your-project>'
+
+./build/csgify project init demo-project
+./build/csgify project review demo-project --source model.step
+```
+
+Load the model in the workspace, then use the **Project conversation** dock.
+The header must say **OpenAI … · advisory** before a live request is sent. If
+either environment variable is absent, the dock intentionally uses and labels
+the built-in simulated provider, so the UI can still be demonstrated without
+network access or API spend.
+
+Each question first builds a bounded, revision-bound evidence snapshot. Only
+that curated JSON and recent conversation messages are sent; STEP files,
+screenshots, project files, API credentials, and database contents are not.
+Responses are constrained to the local response schema and validated again by
+csgify. The current live slice answers questions only: it cannot mutate
+geometry, approve operations, or export. Stop cancels the in-flight context or
+network request, and a response is discarded if its model revision became
+stale while waiting. Questions and terminal answers are retained in schema-8
+project storage and restored when the project is reopened.
+
+The Lua workflow below is for batch scripts the user explicitly trusts, not
+for untrusted model output. Its preferred interface is:
 
 ```sh
 csgify lua script.lua [args...]

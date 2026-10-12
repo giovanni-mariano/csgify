@@ -37,6 +37,14 @@ rem="$outdir/propose_removal.json"
 "$exe" propose removal "$fixtures/four_solids.step" --report "$rem" \
     >/dev/null 2>&1 || true  # ok flag may be false on this fixture
 [ -s "$rem" ] || fail "propose removal did not write report"
+python3 - "$rem" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+for candidate in d.get("candidates", []):
+    assert "component_instance_id" in candidate, candidate
+    assert "component_definition_id" in candidate, candidate
+PY
+[ "$?" -eq 0 ] || fail "removal proposal omitted component identity fields"
 
 # ---- propose surface on a spline face works -------------------------------
 surf="$outdir/propose_surface.json"

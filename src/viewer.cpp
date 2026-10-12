@@ -49,6 +49,14 @@ Quantity_Color color_for_status(SolidViewStatus status) {
         return Quantity_Color(0.85, 0.15, 0.15, Quantity_TOC_sRGB);
     case SolidViewStatus::piece:
         return Quantity_Color(0.20, 0.55, 0.90, Quantity_TOC_sRGB);
+    case SolidViewStatus::generated_medium:
+        return Quantity_Color(0.05, 0.80, 0.90, Quantity_TOC_sRGB);
+    case SolidViewStatus::preview_exact:
+        return Quantity_Color(0.10, 0.95, 0.30, Quantity_TOC_sRGB);
+    case SolidViewStatus::preview_residual:
+        return Quantity_Color(1.00, 0.52, 0.08, Quantity_TOC_sRGB);
+    case SolidViewStatus::preview_sliver:
+        return Quantity_Color(1.00, 0.10, 0.72, Quantity_TOC_sRGB);
     }
     return Quantity_Color(0.6, 0.6, 0.6, Quantity_TOC_sRGB);
 }
@@ -59,6 +67,10 @@ const char* label_for_status(SolidViewStatus status) {
     case SolidViewStatus::needs_decomposition: return "needs-decomp";
     case SolidViewStatus::no_interior_point:   return "no-interior-pt";
     case SolidViewStatus::piece:               return "piece";
+    case SolidViewStatus::generated_medium:    return "contained-medium";
+    case SolidViewStatus::preview_exact:       return "preview-exact";
+    case SolidViewStatus::preview_residual:    return "preview-residual";
+    case SolidViewStatus::preview_sliver:      return "preview-sliver";
     }
     return "unknown";
 }

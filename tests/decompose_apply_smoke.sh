@@ -120,4 +120,25 @@ box_mcnp="$outdir/box.i"
     || fail "decompose-apply on a convex-only model should succeed"
 [[ -s "$box_mcnp" ]] || fail "decompose-apply did not emit deck on convex-only input"
 
+# If the bounded BSP pass cannot resolve a target, emission must not retry the
+# legacy all-planar-faces splitter.  That fallback is outside the BSP budgets
+# and can create a combinatorial splitter arrangement on face-heavy solids.
+unresolved_report="$outdir/unresolved.json"
+if "$exe" decompose-apply "$fixtures/l_shape.step" \
+    --out "$outdir/unresolved.i" --max-depth 0 \
+    --report "$unresolved_report" >/dev/null 2>&1; then
+    fail "max-depth 0 should leave the non-convex target unresolved"
+fi
+[[ -s "$unresolved_report" ]] || fail "unresolved report not produced"
+python3 - "$unresolved_report" <<'PY' || exit 1
+import json, sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+attempts = report.get("summary", {}).get("decomposition_attempts")
+if attempts != 0:
+    print(f"emit retried decomposition after bounded BSP: {attempts=}",
+          file=sys.stderr)
+    sys.exit(1)
+PY
+
 echo "decompose_apply_smoke: ok"

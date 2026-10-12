@@ -5,8 +5,10 @@
 // IDs, commands, reports, and files.
 
 #include "csgify/engine.hpp"
+#include "csgify/alea_bridge.hpp"
 
 #include <string>
+#include <functional>
 #include <vector>
 
 #include <alea.h>
@@ -76,6 +78,21 @@ struct DecomposedSolidPiece {
     bool active = true;
 };
 
+struct CadBooleanBody {
+    std::string id;
+    std::string label;
+    std::string source_solid_id;
+    TopoDS_Shape materialized_solid;
+    std::vector<TopoDS_Solid> positive_cells;
+    std::vector<TopoDS_Solid> negative_cells;
+    std::string role;
+    std::string request_id;
+    int material_id = 0;
+    double density = 0.0;
+    bool emit_as_cell = true;
+    bool active = true;
+};
+
 struct FaceReplacement {
     std::string face_id;
     SplineFitKind kind = SplineFitKind::none;
@@ -97,9 +114,17 @@ struct CadModel {
     std::vector<std::string> removed_solid_ids;
     std::vector<SyntheticBody> synthetic_bodies;
     std::vector<DecomposedSolidPiece> decomposed_pieces;
+    std::vector<CadBooleanBody> cad_boolean_bodies;
     std::vector<FaceReplacement> face_replacements;
     std::vector<ShapeMetadata> solid_metadata;
     std::vector<AssemblyNode> assembly;
+    StringTable strings;
+    std::vector<EntityMetadata> metadata;
+    std::vector<ComponentDefinition> component_definitions;
+    std::vector<ComponentInstance> component_instances;
+    std::vector<MaterialDefinition> materials;
+    std::vector<MediumGenerationRequest> medium_requests;
+    std::vector<DerivedRegionRecord> derived_regions;
 
     bool loaded() const { return !root.IsNull(); }
 };
@@ -127,13 +152,20 @@ private:
 struct ConversionResult {
     AleaSystem system;
     ConversionReport report;
+    AleaHandoffManifest handoff;
 };
 
 CadModel load_step_model(const std::string& step_path,
                          const ConversionOptions& options = {});
 
+using AnalysisProgressCallback =
+    std::function<bool(std::size_t completed, std::size_t total,
+                       const std::string& target_id)>;
+
 AnalysisReport analyze_model(const CadModel& model,
-                             const ConversionOptions& options = {});
+                             const ConversionOptions& options = {},
+                             AnalysisProgressCallback progress = {},
+                             bool* cancelled = nullptr);
 
 ReplacementMetrics replacement_metrics_for_operation(const AnalyzedSolid& solid,
                                                      ReplacementOperation operation);
@@ -145,6 +177,11 @@ ReplacementCheck check_replacement_limits(const CadModel& model,
                                           const ConversionOptions& options = {});
 
 bool remove_solid(CadModel& model, const std::string& solid_id);
+
+bool active_shape_for_id(const CadModel& model,
+                         const std::string& shape_id,
+                         TopoDS_Shape* shape_out,
+                         std::string* source_solid_id_out = nullptr);
 
 bool replace_face_with_fit(CadModel& model,
                            const std::string& face_id,
@@ -162,6 +199,58 @@ AutoFitSummary auto_fit_splines(CadModel& model,
 bool decompose_solid_by_planar_faces(CadModel& model,
                                      const std::string& solid_id,
                                      const ConversionOptions& options = {});
+
+// Fuse adjacent decomposition fragments at the OCCT level. A merge is
+// accepted only when it preserves volume and the fused solid receives the
+// ordinary convex half-space certificate. Returns the number of pieces
+// eliminated. The model is unchanged when no certified merge exists.
+std::size_t coalesce_decomposed_pieces(CadModel& model,
+                                       const ConversionOptions& options = {});
+
+// Exact bounded arrangement for all-planar, linear-edge prismatic solids.
+// Applies each unique support plane sequentially, never as one combinatorial
+// splitter call, and stores both convex and honest residual pieces.
+bool decompose_solid_prismatic(CadModel& model,
+                               const std::string& solid_id,
+                               const ConversionOptions& options = {});
+
+// Split a recognized full axisymmetric solid at its axial meridian-event
+// planes. This handles stepped shafts and similar revolved profiles without
+// constructing a generic 3D surface arrangement.
+bool decompose_solid_revolution(CadModel& model,
+                                const std::string& solid_id,
+                                const ConversionOptions& options = {});
+
+// Clone an already certified decomposition between two rigid occurrences of
+// the same verified component definition.
+bool reuse_definition_decomposition(
+    CadModel& model,
+    const std::string& source_solid_id,
+    const InstanceTransform& source_transform,
+    const std::string& target_solid_id,
+    const InstanceTransform& target_transform,
+    const ConversionOptions& options = {});
+
+MediumGenerationProposal propose_straight_pipe_medium(
+    const CadModel& model,
+    const MediumGenerationRequest& request,
+    const ConversionOptions& options = {});
+
+bool apply_straight_pipe_medium(
+    CadModel& model,
+    const MediumGenerationProposal& proposal,
+    bool user_approved,
+    const ConversionOptions& options = {});
+
+bool decompose_solid_shell_difference(CadModel& model,
+                                      const std::string& solid_id,
+                                      const ConversionOptions& options = {});
+
+// Recognize a straight full-annulus pipe and preserve it as one exact Boolean
+// body: outer cylinder minus inner cylinder.
+bool decompose_solid_pipe_annulus(CadModel& model,
+                                  const std::string& solid_id,
+                                  const ConversionOptions& options = {});
 
 // Exhaustive surface-driven subdivision. Cuts the solid by the bounded
 // cutter of every one of its own faces, recursing (up to

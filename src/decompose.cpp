@@ -152,6 +152,7 @@ std::vector<TopoDS_Solid> run_splitter(const TopoDS_Solid& solid,
     BOPAlgo_Splitter splitter;
     splitter.SetArguments(arguments);
     splitter.SetTools(tools);
+    splitter.SetNonDestructive(true);
     splitter.SetFuzzyValue(options.linear_tolerance);
     splitter.Perform();
     if (splitter.HasErrors()) {

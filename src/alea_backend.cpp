@@ -12,6 +12,18 @@ bool finalize_alea_system(alea_system_t* system,
         return false;
     }
 
+    // Simplify before deciding whether a cell really contains a union.  A
+    // decomposition commonly produces complementary branches such as
+    //
+    //     (A & +cut) | (A & -cut)
+    //
+    // which is just the single intersection A.  Splitting first destroys
+    // that relationship and permanently emits two cells.  Alea's factoring
+    // and complement reduction can remove the artificial cut while the
+    // branches are still together; only genuine residual unions should be
+    // split afterwards.
+    alea_simplify_and_prune_cells(system, nullptr);
+
     if (split_union_cells && alea_split_union_cells(system) < 0) {
         if (error_out) {
             *error_out = alea_error()[0]
@@ -20,10 +32,6 @@ bool finalize_alea_system(alea_system_t* system,
         }
         return false;
     }
-
-    // This is Boolean-expression simplification, not universe flattening.
-    // alea_flatten() has different semantics and must not be substituted here.
-    alea_simplify_and_prune_cells(system, nullptr);
 
     if (alea_build_universe_index(system) != 0) {
         if (error_out) {

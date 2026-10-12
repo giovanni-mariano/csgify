@@ -7,35 +7,54 @@
 
 #include "csgify/engine.hpp"
 
+#include "cleanup_internal.hpp"
+
 #include "analytic_surface.hpp"
+#include "approximation_internal.hpp"
 #include "decompose.hpp"
+#include "topology_analysis.hpp"
 #include "engine_internal.hpp"
 #include "fitted_candidates.hpp"
+#include "occt_boolean.hpp"
 #include "spline_fit.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepBuilderAPI_MakeSolid.hxx>
+#include <BRepBuilderAPI_Transform.hxx>
+#include <BRepClass3d.hxx>
 #include <BRepGProp.hxx>
+#include <BRepLib.hxx>
+#include <BRepPrimAPI_MakeCylinder.hxx>
+#include <BRepPrimAPI_MakeCone.hxx>
+#include <BRepCheck_Analyzer.hxx>
 #include <GProp_GProps.hxx>
+#include <Standard_Failure.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <TopoDS_Shell.hxx>
 #include <TopoDS_Solid.hxx>
 #include <gp_Cone.hxx>
+#include <gp_Ax1.hxx>
+#include <gp_Ax2.hxx>
 #include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Sphere.hxx>
+#include <gp_Trsf.hxx>
 
 namespace csgify {
 namespace {
@@ -182,6 +201,15 @@ struct DecompositionTarget {
     bool is_piece = false;
     DecomposedSolidPiece* piece = nullptr;
 };
+
+std::string decomposition_source_id(const DecompositionTarget& target,
+                                    const std::string& requested_id) {
+    if (target.is_piece && target.piece
+        && !target.piece->source_solid_id.empty()) {
+        return target.piece->source_solid_id;
+    }
+    return requested_id;
+}
 
 bool find_decomposition_target(CadModel& model,
                                const std::string& id,
@@ -531,7 +559,69 @@ bool materialize_fully_replaced_primitive(CadModel& model,
 
 } // namespace
 
+bool active_shape_for_id(const CadModel& model,
+                         const std::string& id,
+                         TopoDS_Shape* shape_out,
+                         std::string* source_solid_id_out) {
+    if (!shape_out) return false;
+    TopoDS_Solid solid;
+    std::size_t index = 0;
+    if (find_solid_by_id(model, id, &solid, &index)) {
+        *shape_out = solid;
+        if (source_solid_id_out) *source_solid_id_out = solid_id(index);
+        return true;
+    }
+    if (const DecomposedSolidPiece* piece = find_piece_by_id(model, id)) {
+        *shape_out = piece->solid;
+        if (source_solid_id_out) {
+            *source_solid_id_out = piece->source_solid_id.empty()
+                ? piece->id : piece->source_solid_id;
+        }
+        return true;
+    }
+    if (const SyntheticBody* body = detail::find_synthetic_body(model, id)) {
+        const TopoDS_Shape shape = detail::build_synthetic_shape(model, *body);
+        if (shape.IsNull()) return false;
+        *shape_out = shape;
+        if (source_solid_id_out) {
+            *source_solid_id_out = body->source_solid_id.empty()
+                ? body->id : body->source_solid_id;
+        }
+        return true;
+    }
+    for (const CadBooleanBody& body : model.cad_boolean_bodies) {
+        if (body.id == id && body.active && !body.materialized_solid.IsNull()) {
+            *shape_out = body.materialized_solid;
+            if (source_solid_id_out) {
+                *source_solid_id_out = body.source_solid_id.empty()
+                    ? body.id : body.source_solid_id;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
 bool remove_solid(CadModel& model, const std::string& id) {
+    if (id.rfind("piece:", 0) == 0) {
+        for (DecomposedSolidPiece& piece : model.decomposed_pieces) {
+            if (piece.id == id && piece.active) {
+                piece.active = false;
+                model.diagnostics.push_back({
+                    DiagnosticSeverity::info,
+                    "decomposed_piece_removed",
+                    "Decomposition piece was explicitly suppressed.",
+                    id});
+                return true;
+            }
+        }
+        model.diagnostics.push_back({
+            DiagnosticSeverity::error,
+            "solid_not_found",
+            "Requested active decomposition piece was not found.",
+            id});
+        return false;
+    }
     TopoDS_Solid solid;
     std::size_t index = 0;
     if (!find_solid_by_id(model, id, &solid, &index)) {
@@ -786,6 +876,729 @@ bool decompose_solid_by_planar_faces(CadModel& model,
     return true;
 }
 
+bool decompose_solid_prismatic(CadModel& model,
+                               const std::string& solid_id_str,
+                               const ConversionOptions& options) {
+    using namespace csgify::detail;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, solid_id_str, &target)) {
+        model.diagnostics.push_back({DiagnosticSeverity::error,
+            "decomposition_target_not_found",
+            "Requested prismatic decomposition target was not found.",
+            solid_id_str});
+        return false;
+    }
+    GProp_GProps original_props;
+    BRepGProp::VolumeProperties(target.solid, original_props);
+    const double original_volume = std::abs(original_props.Mass());
+    const SolidTopology topology =
+        analyze_solid_topology(target.solid, original_volume, options);
+    if (!topology.prismatic_candidate) {
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "prismatic_not_applicable",
+            "Solid did not satisfy the all-planar piecewise-prismatic classifier.",
+            solid_id_str});
+        return false;
+    }
+
+    std::vector<gp_Pln> planes = unique_planar_support_planes(target.solid, options);
+    const gp_Dir axis(topology.prism_axis.x, topology.prism_axis.y,
+                      topology.prism_axis.z);
+    std::stable_sort(planes.begin(), planes.end(), [&](const gp_Pln& a,
+                                                       const gp_Pln& b) {
+        // Partition the 2D profile before introducing axial slabs.
+        return std::abs(a.Axis().Direction().Dot(axis))
+             < std::abs(b.Axis().Direction().Dot(axis));
+    });
+
+    std::vector<gp_Dir> profile_normals;
+    for (const gp_Pln& plane : planes) {
+        const gp_Dir normal = plane.Axis().Direction();
+        if (std::abs(normal.Dot(axis)) > options.angular_tolerance) continue;
+        const bool known = std::any_of(
+            profile_normals.begin(), profile_normals.end(),
+            [&](const gp_Dir& existing) {
+                return std::abs(existing.Dot(normal))
+                    >= 1.0 - std::max(options.angular_tolerance, 1.0e-9);
+            });
+        if (!known) profile_normals.push_back(normal);
+    }
+
+    auto straddles = [&](const TopoDS_Solid& solid, const gp_Pln& plane) {
+        const gp_Dir n = plane.Axis().Direction();
+        const gp_Pnt o = plane.Location();
+        double min_value = std::numeric_limits<double>::infinity();
+        double max_value = -std::numeric_limits<double>::infinity();
+        for (TopExp_Explorer it(solid, TopAbs_VERTEX); it.More(); it.Next()) {
+            const gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(it.Current()));
+            const double value = gp_Vec(o, p).Dot(gp_Vec(n));
+            min_value = std::min(min_value, value);
+            max_value = std::max(max_value, value);
+        }
+        return min_value < -options.linear_tolerance
+            && max_value > options.linear_tolerance;
+    };
+
+    std::vector<TopoDS_Solid> pieces{target.solid};
+    std::size_t splitter_calls = 0;
+    bool any_split = false;
+    bool budget_exhausted = false;
+    for (const gp_Pln& plane : planes) {
+        std::vector<TopoDS_Solid> next;
+        for (const TopoDS_Solid& piece : pieces) {
+            if (!straddles(piece, plane)) {
+                next.push_back(piece);
+                continue;
+            }
+            if (splitter_calls >= options.prismatic_max_splitter_calls) {
+                budget_exhausted = true;
+                next.push_back(piece);
+                continue;
+            }
+            ++splitter_calls;
+            ConversionReport scratch;
+            std::vector<TopoDS_Solid> split = split_solid_by_plane(
+                piece, plane, options, scratch, target.report_index,
+                "prismatic_support_plane");
+            if (split.size() > 1) {
+                any_split = true;
+                next.insert(next.end(), split.begin(), split.end());
+            } else {
+                next.push_back(piece);
+            }
+            if (next.size() > options.prismatic_max_pieces) {
+                budget_exhausted = true;
+                break;
+            }
+        }
+        pieces.swap(next);
+        if (budget_exhausted) break;
+    }
+    if (!any_split || pieces.empty()) {
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "prismatic_no_progress",
+            "Prismatic support-plane arrangement produced no usable partition.",
+            solid_id_str});
+        return false;
+    }
+
+    // Existing face supports are sufficient for ordinary concave profiles,
+    // but not for a profile containing a through-hole: a useful partition
+    // line often continues a wall direction through a reflex vertex and is
+    // not itself the support of any face.  Generate those cross-profile
+    // planes only for residual cells.  This local refinement is bounded by
+    // the same piece/split budgets and avoids constructing the Cartesian
+    // arrangement for the complete source solid.
+    auto is_convex_cell = [&](const TopoDS_Solid& solid,
+                              std::size_t probe_index) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(solid, props);
+        DecomposedSolidPiece record;
+        record.id = "prismatic_probe:" + std::to_string(probe_index);
+        record.solid = solid;
+        record.volume = std::abs(props.Mass());
+        return analyze_decomposed_piece(record, probe_index,
+                                        target.report_index, options)
+            .exact_csg_supported;
+    };
+    std::vector<TopoDS_Solid> refined;
+    std::vector<bool> refined_convex;
+    refined.reserve(pieces.size());
+    refined_convex.reserve(pieces.size());
+    std::size_t refinement_index = 0;
+    for (const TopoDS_Solid& piece : pieces) {
+        ++refinement_index;
+        if (is_convex_cell(piece, refinement_index)) {
+            refined.push_back(piece);
+            refined_convex.push_back(true);
+            continue;
+        }
+        std::vector<gp_Pln> cross_planes;
+        for (TopExp_Explorer vertex_it(piece, TopAbs_VERTEX);
+             vertex_it.More(); vertex_it.Next()) {
+            const gp_Pnt point = BRep_Tool::Pnt(
+                TopoDS::Vertex(vertex_it.Current()));
+            for (const gp_Dir& normal : profile_normals) {
+                const gp_Pln candidate(point, normal);
+                const bool duplicate = std::any_of(
+                    cross_planes.begin(), cross_planes.end(),
+                    [&](const gp_Pln& existing) {
+                        return std::abs(existing.Axis().Direction().Dot(normal))
+                                   >= 1.0 - std::max(options.angular_tolerance,
+                                                    1.0e-9)
+                            && existing.Distance(point)
+                                   <= std::max(options.linear_tolerance * 10.0,
+                                               1.0e-6);
+                    });
+                if (!duplicate) cross_planes.push_back(candidate);
+            }
+        }
+        std::vector<TopoDS_Solid> local{piece};
+        for (const gp_Pln& plane : cross_planes) {
+            std::vector<TopoDS_Solid> next;
+            for (const TopoDS_Solid& cell : local) {
+                if (!straddles(cell, plane)) {
+                    next.push_back(cell);
+                    continue;
+                }
+                if (splitter_calls >= options.prismatic_max_splitter_calls
+                    || refined.size() + next.size() + local.size()
+                           >= options.prismatic_max_pieces) {
+                    budget_exhausted = true;
+                    next.push_back(cell);
+                    continue;
+                }
+                ++splitter_calls;
+                ConversionReport scratch;
+                std::vector<TopoDS_Solid> split = split_solid_by_plane(
+                    cell, plane, options, scratch, target.report_index,
+                    "prismatic_reflex_vertex_plane");
+                if (split.size() > 1) {
+                    next.insert(next.end(), split.begin(), split.end());
+                } else {
+                    next.push_back(cell);
+                }
+            }
+            local.swap(next);
+        }
+        refined.insert(refined.end(), local.begin(), local.end());
+        refined_convex.insert(refined_convex.end(), local.size(), false);
+    }
+    pieces.swap(refined);
+
+    double pieces_volume = 0.0;
+    std::size_t residual = 0;
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(pieces[i], props);
+        const double volume = std::abs(props.Mass());
+        pieces_volume += volume;
+        if (!refined_convex[i]) {
+            DecomposedSolidPiece record;
+            record.id = "prismatic_probe:" + std::to_string(i + 1);
+            record.solid = pieces[i];
+            record.volume = volume;
+            const AnalyzedDecomposedPiece analyzed = analyze_decomposed_piece(
+                record, i + 1, target.report_index, options);
+            if (!analyzed.exact_csg_supported) ++residual;
+        }
+    }
+    const double relative_delta = std::abs(pieces_volume - original_volume)
+        / std::max(original_volume, kEps);
+    if (relative_delta > options.decomposition_relative_volume_tolerance) {
+        std::ostringstream msg;
+        msg << "Prismatic partition relative volume delta " << relative_delta
+            << " exceeds tolerance "
+            << options.decomposition_relative_volume_tolerance << ".";
+        model.diagnostics.push_back({DiagnosticSeverity::error,
+            "decomposition_volume_drift", msg.str(), solid_id_str});
+        return false;
+    }
+
+    if (target.is_piece && target.piece) target.piece->active = false;
+    else remove_solid(model, solid_id_str);
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(piece, props);
+        DecomposedSolidPiece record;
+        record.id = next_decomposed_piece_id(model);
+        record.label = record.id + "/from_" + solid_id_str;
+        record.source_solid_id = decomposition_source_id(target, solid_id_str);
+        record.solid = piece;
+        record.volume = std::abs(props.Mass());
+        model.decomposed_pieces.push_back(std::move(record));
+    }
+    std::ostringstream msg;
+    msg << "Sequential prismatic arrangement produced " << pieces.size()
+        << " piece(s) using " << splitter_calls << " splitter call(s); "
+        << residual << " residual piece(s), relative_delta=" << relative_delta;
+    model.diagnostics.push_back({
+        residual == 0 && !budget_exhausted ? DiagnosticSeverity::info
+                                           : DiagnosticSeverity::warning,
+        residual == 0 && !budget_exhausted ? "prismatic_decomposition"
+                                           : "prismatic_decomposition_partial",
+        msg.str(), solid_id_str});
+    return true;
+}
+
+bool decompose_solid_revolution(CadModel& model,
+                                const std::string& solid_id_str,
+                                const ConversionOptions& options) {
+    using namespace csgify::detail;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, solid_id_str, &target)) {
+        model.diagnostics.push_back({DiagnosticSeverity::error,
+            "revolution_target_not_found",
+            "Requested revolution target was not found.", solid_id_str});
+        return false;
+    }
+    GProp_GProps original_props;
+    BRepGProp::VolumeProperties(target.solid, original_props);
+    const double original_volume = std::abs(original_props.Mass());
+    const SolidTopology topology =
+        analyze_solid_topology(target.solid, original_volume, options);
+    if (!topology.revolution.candidate
+        || !topology.revolution.full_revolution) {
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "revolution_not_applicable",
+            "The solid is not a supported full axisymmetric revolution.",
+            solid_id_str});
+        return false;
+    }
+
+    const gp_Dir axis(topology.revolution.axis_direction.x,
+                      topology.revolution.axis_direction.y,
+                      topology.revolution.axis_direction.z);
+    std::vector<gp_Pln> axial_planes;
+    for (const gp_Pln& plane : unique_planar_support_planes(target.solid,
+                                                             options)) {
+        if (std::abs(plane.Axis().Direction().Dot(axis))
+            >= 1.0 - std::max(options.angular_tolerance, 1.0e-9)) {
+            axial_planes.push_back(plane);
+        }
+    }
+    auto straddles = [&](const TopoDS_Solid& solid, const gp_Pln& plane) {
+        const gp_Dir normal = plane.Axis().Direction();
+        const gp_Pnt origin = plane.Location();
+        double low = std::numeric_limits<double>::infinity();
+        double high = -std::numeric_limits<double>::infinity();
+        for (TopExp_Explorer it(solid, TopAbs_VERTEX); it.More(); it.Next()) {
+            const gp_Pnt point = BRep_Tool::Pnt(TopoDS::Vertex(it.Current()));
+            const double value = gp_Vec(origin, point).Dot(gp_Vec(normal));
+            low = std::min(low, value);
+            high = std::max(high, value);
+        }
+        return low < -options.linear_tolerance
+            && high > options.linear_tolerance;
+    };
+
+    std::vector<TopoDS_Solid> pieces{target.solid};
+    std::size_t splitter_calls = 0;
+    bool any_split = false;
+    bool budget_exhausted = false;
+    for (const gp_Pln& plane : axial_planes) {
+        std::vector<TopoDS_Solid> next;
+        for (const TopoDS_Solid& piece : pieces) {
+            if (!straddles(piece, plane)) {
+                next.push_back(piece);
+                continue;
+            }
+            if (splitter_calls >= options.prismatic_max_splitter_calls
+                || next.size() + pieces.size()
+                       >= options.prismatic_max_pieces) {
+                budget_exhausted = true;
+                next.push_back(piece);
+                continue;
+            }
+            ++splitter_calls;
+            ConversionReport scratch;
+            std::vector<TopoDS_Solid> split = split_solid_by_plane(
+                piece, plane, options, scratch, target.report_index,
+                "revolution_axial_event_plane");
+            if (split.size() > 1) {
+                any_split = true;
+                next.insert(next.end(), split.begin(), split.end());
+            } else {
+                next.push_back(piece);
+            }
+        }
+        pieces.swap(next);
+    }
+    if (!any_split || pieces.empty()) {
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "revolution_no_progress",
+            "No internal axial meridian-event plane split the solid.",
+            solid_id_str});
+        return false;
+    }
+
+    double pieces_volume = 0.0;
+    std::size_t residual = 0;
+    for (std::size_t i = 0; i < pieces.size(); ++i) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(pieces[i], props);
+        const double piece_volume = std::abs(props.Mass());
+        pieces_volume += piece_volume;
+        DecomposedSolidPiece probe;
+        probe.id = "revolution_probe:" + std::to_string(i + 1);
+        probe.solid = pieces[i];
+        probe.volume = piece_volume;
+        if (!analyze_decomposed_piece(probe, i + 1, target.report_index,
+                                      options).exact_csg_supported) {
+            ++residual;
+        }
+    }
+    const double relative_delta = std::abs(pieces_volume - original_volume)
+        / std::max(original_volume, kEps);
+    if (!decomposition_volume_guard(model, solid_id_str, relative_delta,
+                                    options)) {
+        return false;
+    }
+
+    if (target.is_piece && target.piece) target.piece->active = false;
+    else remove_solid(model, solid_id_str);
+    for (const TopoDS_Solid& piece : pieces) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(piece, props);
+        DecomposedSolidPiece record;
+        record.id = next_decomposed_piece_id(model);
+        record.label = record.id + "/from_" + solid_id_str;
+        record.source_solid_id = decomposition_source_id(target, solid_id_str);
+        record.solid = piece;
+        record.volume = std::abs(props.Mass());
+        model.decomposed_pieces.push_back(std::move(record));
+    }
+    std::ostringstream message;
+    message << "Axial revolution arrangement produced " << pieces.size()
+            << " piece(s) using " << splitter_calls << " splitter call(s); "
+            << residual << " residual piece(s), relative_delta="
+            << relative_delta;
+    model.diagnostics.push_back({
+        residual == 0 && !budget_exhausted ? DiagnosticSeverity::info
+                                           : DiagnosticSeverity::warning,
+        residual == 0 && !budget_exhausted ? "revolution_decomposition"
+                                           : "revolution_decomposition_partial",
+        message.str(), solid_id_str});
+    return true;
+}
+
+bool reuse_definition_decomposition(
+    CadModel& model,
+    const std::string& source_solid_id,
+    const InstanceTransform& source_transform,
+    const std::string& target_solid_id,
+    const InstanceTransform& target_transform,
+    const ConversionOptions& options) {
+    if (source_solid_id.empty() || source_solid_id == target_solid_id) {
+        return false;
+    }
+    auto is_rigid = [](const InstanceTransform& transform) {
+        const auto& m = transform.values;
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 3; ++b) {
+                double dot = 0.0;
+                for (int row = 0; row < 3; ++row)
+                    dot += m[4 * row + a] * m[4 * row + b];
+                const double expected = a == b ? 1.0 : 0.0;
+                if (std::abs(dot - expected) > 1.0e-9) return false;
+            }
+        }
+        return true;
+    };
+    if (!is_rigid(source_transform) || !is_rigid(target_transform)) {
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "definition_cache_non_rigid_transform",
+            "Definition conversion reuse was rejected because an occurrence "
+            "transform contains scale or shear.", target_solid_id});
+        return false;
+    }
+    TopoDS_Shape target_shape;
+    if (!active_shape_for_id(model, target_solid_id, &target_shape)
+        || target_shape.ShapeType() != TopAbs_SOLID) {
+        return false;
+    }
+    std::vector<const DecomposedSolidPiece*> source_pieces;
+    for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (piece.active && piece.source_solid_id == source_solid_id) {
+            source_pieces.push_back(&piece);
+        }
+    }
+    std::vector<const CadBooleanBody*> source_bodies;
+    for (const CadBooleanBody& body : model.cad_boolean_bodies) {
+        if (body.active && body.source_solid_id == source_solid_id) {
+            source_bodies.push_back(&body);
+        }
+    }
+    if (source_pieces.empty() && source_bodies.empty()) return false;
+
+    auto to_trsf = [](const InstanceTransform& value) {
+        const auto& m = value.values;
+        gp_Trsf result;
+        result.SetValues(m[0], m[1], m[2], m[3],
+                         m[4], m[5], m[6], m[7],
+                         m[8], m[9], m[10], m[11]);
+        return result;
+    };
+    gp_Trsf inverse_source = to_trsf(source_transform);
+    try {
+        inverse_source.Invert();
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+    const gp_Trsf relative = to_trsf(target_transform) * inverse_source;
+    std::vector<TopoDS_Solid> transformed;
+    transformed.reserve(source_pieces.size());
+    std::vector<CadBooleanBody> transformed_bodies;
+    transformed_bodies.reserve(source_bodies.size());
+    double transformed_volume = 0.0;
+    try {
+        auto move_solid = [&](const TopoDS_Solid& source) {
+            const TopoDS_Shape moved = BRepBuilderAPI_Transform(
+                source, relative, true).Shape();
+            if (moved.IsNull() || moved.ShapeType() != TopAbs_SOLID
+                || !BRepCheck_Analyzer(moved, true).IsValid()) {
+                throw Standard_Failure("invalid transformed definition solid");
+            }
+            return TopoDS::Solid(moved);
+        };
+        for (const DecomposedSolidPiece* source : source_pieces) {
+            const TopoDS_Solid solid = move_solid(source->solid);
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(solid, props);
+            transformed_volume += std::abs(props.Mass());
+            transformed.push_back(solid);
+        }
+        for (const CadBooleanBody* source : source_bodies) {
+            CadBooleanBody body;
+            body.source_solid_id = target_solid_id;
+            body.materialized_solid = BRepBuilderAPI_Transform(
+                source->materialized_solid, relative, true).Shape();
+            if (body.materialized_solid.IsNull()
+                || !BRepCheck_Analyzer(body.materialized_solid, true).IsValid())
+                throw Standard_Failure("invalid transformed Boolean body");
+            for (const TopoDS_Solid& positive : source->positive_cells)
+                body.positive_cells.push_back(move_solid(positive));
+            for (const TopoDS_Solid& negative : source->negative_cells)
+                body.negative_cells.push_back(move_solid(negative));
+            GProp_GProps props;
+            BRepGProp::VolumeProperties(body.materialized_solid, props);
+            transformed_volume += std::abs(props.Mass());
+            body.role = source->role;
+            body.request_id = source->request_id;
+            body.material_id = source->material_id;
+            body.density = source->density;
+            body.emit_as_cell = source->emit_as_cell;
+            transformed_bodies.push_back(std::move(body));
+        }
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+
+    GProp_GProps target_props;
+    BRepGProp::VolumeProperties(target_shape, target_props);
+    const double target_volume = std::abs(target_props.Mass());
+    const double relative_delta = std::abs(transformed_volume - target_volume)
+        / std::max(target_volume, kEps);
+    if (!decomposition_volume_guard(model, target_solid_id, relative_delta,
+                                    options)) {
+        return false;
+    }
+    if (!remove_solid(model, target_solid_id)) return false;
+    for (TopoDS_Solid& solid : transformed) {
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(solid, props);
+        DecomposedSolidPiece piece;
+        piece.id = next_decomposed_piece_id(model);
+        piece.label = piece.id + "/definition_cache_from_" + source_solid_id;
+        piece.source_solid_id = target_solid_id;
+        piece.solid = std::move(solid);
+        piece.volume = std::abs(props.Mass());
+        model.decomposed_pieces.push_back(std::move(piece));
+    }
+    for (CadBooleanBody& body : transformed_bodies) {
+        body.id = "cad_boolean:"
+            + std::to_string(model.cad_boolean_bodies.size() + 1);
+        body.label = body.id + "/definition_cache_from_" + source_solid_id;
+        model.cad_boolean_bodies.push_back(std::move(body));
+    }
+    std::ostringstream message;
+    message << "Reused " << source_pieces.size()
+            << " certified decomposition piece(s) and "
+            << source_bodies.size() << " Boolean body/bodies from "
+            << source_solid_id
+            << " for transformed occurrence " << target_solid_id
+            << "; relative_delta=" << relative_delta << ".";
+    model.diagnostics.push_back({DiagnosticSeverity::info,
+        "definition_conversion_cache_hit", message.str(), target_solid_id});
+    return true;
+}
+
+bool decompose_solid_shell_difference(CadModel& model,
+                                      const std::string& solid_id_str,
+                                      const ConversionOptions& options) {
+    using namespace csgify::detail;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, solid_id_str, &target)
+        || target.is_piece) {
+        model.diagnostics.push_back({DiagnosticSeverity::error,
+            "shell_difference_target_not_found",
+            "Shell-difference conversion requires an imported solid:N target.",
+            solid_id_str});
+        return false;
+    }
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(target.solid, props);
+    const double volume = std::abs(props.Mass());
+    const SolidTopology topology =
+        analyze_solid_topology(target.solid, volume, options);
+    if (topology.cavity_shell_count == 0) {
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "shell_difference_not_applicable",
+            "The solid has no enclosed cavity shells.", solid_id_str});
+        return false;
+    }
+
+    const TopoDS_Shell outer = BRepClass3d::OuterShell(target.solid);
+    CadBooleanBody body;
+    body.id = "cad_boolean:"
+        + std::to_string(model.cad_boolean_bodies.size() + 1);
+    body.label = body.id + "/from_" + solid_id_str;
+    body.source_solid_id = solid_id_str;
+    body.materialized_solid = target.solid;
+    std::size_t shell_index = 0;
+    for (TopExp_Explorer it(target.solid, TopAbs_SHELL);
+         it.More(); it.Next()) {
+        ++shell_index;
+        const TopoDS_Shell shell = TopoDS::Shell(it.Current());
+        TopoDS_Solid shell_solid = BRepBuilderAPI_MakeSolid(shell).Solid();
+        BRepLib::OrientClosedSolid(shell_solid);
+        GProp_GProps shell_props;
+        BRepGProp::VolumeProperties(shell_solid, shell_props);
+        gp_Pnt interior;
+        ConversionReport scratch;
+        GeometryCertificate certificate;
+        const bool convex =
+            find_interior_point(shell_solid, shell_props,
+                                options.linear_tolerance, &interior)
+            && validate_convex_halfspace_cell(
+                shell_solid, interior, target.report_index, options, scratch,
+                false, false, false, &model.face_replacements, &certificate);
+        if (!convex) {
+            std::ostringstream msg;
+            msg << "Shell " << shell_index
+                << " is not a convex analytic cell ("
+                << certificate.failure_code
+                << "); shell difference was not applied.";
+            model.diagnostics.push_back({DiagnosticSeverity::warning,
+                "shell_difference_nonconvex_shell", msg.str(), solid_id_str});
+            return false;
+        }
+        if (!outer.IsNull() && shell.IsSame(outer)) {
+            body.positive_cells.push_back(shell_solid);
+        } else {
+            body.negative_cells.push_back(shell_solid);
+        }
+    }
+    if (body.positive_cells.empty() || body.negative_cells.empty()) return false;
+    remove_solid(model, solid_id_str);
+    model.cad_boolean_bodies.push_back(std::move(body));
+    model.diagnostics.push_back({DiagnosticSeverity::info,
+        "shell_difference_applied",
+        "Converted the outer shell and enclosed cavity shells to an exact "
+        "Boolean difference.", solid_id_str});
+    return true;
+}
+
+bool decompose_solid_pipe_annulus(CadModel& model,
+                                  const std::string& solid_id_str,
+                                  const ConversionOptions& options) {
+    using namespace csgify::detail;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, solid_id_str, &target)
+        || target.is_piece) {
+        model.diagnostics.push_back({DiagnosticSeverity::error,
+            "pipe_annulus_target_not_found",
+            "Pipe recognition requires an imported solid:N target.",
+            solid_id_str});
+        return false;
+    }
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(target.solid, props);
+    const double volume = std::abs(props.Mass());
+    const SolidTopology topology =
+        analyze_solid_topology(target.solid, volume, options);
+    const PipeAnnulusTopology& pipe = topology.pipe_annulus;
+    if (!pipe.candidate || pipe.ports.size() != 2) {
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "pipe_annulus_not_applicable",
+            "The solid is not a certified straight full-annulus pipe.",
+            solid_id_str});
+        return false;
+    }
+
+    const gp_Pnt base(pipe.ports.front().center.x,
+                      pipe.ports.front().center.y,
+                      pipe.ports.front().center.z);
+    const gp_Dir axis(pipe.axis_direction.x, pipe.axis_direction.y,
+                      pipe.axis_direction.z);
+    try {
+        const gp_Ax2 placement(base, axis);
+        const TopoDS_Solid outer = pipe.conical
+            ? BRepPrimAPI_MakeCone(placement, pipe.outer_radius,
+                                   pipe.top_outer_radius,
+                                   pipe.axial_length).Solid()
+            : BRepPrimAPI_MakeCylinder(
+                  placement, pipe.outer_radius, pipe.axial_length).Solid();
+        const TopoDS_Solid inner = pipe.conical
+            ? BRepPrimAPI_MakeCone(placement, pipe.inner_radius,
+                                   pipe.top_inner_radius,
+                                   pipe.axial_length).Solid()
+            : BRepPrimAPI_MakeCylinder(
+                  placement, pipe.inner_radius, pipe.axial_length).Solid();
+        BRepAlgoAPI_Cut cut;
+        detail::build_binary_boolean(cut, outer, inner);
+        if (!cut.IsDone() || cut.HasErrors() || cut.Shape().IsNull()
+            || !BRepCheck_Analyzer(cut.Shape()).IsValid()) {
+            model.diagnostics.push_back({DiagnosticSeverity::warning,
+                "pipe_annulus_reconstruction_failed",
+                "OCCT could not materialize a valid outer-minus-inner pipe.",
+                solid_id_str});
+            return false;
+        }
+        TopExp_Explorer solids(cut.Shape(), TopAbs_SOLID);
+        if (!solids.More()) return false;
+        const TopoDS_Solid reconstructed = TopoDS::Solid(solids.Current());
+        solids.Next();
+        if (solids.More()) return false;
+
+        std::string measurement_error;
+        const double numerical_tolerance = std::max(
+            1.0e-12, volume * options.decomposition_relative_volume_tolerance);
+        const ApproximationMetrics metrics = measure_shape_approximation(
+            target.solid, reconstructed, volume, numerical_tolerance,
+            &measurement_error);
+        if (!metrics.symmetric_difference_certified
+            || metrics.changed_volume_fraction
+                   > options.decomposition_relative_volume_tolerance) {
+            std::ostringstream message;
+            message << "Recognized pipe reconstruction did not pass the exact "
+                       "symmetric-difference certificate";
+            if (!measurement_error.empty()) message << ": " << measurement_error;
+            message << "; changed_fraction=" << std::setprecision(17)
+                    << metrics.changed_volume_fraction;
+            model.diagnostics.push_back({DiagnosticSeverity::warning,
+                "pipe_annulus_certificate_failed", message.str(), solid_id_str});
+            return false;
+        }
+
+        CadBooleanBody body;
+        body.id = "cad_boolean:"
+            + std::to_string(model.cad_boolean_bodies.size() + 1);
+        body.label = body.id + "/pipe_from_" + solid_id_str;
+        body.source_solid_id = solid_id_str;
+        body.materialized_solid = target.solid;
+        body.positive_cells.push_back(outer);
+        body.negative_cells.push_back(inner);
+        remove_solid(model, solid_id_str);
+        model.cad_boolean_bodies.push_back(std::move(body));
+        std::ostringstream message;
+        message << "Recognized a straight "
+                << (pipe.conical ? "conical" : "cylindrical")
+                << " pipe and emitted one exact annulus as outer primitive "
+                   "minus inner primitive; changed_fraction="
+                << std::setprecision(17) << metrics.changed_volume_fraction;
+        model.diagnostics.push_back({DiagnosticSeverity::info,
+            "pipe_annulus_difference_applied", message.str(), solid_id_str});
+        return true;
+    } catch (const Standard_Failure& failure) {
+        const char* what = failure.what();
+        model.diagnostics.push_back({DiagnosticSeverity::warning,
+            "pipe_annulus_reconstruction_failed",
+            what ? what : "OCCT pipe reconstruction failed.", solid_id_str});
+        return false;
+    }
+}
+
 bool decompose_solid_by_face(CadModel& model,
                              const std::string& solid_id_str,
                              const std::string& face_id_str,
@@ -927,7 +1740,7 @@ bool decompose_solid_by_face(CadModel& model,
         DecomposedSolidPiece decomposed;
         decomposed.id = next_decomposed_piece_id(model);
         decomposed.label = decomposed.id + "/from_" + solid_id_str;
-        decomposed.source_solid_id = solid_id_str;
+        decomposed.source_solid_id = decomposition_source_id(target, solid_id_str);
         decomposed.solid = piece;
         decomposed.volume = std::abs(piece_props.Mass());
         decomposed.active = true;
@@ -1035,7 +1848,7 @@ bool decompose_solid_by_plane(CadModel& model,
         DecomposedSolidPiece decomposed;
         decomposed.id = next_decomposed_piece_id(model);
         decomposed.label = decomposed.id + "/from_" + solid_id_str;
-        decomposed.source_solid_id = solid_id_str;
+        decomposed.source_solid_id = decomposition_source_id(target, solid_id_str);
         decomposed.solid = piece;
         decomposed.volume = std::abs(piece_props.Mass());
         decomposed.active = true;
@@ -1156,7 +1969,7 @@ bool decompose_solid_by_planes(CadModel& model,
         DecomposedSolidPiece decomposed;
         decomposed.id = next_decomposed_piece_id(model);
         decomposed.label = decomposed.id + "/from_" + solid_id_str;
-        decomposed.source_solid_id = solid_id_str;
+        decomposed.source_solid_id = decomposition_source_id(target, solid_id_str);
         decomposed.solid = piece;
         decomposed.volume = std::abs(piece_props.Mass());
         decomposed.active = true;
@@ -1209,13 +2022,6 @@ void score_decomposition_candidate(DecompositionCandidate& candidate) {
         candidate.rejection_reason = msg.str();
         return;
     }
-    if (candidate.sliver_piece_count > 0) {
-        candidate.usable = false;
-        candidate.confidence = "rejected";
-        candidate.rejection_reason = "split produced sliver pieces";
-        return;
-    }
-
     candidate.usable = true;
     const double exact_fraction = candidate.piece_count > 0
         ? static_cast<double>(candidate.exact_piece_count)
@@ -1251,9 +2057,11 @@ void score_decomposition_candidate(DecompositionCandidate& candidate) {
         100.0
         + 40.0 * exact_fraction
         + 20.0 * candidate.volume_balance
+        + 80.0 * candidate.progress_ratio
         + surface_bonus
         + reason_bonus
         - 25.0 * decision_fraction
+        - 20.0 * static_cast<double>(candidate.sliver_piece_count)
         - 100000.0 * candidate.relative_delta;
 
     if (candidate.exact_piece_count == candidate.piece_count
@@ -1262,8 +2070,10 @@ void score_decomposition_candidate(DecompositionCandidate& candidate) {
         && candidate.volume_balance >= 0.1
         && candidate.reason != "bbox_axis_fallback") {
         candidate.confidence = "high";
-    } else if (candidate.exact_piece_count > 0
-               && candidate.pieces_requiring_decomposition < candidate.piece_count) {
+    } else if ((candidate.exact_piece_count > 0
+                && candidate.pieces_requiring_decomposition
+                       < candidate.piece_count)
+               || candidate.progress_ratio >= 0.05) {
         candidate.confidence = "medium";
     } else {
         candidate.confidence = "low";
@@ -1291,7 +2101,13 @@ DecompositionProposal propose_decomposition_candidates_impl(
     bool convexity_failure_face_only,
     bool longest_bbox_axis_only,
     bool include_multi_bbox_fallback,
-    bool lazy_first_usable) {
+    bool lazy_first_usable,
+    std::map<std::string, std::vector<TopoDS_Solid>>* geometry_out = nullptr,
+    bool include_parallel_plane_batches = false,
+    std::size_t max_parallel_families = 0,
+    std::size_t max_planes_per_batch = 0,
+    std::size_t max_generated_candidates =
+        std::numeric_limits<std::size_t>::max()) {
     using namespace csgify::detail;
     DecompositionProposal proposal;
     proposal.target_id = solid_id_str;
@@ -1321,6 +2137,8 @@ DecompositionProposal propose_decomposition_candidates_impl(
         });
         return proposal;
     }
+    const std::size_t parent_violation_count =
+        convexity_halfspace_violation_count(solid, report_index, options);
 
     std::size_t convexity_failure_face_index = 0;
     const bool has_convexity_failure_face =
@@ -1331,6 +2149,9 @@ DecompositionProposal propose_decomposition_candidates_impl(
 
     auto finish_candidate = [&](DecompositionCandidate& candidate,
                                 const std::vector<TopoDS_Solid>& pieces) {
+        if (geometry_out) {
+            (*geometry_out)[candidate.id] = pieces;
+        }
         candidate.piece_count = pieces.size();
         double min_fraction = 0.0;
         double max_fraction = 0.0;
@@ -1376,6 +2197,12 @@ DecompositionProposal propose_decomposition_candidates_impl(
             summary.needs_spline_replacement = analyzed.needs_spline_replacement;
             summary.needs_surface_replacement = analyzed.needs_surface_replacement;
             summary.needs_user_decision = analyzed.needs_user_decision;
+            summary.halfspace_violation_count =
+                convexity_halfspace_violation_count(
+                    piece, report_solid_index, options);
+            candidate.max_piece_halfspace_violation_count = std::max(
+                candidate.max_piece_halfspace_violation_count,
+                summary.halfspace_violation_count);
             candidate.pieces.push_back(summary);
 
             if (analyzed.exact_csg_supported) {
@@ -1400,20 +2227,167 @@ DecompositionProposal propose_decomposition_candidates_impl(
         if (max_fraction > kEps) {
             candidate.volume_balance = min_fraction / max_fraction;
         }
+        candidate.parent_halfspace_violation_count = parent_violation_count;
+        if (parent_violation_count > 0 && candidate.piece_count >= 2) {
+            candidate.progress_ratio = std::max(
+                0.0, 1.0
+                    - static_cast<double>(
+                          candidate.max_piece_halfspace_violation_count)
+                        / static_cast<double>(parent_violation_count));
+        }
 
         score_decomposition_candidate(candidate);
     };
 
+    auto has_usable_in_proposal = [&]() {
+        for (const DecompositionCandidate& c : proposal.candidates) {
+            if (c.usable) return true;
+        }
+        return false;
+    };
+    auto has_high_confidence_in_proposal = [&]() {
+        for (const DecompositionCandidate& c : proposal.candidates) {
+            if (c.usable && c.confidence == "high") return true;
+        }
+        return false;
+    };
+
     std::size_t candidate_index = 0;
+    auto candidate_budget_available = [&]() {
+        return proposal.candidates.size() < max_generated_candidates;
+    };
+
+    // GEOUNED-style fast path for repeated planar structure: canonicalize
+    // planar face supports into parallel families and hand all useful offsets
+    // in one family to one OCCT splitter call. Single face cuts often peel a
+    // sliver without making a child convex; the coherent family exposes the
+    // complete profile partition at once.
+    if (include_parallel_plane_batches && max_parallel_families > 0
+        && max_planes_per_batch >= 2) {
+        struct PlaneFamily {
+            gp_Dir normal;
+            std::vector<gp_Pln> planes;
+            bool contains_failure = false;
+            std::size_t first_face_index = 0;
+        };
+        std::vector<PlaneFamily> families;
+        std::size_t face_index = 0;
+        for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
+             face_exp.More(); face_exp.Next()) {
+            ++face_index;
+            const TopoDS_Face face = TopoDS::Face(face_exp.Current());
+            BRepAdaptor_Surface adaptor(face, false);
+            if (adaptor.GetType() != GeomAbs_Plane) continue;
+            gp_Pln plane = adaptor.Plane();
+            gp_Dir normal = plane.Axis().Direction();
+            const double sign_component = std::abs(normal.X()) > 1.0e-12
+                ? normal.X() : std::abs(normal.Y()) > 1.0e-12
+                    ? normal.Y() : normal.Z();
+            if (sign_component < 0.0) {
+                normal.Reverse();
+                plane.SetAxis(gp_Ax1(plane.Location(), normal));
+            }
+            PlaneFamily* family = nullptr;
+            for (PlaneFamily& existing : families) {
+                if (existing.normal.Dot(normal)
+                        >= 1.0 - std::max(options.angular_tolerance, 1.0e-9)) {
+                    family = &existing;
+                    break;
+                }
+            }
+            if (!family) {
+                families.push_back({normal, {}, false, face_index});
+                family = &families.back();
+            }
+            const bool duplicate = std::any_of(
+                family->planes.begin(), family->planes.end(),
+                [&](const gp_Pln& existing) {
+                    return existing.Distance(plane.Location())
+                        <= std::max(options.linear_tolerance * 10.0, 1.0e-6);
+                });
+            if (!duplicate) family->planes.push_back(plane);
+            if (has_convexity_failure_face
+                && face_index == convexity_failure_face_index) {
+                family->contains_failure = true;
+            }
+        }
+        std::stable_sort(families.begin(), families.end(),
+            [](const PlaneFamily& left, const PlaneFamily& right) {
+                if (left.contains_failure != right.contains_failure)
+                    return left.contains_failure;
+                if (left.planes.size() != right.planes.size())
+                    return left.planes.size() > right.planes.size();
+                return left.first_face_index < right.first_face_index;
+            });
+        std::size_t families_evaluated = 0;
+        for (const PlaneFamily& family : families) {
+            if (!candidate_budget_available()) break;
+            if (families_evaluated >= max_parallel_families) break;
+            if (family.planes.size() < 2) continue;
+            ++families_evaluated;
+            ++candidate_index;
+            DecompositionCandidate candidate;
+            candidate.id = "candidate:" + std::to_string(candidate_index);
+            candidate.target_id = solid_id_str;
+            candidate.surface_type = "plane";
+            candidate.tool_kind = "parallel_face_planes";
+            candidate.reason = "parallel_face_plane_batch";
+            candidate.original_volume = original_volume;
+            std::vector<gp_Pln> tools;
+            const std::size_t plane_count = std::min(
+                family.planes.size(), max_planes_per_batch);
+            tools.reserve(plane_count);
+            candidate.planes.reserve(plane_count);
+            for (std::size_t i = 0; i < plane_count; ++i) {
+                const gp_Pln& plane = family.planes[i];
+                tools.push_back(plane);
+                PlaneSpec spec;
+                spec.origin = {plane.Location().X(), plane.Location().Y(),
+                               plane.Location().Z()};
+                const gp_Dir direction = plane.Axis().Direction();
+                spec.normal = {direction.X(), direction.Y(), direction.Z()};
+                candidate.planes.push_back(spec);
+            }
+            ConversionReport split_report;
+            std::vector<TopoDS_Solid> pieces = split_solid_by_planes(
+                solid, tools, options, split_report, report_index,
+                candidate.tool_kind);
+            candidate.diagnostics = split_report.diagnostics;
+            candidate.rejection_reason =
+                first_diagnostic_reason(candidate.diagnostics);
+            finish_candidate(candidate, pieces);
+            proposal.candidates.push_back(std::move(candidate));
+            if (lazy_first_usable && has_high_confidence_in_proposal()) break;
+        }
+    }
 
     // Helper: evaluate one face as a decomposition candidate. Runs the
     // BRepAlgoAPI_Splitter call, scores the result, appends to the
     // proposal. The split is the expensive step; the per-piece analysis
     // inside finish_candidate is the second most expensive. Both run
     // exactly once per call.
+    std::vector<gp_Pln> evaluated_planar_supports;
     auto evaluate_face = [&](std::size_t face_idx, const TopoDS_Face& face) {
-        ++candidate_index;
+        if (!candidate_budget_available()) return;
         BRepAdaptor_Surface adaptor(face, false);
+        if (adaptor.GetType() == GeomAbs_Plane) {
+            const gp_Pln plane = adaptor.Plane();
+            const bool duplicate = std::any_of(
+                evaluated_planar_supports.begin(),
+                evaluated_planar_supports.end(),
+                [&](const gp_Pln& existing) {
+                    return std::abs(existing.Axis().Direction().Dot(
+                                        plane.Axis().Direction()))
+                               >= 1.0 - std::max(options.angular_tolerance,
+                                                1.0e-9)
+                        && existing.Distance(plane.Location())
+                               <= std::max(options.linear_tolerance * 10.0,
+                                           1.0e-6);
+                });
+            if (duplicate) return;
+            evaluated_planar_supports.push_back(plane);
+        }
+        ++candidate_index;
 
         DecompositionCandidate candidate;
         candidate.id = "candidate:" + std::to_string(candidate_index);
@@ -1431,6 +2405,16 @@ DecompositionProposal propose_decomposition_candidates_impl(
             ? "convexity_failure_face"
             : "existing_face";
         candidate.original_volume = original_volume;
+        if (adaptor.GetType() == GeomAbs_Plane) {
+            const gp_Pln support = adaptor.Plane();
+            candidate.plane_valid = true;
+            candidate.plane_origin = {
+                support.Location().X(), support.Location().Y(),
+                support.Location().Z()};
+            const gp_Dir direction = support.Axis().Direction();
+            candidate.plane_normal = {
+                direction.X(), direction.Y(), direction.Z()};
+        }
 
         ConversionReport split_report;
         std::vector<TopoDS_Solid> pieces =
@@ -1442,26 +2426,12 @@ DecompositionProposal propose_decomposition_candidates_impl(
         proposal.candidates.push_back(std::move(candidate));
     };
 
-    auto has_usable_in_proposal = [&]() {
-        for (const DecompositionCandidate& c : proposal.candidates) {
-            if (c.usable) return true;
-        }
-        return false;
-    };
-
     // High-confidence is the early-stop bar for the lazy path: any
     // weaker candidate (medium / bbox-fallback) might be beaten by a
     // not-yet-evaluated face. Only when *no* face produces high do we
     // fall through to bbox; only when *no* bbox is usable do we give
     // up. This preserves the baseline's "best candidate wins" semantics
     // without paying for exhaustive evaluation on the common case.
-    auto has_high_confidence_in_proposal = [&]() {
-        for (const DecompositionCandidate& c : proposal.candidates) {
-            if (c.usable && c.confidence == "high") return true;
-        }
-        return false;
-    };
-
     if (lazy_first_usable) {
         // Priority order for the lazy path: convexity-failure face
         // first (it's usually the natural cut), then remaining faces in
@@ -1473,10 +2443,12 @@ DecompositionProposal propose_decomposition_candidates_impl(
         // best-candidate-wins semantics for the hard cases. The
         // exhaustive path keeps face-index order so candidate IDs stay
         // stable for the agent-review workflow.
-        if (has_convexity_failure_face) {
+        if (!has_high_confidence_in_proposal()
+            && has_convexity_failure_face) {
             std::size_t fi = 0;
             for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
                  face_exp.More(); face_exp.Next()) {
+                if (!candidate_budget_available()) break;
                 ++fi;
                 if (fi == convexity_failure_face_index) {
                     evaluate_face(fi, TopoDS::Face(face_exp.Current()));
@@ -1489,6 +2461,7 @@ DecompositionProposal propose_decomposition_candidates_impl(
             std::size_t fi = 0;
             for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
                  face_exp.More(); face_exp.Next()) {
+                if (!candidate_budget_available()) break;
                 ++fi;
                 if (has_convexity_failure_face
                     && fi == convexity_failure_face_index) {
@@ -1507,6 +2480,7 @@ DecompositionProposal propose_decomposition_candidates_impl(
         std::size_t fi = 0;
         for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
              face_exp.More(); face_exp.Next()) {
+            if (!candidate_budget_available()) break;
             ++fi;
             if (convexity_failure_face_only
                 && has_convexity_failure_face
@@ -1577,6 +2551,7 @@ DecompositionProposal propose_decomposition_candidates_impl(
             // where the longest axis isn't the right cut is worth it.
             std::size_t bbox_attempts = 0;
             for (const AxisFallback& fallback : ordered_fallbacks) {
+                if (!candidate_budget_available()) break;
                 if (longest_bbox_axis_only && bbox_attempts >= 1) {
                     break;
                 }
@@ -1615,7 +2590,7 @@ DecompositionProposal propose_decomposition_candidates_impl(
             // not enough; handing the whole set to BRepAlgoAPI_Splitter
             // in a single call often produces 4+ usable pieces where
             // any single plane would have failed to bisect.
-            if (include_multi_bbox_fallback) {
+            if (include_multi_bbox_fallback && candidate_budget_available()) {
                 ++candidate_index;
                 DecompositionCandidate candidate;
                 candidate.id = "candidate:" + std::to_string(candidate_index);
@@ -1700,7 +2675,9 @@ DecompositionProposal propose_decomposition_candidates(
                                                 /*convexity_failure_face_only=*/false,
                                                 /*longest_bbox_axis_only=*/false,
                                                 /*include_multi_bbox_fallback=*/true,
-                                                /*lazy_first_usable=*/false);
+                                                /*lazy_first_usable=*/false,
+                                                nullptr, false, 0, 0,
+                                                std::numeric_limits<std::size_t>::max());
 }
 
 DecompositionProposal propose_bsp_decomposition_candidates(
@@ -1718,8 +2695,69 @@ DecompositionProposal propose_bsp_decomposition_candidates(
                                                 /*convexity_failure_face_only=*/false,
                                                 /*longest_bbox_axis_only=*/false,
                                                 /*include_multi_bbox_fallback=*/false,
-                                                /*lazy_first_usable=*/true);
+                                                /*lazy_first_usable=*/true,
+                                                nullptr, false, 0, 0,
+                                                std::numeric_limits<std::size_t>::max());
 }
+
+namespace detail {
+
+LocalBspProposal propose_bsp_decomposition_candidates_local(
+    const CadModel& model,
+    const std::string& solid_id_str,
+    const ConversionOptions& options,
+    bool include_parallel_plane_batches,
+    std::size_t max_parallel_families,
+    std::size_t max_planes_per_batch,
+    std::size_t max_generated_candidates) {
+    LocalBspProposal local;
+    local.proposal = propose_decomposition_candidates_impl(
+        model, solid_id_str, options,
+        /*convexity_failure_face_only=*/false,
+        /*longest_bbox_axis_only=*/false,
+        /*include_multi_bbox_fallback=*/false,
+        /*lazy_first_usable=*/true,
+        &local.candidate_children,
+        include_parallel_plane_batches,
+        max_parallel_families,
+        max_planes_per_batch,
+        max_generated_candidates);
+    return local;
+}
+
+bool commit_local_decomposition_partition(
+    CadModel& model,
+    const std::string& target_id,
+    const std::vector<TopoDS_Solid>& children,
+    std::vector<std::string>* committed_ids) {
+    if (children.empty()) return false;
+    DecompositionTarget target;
+    if (!find_decomposition_target(model, target_id, &target)) return false;
+    const std::string source_id = decomposition_source_id(target, target_id);
+    if (target.is_piece) target.piece->active = false;
+    else if (!remove_solid(model, target_id)) return false;
+    if (committed_ids) {
+        committed_ids->clear();
+        committed_ids->reserve(children.size());
+    }
+    for (const TopoDS_Solid& child : children) {
+        if (child.IsNull()) return false;
+        GProp_GProps properties;
+        BRepGProp::VolumeProperties(child, properties);
+        DecomposedSolidPiece piece;
+        piece.id = next_decomposed_piece_id(model);
+        piece.label = piece.id + "/from_" + target_id;
+        piece.source_solid_id = source_id;
+        piece.solid = child;
+        piece.volume = std::abs(properties.Mass());
+        piece.active = true;
+        if (committed_ids) committed_ids->push_back(piece.id);
+        model.decomposed_pieces.push_back(std::move(piece));
+    }
+    return true;
+}
+
+} // namespace detail
 
 bool decomposition_target_exact_csg_supported(const CadModel& model,
                                              const std::string& solid_id_str,

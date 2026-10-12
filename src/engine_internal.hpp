@@ -5,7 +5,9 @@
 
 #include "engine_model.hpp"
 
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <BRep_Tool.hxx>
@@ -17,6 +19,13 @@
 namespace csgify::detail {
 
 constexpr double kEps = 1.0e-14;
+
+struct OverlapIntersectionEvidence {
+    bool known = false;
+    double volume = 0.0;
+};
+using OverlapPairCache = std::map<
+    std::pair<std::string, std::string>, OverlapIntersectionEvidence>;
 
 // Diagnostics.
 void add_diag(ConversionReport& report,
@@ -76,6 +85,10 @@ bool find_convexity_failure_face(const TopoDS_Solid& solid,
                                  std::size_t solid_index,
                                  const ConversionOptions& options,
                                  std::size_t* face_index_out);
+std::size_t convexity_halfspace_violation_count(
+    const TopoDS_Solid& solid,
+    std::size_t solid_index,
+    const ConversionOptions& options);
 
 // Small cross-cutting utilities.
 double vec_len(Vec3 v);
@@ -103,7 +116,9 @@ AnalyzedDecomposedPiece analyze_decomposed_piece(const DecomposedSolidPiece& pie
 // internal post-mutation analyze. Honors options.check_overlaps.
 void detect_solid_overlaps(CadModel& model,
                             const ConversionOptions& options,
-                            ConversionReport& report);
+                            ConversionReport& report,
+                            const OverlapPairCache* reusable = nullptr,
+                            OverlapPairCache* cache_out = nullptr);
 
 // Build a TopoDS_Shape for a primitive SyntheticBody. Returns a null
 // shape for boolean synthetic bodies (union/intersection/difference)

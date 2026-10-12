@@ -22,6 +22,14 @@
 
 namespace csgify {
 
+const char* csgify_version() {
+#ifdef CSGIFY_VERSION
+    return CSGIFY_VERSION;
+#else
+    return "unknown";
+#endif
+}
+
 const char* occt_version() {
     return OCC_VERSION_COMPLETE;
 }

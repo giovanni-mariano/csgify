@@ -28,7 +28,10 @@ ViewerController::ViewerController(Session& session,
     removal_set_ =
         review_.kind == "removal_set" && !review_.alternatives.empty();
     for (const ViewerReviewAlternative& a : review_.alternatives) {
-        alts_.push_back(ControllerAlternative{a, AltState::pending});
+        const bool rejected = decision_review_status(
+            session_, a.target_id, a.review_id) == "rejected";
+        alts_.push_back(ControllerAlternative{
+            a, rejected ? AltState::rejected : AltState::pending});
     }
     visible_ = snapshot_visible_();
     if (removal_set_) {
@@ -84,6 +87,8 @@ ViewerAction ViewerController::run_op_(const std::string& op,
 
     const std::set<std::string> before = snapshot_visible_();
 
+    if (!review_.audit.actor.empty())
+        set_decision_audit_context(session_, review_.audit);
     CommandResult r;
     if (op == "remove_solid") {
         r = remove_solid(session_, target);
@@ -93,11 +98,16 @@ ViewerAction ViewerController::run_op_(const std::string& op,
         r = fill_hole(session_, document_id_, candidate);
     } else if (op == "apply_surface_replacement_candidate") {
         r = apply_surface_replacement_candidate(session_, target, candidate);
+    } else if (op == "apply_contained_medium" && review_.has_medium) {
+        r = apply_contained_medium(
+            session_, document_id_, review_.medium_request, true);
     } else {
+        clear_decision_audit_context(session_);
         act.mutated = false;
         act.message = "unknown op " + op;
         return act;
     }
+    clear_decision_audit_context(session_);
 
     act.ok = r.ok;
     if (!r.ok) {
@@ -152,6 +162,14 @@ ViewerAction ViewerController::reject_active() {
         }
         ControllerAlternative& a = alts_[active_];
         a.state = AltState::rejected;
+        DecisionAuditContext audit = review_.audit;
+        if (audit.actor.empty()) audit.actor = "reviewer";
+        audit.proposal_id = a.info.review_id;
+        audit.approval_mode = "manual";
+        if (audit.rationale.empty()) audit.rationale = "reviewer rejected proposal";
+        record_decision_review(session_, a.info.target_id, a.info.review_id,
+                               "rejected", audit, review_.kind, review_.action,
+                               {}, document_revision(session_, document_id_));
         ViewerAction act;
         act.handled = true;
         act.alternatives_changed = true;
@@ -161,6 +179,15 @@ ViewerAction ViewerController::reject_active() {
         return act;
     }
     if (!review_.review_id.empty()) {
+        DecisionAuditContext audit = review_.audit;
+        if (audit.actor.empty()) audit.actor = "reviewer";
+        audit.proposal_id = review_.review_id;
+        audit.approval_mode = "manual";
+        if (audit.rationale.empty()) audit.rationale = "reviewer rejected proposal";
+        record_decision_review(session_, review_.target_id, review_.review_id,
+                               "rejected", audit, review_.kind, review_.action,
+                               review_.candidate_id,
+                               document_revision(session_, document_id_));
         return message_action("rejected " + review_.kind + " "
                               + review_.review_id + "  (no change)");
     }
@@ -183,6 +210,61 @@ ViewerAction ViewerController::cycle(bool forward) {
     act.handled = true;
     act.alternatives_changed = true;
     act.message = active_summary();
+    return act;
+}
+
+ViewerAction ViewerController::select_candidate(const std::string& id) {
+    if (review_.kind != "decomposition" || id.empty()) {
+        return message_action("candidate selection is not available for this review");
+    }
+    review_.candidate_id = id;
+    review_.review_id = id;
+    ViewerAction act;
+    act.handled = true;
+    act.alternatives_changed = true;
+    act.candidate_id = id;
+    act.message = "selected decomposition candidate " + id;
+    return act;
+}
+
+void ViewerController::configure_decomposition_review(
+    const std::string& target_id,
+    const std::string& candidate_id,
+    const DecisionAuditContext& audit) {
+    review_.kind = "decomposition";
+    review_.action = "apply_decomposition_candidate";
+    review_.target_id = target_id;
+    review_.candidate_id = candidate_id;
+    review_.review_id = candidate_id;
+    review_.audit = audit;
+}
+
+ViewerAction ViewerController::undo() {
+    ViewerAction act;
+    act.handled = true;
+    act.mutated = true;
+    act.op = "undo_last_mutation";
+    act.target_id = document_id_;
+    const std::set<std::string> before = snapshot_visible_();
+    if (!review_.audit.actor.empty())
+        set_decision_audit_context(session_, review_.audit);
+    const CommandResult result = undo_last_mutation(session_, document_id_);
+    clear_decision_audit_context(session_);
+    act.ok = result.ok;
+    if (!result.ok) {
+        act.message = "undo failed (see report)";
+        return act;
+    }
+    const std::set<std::string> after = snapshot_visible_();
+    for (const std::string& id : before) {
+        if (after.find(id) == after.end()) act.erased.push_back(id);
+    }
+    for (const std::string& id : after) {
+        if (before.find(id) == before.end()) act.added.push_back(id);
+    }
+    visible_ = after;
+    act.stdout_line = "logged undo_last_mutation " + document_id_;
+    act.message = "restored the preceding document state";
     return act;
 }
 
@@ -235,6 +317,10 @@ int run_viewer_headless(Session& session,
             a = controller.cycle(true);
         } else if (tok == "ShiftTab" || tok == "BackTab") {
             a = controller.cycle(false);
+        } else if (tok.rfind("C:", 0) == 0) {
+            a = controller.select_candidate(tok.substr(2));
+        } else if (tok == "U" || tok == "u") {
+            a = controller.undo();
         } else if (tok.rfind("R:", 0) == 0) {
             a = controller.remove_target(tok.substr(2));
         } else if (tok == "Q" || tok == "q") {

@@ -69,14 +69,15 @@
 
      For visual triage of the whole set at once, ask me to run:
      ./home/giovanni/projects/csgify view <STEP> --review-removals --log decisions.json --out tmp.i
-     (shows every removal candidate together; Tab/Shift-Tab cycles the active one, A accepts/removes it
-      live, X rejects. With --log each accepted removal is recorded as a replayable decision; with --out
-      the deck is emitted on quit. The same decisions.json compacts into a recipe — no separate apply step.)
+     (the Qt frontend groups candidates by assembly occurrence, shows blockers and exact solid counts,
+      and applies the checked set asynchronously as one certified transaction and one undo step. With
+      --log the removal is replayable; with --out the deck is emitted on quit.)
 
      You (the agent) can also drive the SAME review headlessly, no window needed, by replaying a key
      string — useful to apply a vetted set of decisions and capture the log:
      ./home/giovanni/projects/csgify view <STEP> --review-removals --keys "A,Tab,A,Q" --log decisions.json --out tmp.i
-     (A=accept active, X=reject, Tab/BackTab=cycle, R:solid:N=remove a specific solid, Q=quit+commit.)
+     (the headless controller retains sequential keys: A=accept active, X=reject,
+      Tab/BackTab=cycle, R:solid:N=remove a specific solid, Q=quit+commit.)
 
      To apply a removal:
      ./home/giovanni/projects/csgify apply removal solid:N <STEP> --out tmp.i --log decisions.json --report report.after_removal.json

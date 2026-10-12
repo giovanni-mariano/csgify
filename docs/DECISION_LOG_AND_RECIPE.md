@@ -6,10 +6,43 @@ The implemented formats are explicitly versioned:
 - compact JSON recipes: `csgify.recipe`, schema version 1;
 - each decision carries the version from the central operation registry.
 
-Readers accept legacy unversioned files for compatibility and reject unknown
-explicit schema or operation versions. Automatic transaction rollback appends
-an undo record so compaction cannot replay a mutation that failed its geometry
-postconditions.
+CLI replay accepts legacy unversioned files for compatibility and rejects
+unknown explicit schema or operation versions. A live session may append only
+to a log whose manifest matches the current csgify and OCCT versions and, when
+a source is supplied, the exact STEP digest. Automatic transaction rollback
+appends an undo record so compaction cannot replay a mutation that failed its
+geometry postconditions.
+
+Each NDJSON record is assembled before append. If a write fails, the file is
+truncated back to the preceding complete-record boundary and the sequence
+counter is not advanced. A compensating user undo is journaled before the live
+model is restored, making the journal authoritative across interruption.
+
+When a log contains fixed-point accepted actions, the compact JSON recipe also
+stores terminal residual-count, active-piece-count, and zero-overlap
+postconditions. JSON replay recomputes these metrics and refuses to emit MCNP
+or STEP if the reconstructed geometry diverges. Older recipes without this
+optional block remain replayable.
+
+Compaction also retains the latest review record for each target/proposal
+identity in an optional `reviews` array. Project reconstruction restores the
+decision, actor, proposal origin, rationale, policy rule, and approval mode
+without appending duplicates to the journal. Geometry operations and review
+state remain separate: rejecting an alternative never mutates the model.
+Pending records additionally retain the review kind, typed action, candidate
+identity, and base document revision. They are checkpoints, not approvals;
+the workspace must regenerate current engine evidence before resuming them.
+The Qt workspace supports decomposition, surface-replacement, hole-fill,
+removal, and contained-medium checkpoints. For a contained medium, the
+candidate identity is the stable staged request ID. If a saved identity is
+absent from fresh evidence, the checkpoint remains pending.
+
+New decision logs record healing, unit assertion/custom scale, and unit
+normalization explicitly on `load_step`, including their default values. This
+lets project restoration distinguish a policy that deliberately uses defaults
+from a legacy log that never bound preparation. CLI replay retains legacy
+compatibility; the Qt project restore path is stricter and requires bound
+preparation, an exact source digest, and the recorded csgify and OCCT versions.
 
 This document describes how `csgify` should persist preprocessing
 decisions so that a conversion can be reproduced, audited, and re-applied
@@ -80,7 +113,7 @@ the log is created:
 {
   "kind": "manifest",
   "seq": 0,
-  "csgify_version": "unversioned",
+  "csgify_version": "0.1.0",
   "occt_version": "8.0.0",
   "step_path": "reactor_v3.step",
   "step_digest": "fnv1a128:a4f7...",
@@ -90,7 +123,7 @@ the log is created:
 
 The STEP digest uses FNV-1a-128, prefix-tagged (`fnv1a128:<hex>`) so a
 future swap to SHA-256 (`sha256:<hex>`) is unambiguous. `csgify_version`
-is currently the literal `"unversioned"` until the build exposes one.
+is the CMake project version compiled into the engine.
 
 On replay, the manifest is read first. A mismatching `step_digest` puts
 replay into soft-match mode.
@@ -174,9 +207,9 @@ via `csgify lua recipe.lua`.
 -- log_digest:  fnv1a128:e1c8...
 -- step_path:   reactor_v3.step
 -- step_digest: fnv1a128:a4f7...
--- csgify:     unversioned
+-- csgify:     0.1.0
 -- occt:        8.0.0
--- (version assert will be added once csgify.version() is exposed)
+-- project restoration verifies both identities before reconstruction
 
 local s = csgify.session()
 local doc = s:load_step("reactor_v3.step")
@@ -218,6 +251,16 @@ reordered for storage; today `seq` order is sufficient):
    itself later replaced wholesale drop.
 5. **`load_step` and `emit_*` always survive.** They are the entry and
    exit points.
+
+Recorded STEP exports are side effects and are omitted by default. Use:
+
+```sh
+csgify compact decisions.json --out recipe.lua --preserve-step-exports
+```
+
+to retain the latest `export_step` operation immediately before final MCNP
+emission. Both the generated Lua and companion JSON recipe preserve it. During
+JSON replay, an explicit `--out-step` path overrides the recorded path.
 
 ### Deterministic Ordering
 

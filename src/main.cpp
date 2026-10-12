@@ -1,9 +1,15 @@
 #include "csgify/engine.hpp"
+#include "csgify/alea_bridge.hpp"
+#include "csgify/alea_void_bridge.hpp"
+#include "csgify/autonomy.hpp"
+#include "csgify/project_store.hpp"
+#include "csgify/project_job_progress.hpp"
 #include "csgify/session.hpp"
 
 #include "decision_pack.hpp"
 #include "engine_internal.hpp"
 #include "engine_model.hpp"
+#include "fnv.hpp"
 #include "hole_fill.hpp"
 #include "lua_runner.hpp"
 #include "operation_registry.hpp"
@@ -12,6 +18,9 @@
 
 #include "viewer.hpp"
 #include "viewer_controller.hpp"  // ViewerReviewContext + headless replay (ungated)
+#if CSGIFY_HAVE_QT6_VIEWER
+#include "viewer_qt.hpp"
+#endif
 
 #include <alea.h>
 #include <Graphic3d_GraphicDriverFactory.hxx>
@@ -19,16 +28,24 @@
 #include <OpenGl_GraphicDriverFactory.hxx>
 #endif
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <fstream>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <sys/stat.h>
 #include <unordered_map>
 #include <set>
@@ -66,12 +83,16 @@ constexpr const char* kPropMutation = "Read-only: proposal generation only.";
 constexpr VerbHelp kVerbHelp[] = {
     {"inspect",
      "inspect input.step [--report report.json|-] [--log decisions.json]\n"
+     "                            [--progress-json events.jsonl|-]\n"
+     "                            [--project project-directory]\n"
      "                            [--units mm|cm|m|in|...] [--scale X]\n"
      "                            [--normalize-units mm|cm|m|in|...]\n"
-     "                            [--no-overlap-check]",
+     "                            [--target solid:N ...] [--no-overlap-check]",
      "Analyze a STEP file; print a human summary or write JSON.",
      "  --report PATH         write JSON report to PATH (`-` for stdout)\n"
      "  --log PATH            open an append-only decision log alongside the run\n"
+     "  --project DIR         persist semantic import state and report artifact\n"
+     "  --progress-json PATH  stream general analysis progress as JSON Lines\n"
      "  --units NAME          assert the source unit (no geometry rescale)\n"
      "  --scale X             assert the source-unit-to-mm factor (no rescale)\n"
      "  --normalize-units NM  actually rescale geometry to NM (mm|cm|m|in|...)\n"
@@ -82,6 +103,75 @@ constexpr VerbHelp kVerbHelp[] = {
      "                          warning; emit will proceed despite overlaps\n"
      "                          (use only when you understand the consequences)",
      kReadOnlyMutation},
+    {"handoff",
+     "handoff input.step --out handoff.json|- [--project project-directory]\n"
+     "                            [--report report.json|-]",
+     "Build and validate the versioned csgify-to-libalea handoff package.",
+     "  --out PATH            write the deterministic handoff manifest\n"
+     "  --project DIR         publish the manifest as an immutable project artifact\n"
+     "  --report PATH         optionally write the conversion JSON report\n"
+     "Input geometry must already satisfy the exact Alea/MCNP cell requirements.",
+     kReadOnlyMutation},
+    {"voids",
+     "voids input.step --out coverage.json|- [--out-mcnp geometry.i]\n"
+     "                         [--project project-directory] [--margin F]\n"
+     "                         [--domain-id ID] [--bounds xmin,ymin,zmin,xmax,ymax,zmax]\n"
+     "                         [--max-depth N] [--min-size X] [--workers N]\n"
+     "                         [--scratch-bytes N] [--samples N]\n"
+     "                         [--no-merge] [--no-graveyard] [--review]",
+     "Generate modeled-domain voids with libalea and certify ownership.",
+     "  --out PATH            write the versioned coverage certificate\n"
+     "  --out-mcnp PATH       write material, void, and graveyard geometry\n"
+     "  --project DIR         checkpoint immutable geometry/certificate artifacts\n"
+     "  --margin F            domain diagonal margin fraction (default 0.05)\n"
+     "  --domain-id ID        stable modeled-domain identity\n"
+     "  --bounds CSV          explicit finite modeled-domain bounds\n"
+     "  --max-depth N         libalea adaptive-octree depth (default 8)\n"
+     "  --min-size X          minimum octree box size (default libalea behavior)\n"
+     "  --workers N           bounded classification workers (0 = runtime maximum)\n"
+     "  --scratch-bytes N     parallel scratch budget (default 512 MiB)\n"
+     "  --samples N           complete-ownership lattice per axis (default 7)\n"
+     "  --no-merge            retain libalea's unmerged regional void cells\n"
+     "  --no-graveyard        omit the transport graveyard cells\n"
+     "  --review              open the typed Qt coverage panel after generation/reuse\n"
+     "Input geometry must already satisfy exact Alea/MCNP cell requirements.\n"
+     "A certificate with overlap, gap, undefined-fill, or unresolved evidence blocks success.",
+     "Mutating: adds analytical void/graveyard cells to the in-memory Alea model; source STEP is unchanged."},
+    {"coverage",
+     "coverage status coverage.json\n"
+     "coverage review coverage.json\n"
+     "coverage queue coverage.json --out queue.json [--source final.step]\n"
+     "                                      [--resume previous-queue.json]",
+     "Inspect a validated Phase 8 ownership certificate without reading raw JSON.",
+     "  status                 print concise domain, ownership, resource, and blocker evidence\n"
+     "  review                 open the searchable Qt 6 coverage decision panel\n"
+     "  queue                  persist blocking findings in the standard autonomy queue\n"
+     "  --source PATH          associate corrective items with the source STEP\n"
+     "  --resume PATH          verify resolved/remaining items against a replacement certificate\n"
+     "Unsafe findings remain blocking; this command cannot authorize overlap or weaken MCNP ownership.",
+     kReadOnlyMutation},
+    {"project",
+     "project init DIR\n"
+     "project status DIR [--limit N]\n"
+     "project events DIR --job JOB_ID [--after SEQUENCE] [--limit N]\n"
+     "project cancel DIR --job JOB_ID\n"
+     "project review [DIR] [--source model.step] [--coverage coverage.json]\n"
+     "                   [--queue queue.json]",
+     "Inspect or open the resumable large-model project workspace.",
+     "  init                   create/migrate a project and conservative project-policy.json\n"
+     "  status                 query SQLite read-only; do not load CAD geometry\n"
+     "  events                 stream persisted job events as JSON Lines\n"
+     "  cancel                 request cancellation at the next safe boundary\n"
+     "  review                 open the Qt 6 project workspace\n"
+     "  --limit N              maximum rows printed per paginated category\n"
+     "  --source PATH          STEP loaded only on explicit geometry review\n"
+     "  --coverage PATH        attach a Phase 8 ownership certificate\n"
+     "  --queue PATH           attach a durable autonomy queue\n"
+     "  --smoke-test           construct, validate attachments, then close (CI)",
+     "Status and events are read-only and never initialize a project. Review may\n"
+     "persist explicitly approved workspace operations. Cancel changes only the\n"
+     "durable job request; geometry remains unchanged until its worker reaches a\n"
+     "certified transaction boundary."},
     {"explain",
      "explain <shape-id> input.step [--report report.json|-]",
      "Explain why a target solid/piece/face is not emit-ready.",
@@ -120,9 +210,14 @@ constexpr VerbHelp kVerbHelp[] = {
      "preprocess input.step --out-step simplified.step\n"
      "                                  [--policy auto|medium|low|conservative] [--max-depth N]\n"
      "                                  [--target solid:N] [--max-targets N] [--max-splits N]\n"
+     "                                  [--prismatic-max-pieces N] [--prismatic-max-splitter-calls N]\n"
+     "                                  [--legacy-global-trials] [--no-parallel-plane-batches]\n"
+     "                                  [--max-parallel-families N] [--max-planes-per-batch N]\n"
+     "                                  [--max-local-boolean-calls N] [--verify-incremental-state]\n"
      "                                  [--apply-removal-candidates high|medium]\n"
      "                                  [--safe-all] [--max-deviation value] [--dry-run]\n"
      "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
+     "                                  [--approx-volume P%]\n"
      "                                  [--allow-overlaps]\n"
      "                                  [--log decisions.json] [--report report.json|-]",
      "Apply safe high-confidence operations and emit a simplified STEP.",
@@ -141,12 +236,38 @@ constexpr VerbHelp kVerbHelp[] = {
      "  order of surviving solids is stable."},
     {"decompose-apply",
      "decompose-apply input.step --out output.i\n"
+     "                                  [--fixed-point|--single-pass] [--max-actions N]\n"
+     "                                  [--max-active-pieces N] [--max-candidate-evaluations N]\n"
+     "                                  [--max-candidates-per-target N]\n"
+     "                                  [--max-splitter-calls N] [--max-cumulative-volume-delta X]\n"
+     "                                  [--max-action-volume-delta X]\n"
+     "                                  [--legacy-global-trials] [--no-parallel-plane-batches]\n"
+     "                                  [--max-parallel-families N] [--max-planes-per-batch N]\n"
+     "                                  [--max-local-boolean-calls N] [--max-stagnant-target-visits N]\n"
+     "                                  [--verify-incremental-state]\n"
      "                                  [--policy auto|medium|low|conservative] [--max-depth N]\n"
      "                                  [--target solid:N] [--max-targets N] [--max-splits N]\n"
+     "                                  [--prismatic-max-pieces N] [--prismatic-max-splitter-calls N]\n"
      "                                  [--allow-medium-confidence-auto] [--allow-bbox-fallback-auto]\n"
-     "                                  [--log decisions.json] [--out-step simplified.step] [--report report.json|-]",
-     "Run safe BSP decomposition then emit MCNP.",
-     "",
+     "                                  [--log decisions.json] [--progress-json events.jsonl]\n"
+     "                                  [--out-step simplified.step] [--report report.json|-]",
+     "Run bounded decomposition then emit MCNP.",
+     "  --fixed-point           globally improving coordinator (default)\n"
+     "  --single-pass           compatibility: legacy per-target decomposition pass\n"
+     "  --out-step PATH         STEP output (default: <out-stem>_decomposed.step)\n"
+     "  --progress-json PATH    stream bounded fixed-point events as JSON Lines\n"
+     "  --no-partial-commit     roll back fixed-point progress unless the result is exact\n"
+     "  --legacy-global-trials  qualification oracle: copy and recertify the full model per trial\n"
+     "  --no-parallel-plane-batches disable grouped face-plane OCCT candidates\n"
+     "  --max-parallel-families N bound grouped support families per target (default: 8)\n"
+     "  --max-planes-per-batch N bound planes in one grouped splitter call (default: 64)\n"
+     "  --max-local-boolean-calls N bound exact local partition proof calls (default: 2048)\n"
+     "  --max-stagnant-target-visits N skip unchanged failed targets after N visits (default: 2)\n"
+     "  --max-candidates-per-target N bound OCCT proposals/certificates before yielding (default: 64)\n"
+     "  --verify-incremental-state globally reconcile after every accepted local action\n"
+     "  --approx-volume P%      resolve small overlaps by deterministic single ownership;\n"
+     "                          charge removed volume to this immutable budget\n"
+     "  --allow-shatter-fallback enable bounded shatter as a final fixed-point strategy",
      "Mutation contract: decomposed solid:N is suppressed and produces\n"
      "  piece:1..K. Surviving solid:N IDs do NOT shift."},
     {"shatter",
@@ -157,12 +278,16 @@ constexpr VerbHelp kVerbHelp[] = {
      "  --all                   shatter every solid that fails convex validation\n"
      "  --target solid:N        shatter only the named solid(s) (repeatable)\n"
      "  --max-depth N           recursion bound (default 8)\n"
-     "  --allow-shatter-volume-drift  proceed when a cut drifts past tolerance\n\n"
+     "  --approx-volume P%      measured cumulative symmetric-difference budget\n"
+     "  --allow-containment-change permit measured outward numerical drift\n"
+     "  --allow-topology-change permit topology-changing approximation\n"
+     "  --allow-shatter-volume-drift  deprecated legacy unmeasured override\n\n"
      "Mutation contract: shattered solid:N is suppressed and produces\n"
      "  piece:1..K. Surviving solid:N IDs do NOT shift."},
     {"compact",
-     "compact decisions.json --out recipe.lua",
-     "Compact a decision log into a deterministic Lua recipe.", "",
+     "compact decisions.json --out recipe.lua [--preserve-step-exports]",
+     "Compact a decision log into a deterministic Lua recipe.",
+     "  --preserve-step-exports retain the latest recorded STEP export and path",
      kReadOnlyMutation},
     {"replay",
      "replay recipe.json --step input.step --out output.i --report replay.json [--out-step simplified.step]",
@@ -181,6 +306,7 @@ constexpr VerbHelp kVerbHelp[] = {
      "    --fill-hole\n"
      "    --apply-decomposition-candidate --candidate candidate:N\n"
      "    --decompose-by-face --by-face face:N.M\n"
+     "    --resolve-overlap --owner solid:M\n"
      "    --remove-solid\n"
      "  Face actions (target face:N.M, comma list allowed):\n"
      "    --replace-face-with-plane       --replace-face-with-cylinder\n"
@@ -189,6 +315,19 @@ constexpr VerbHelp kVerbHelp[] = {
      "  Options:\n"
      "    --max-abs-delta value          (solid replacement volume guard)\n"
      "    --max-rel-delta value          (solid replacement volume guard)\n"
+     "    --approx-volume P%             symmetric-difference volume budget\n"
+     "    --approx-body-volume P%        cumulative per-source override\n"
+     "    --approx-action-volume P%      per-action override\n"
+     "    --approx-added-volume P%       added-volume override\n"
+     "    --approx-removed-volume P%     removed-volume override\n"
+     "    --approx-preset NAME           conservative(0.1), moderate(1), permissive(2) percent\n"
+     "    --protect shape-id             forbid approximation of target (repeatable)\n"
+     "    --protect-material ID          forbid approximation of material (repeatable)\n"
+     "    --allow-containment-change     permit measured added volume\n"
+     "    --allow-topology-change        permit solid/shell count changes\n"
+     "    --owner shape-id               component retaining overlap ownership\n"
+     "    --mcnp-domain solid:N          non-emitting modeled-domain container\n"
+     "    --require-domain-coverage      block unless domain coverage certifies\n"
      "    --max-deviation value          (face replacement distance guard)\n"
      "    --max-depth value              (safe BSP / shatter recursion bound)\n"
      "    --allow-bbox-fallback-auto\n"
@@ -249,28 +388,114 @@ constexpr VerbHelp kVerbHelp[] = {
      "  --log decisions.json           append-only decision log\n"
      "  --out-step simplified.step     as-applied geometry for further passes\n"
      "  --report PATH                  (`-` for stdout)",
-     "Mutation contract: same as the simplify --apply-*-candidate it forwards to."},
+     "Same as the simplify --apply-*-candidate operation it forwards to."},
+    {"autonomy",
+     "autonomy input.step (--actions actions.json|--actions-json JSON) [--mode explain|propose|auto]\n"
+     "                         [--policy-file project-policy.json]\n"
+     "                         [--queue-report queue.json|-] [--project project-directory]\n"
+     "                         [--log decisions.json]\n"
+     "                         [--out output.i] [--out-step reviewed.step] [policy options]",
+     "Evaluate structured LLM actions through deterministic geometry policy gates.",
+     "  --actions PATH                    csgify.autonomy-actions JSON request\n"
+     "  --actions-json JSON               inline request; avoids temporary files\n"
+     "  --resume PATH                     restore applied state and continue a saved queue\n"
+     "  --mode explain|propose|auto       default: propose\n"
+     "  --policy-file PATH                shared versioned preparation/authority policy\n"
+     "  --units NAME                      assert source units without rescaling\n"
+     "  --scale X                         assert source scale to millimetres\n"
+     "  --normalize-units NAME            explicitly rescale imported geometry\n"
+     "  --no-heal                         disable import-time ShapeFix preparation\n"
+     "  --max-relative-delta X            auto-apply volume budget\n"
+     "  --allow-certified-intermediate X auto-apply bounded progress splits up to delta X\n"
+     "  --max-intermediate-pieces N       per-split piece limit (default: 64)\n"
+     "  --max-intermediate-residuals N    residual-child limit (default: 4)\n"
+     "  --min-piece-fraction X            reject autonomous slivers\n"
+     "  --allow-removal FRACTION          opt in to tiny high-confidence removals\n"
+     "  --allow-contained-medium ID:PHASE:DENSITY\n"
+     "                                    authorize an exact configured fluid material\n"
+     "  --allow-approximate-surface DEV   opt in with maximum deviation\n"
+     "  --approx-volume P%                immutable symmetric-difference budget\n"
+     "  --approx-shatter                  permit measured numerical shatter loss\n"
+     "  --approx-remove-residuals         permit measured piece suppression\n"
+     "  --approx-resolve-overlaps         permit measured single-owner overlap repair\n"
+     "  --allow-containment-change        permit measured added volume\n"
+     "  --allow-topology-change           permit topology-changing approximation\n"
+     "  --max-auto-actions N              queue mutation budget (default: 32)\n"
+     "  --queue-report PATH|-             required audit/evidence output (default: -)\n"
+     "  --project DIR                     discover policy; reserve/recover requests\n"
+     "  --log PATH                        replayable mutation log with actor/policy audit\n"
+     "  --review                          open the persistent review queue in the Qt viewer\n"
+     "Exit 0: completed; 2: human review required; 1: denied or failed.",
+     "Only auto-approved actions execute, each through the atomic "
+     "Session API. Human-review and denied items never mutate geometry."},
+    {"context",
+     "context input.step --out context.json|- [--target solid:N|face:N.M]\n"
+     "                       [--history decisions.json] [--policy-file project-policy.json]\n"
+     "                       [--project project-directory] [policy options]",
+     "Build a compact, versioned reasoning context for an external LLM.",
+     "  --out PATH|-                       csgify.llm-context JSON\n"
+     "  --target ID                        include fresh candidates for one target\n"
+     "  --history PATH                     include a bounded decision-history tail\n"
+     "  --candidate-offset N               start each bounded candidate page at N\n"
+     "  --max-candidates N                 candidates per family (default 32)\n"
+     "  --solid-offset N                   start the bounded solid page at N\n"
+     "  --max-solids N                     solids per page (default 32)\n"
+     "  --occurrence-offset N              start the same-definition occurrence page at N\n"
+     "  --max-occurrences N                occurrences per page (default 32)\n"
+     "  --overlap-offset N                 start the bounded local-overlap page at N\n"
+     "  --max-local-overlaps N             local overlaps per page (default 32)\n"
+     "  --max-faces-per-solid N            face IDs per solid (default 32)\n"
+     "  --max-materials N                  material definitions in context (default 32)\n"
+     "  --max-interfaces N                 selected-owner interfaces (default 32)\n"
+     "  --max-context-bytes N              hard JSON size ceiling (default 1048576)\n"
+     "  --policy-file PATH                 use shared preparation/authority policy\n"
+     "  --project DIR                      discover DIR/project-policy.json\n"
+     "  --max-relative-delta X             advertise autonomous volume budget\n"
+     "  --allow-certified-intermediate X  advertise bounded progress-split policy\n"
+     "  --allow-removal FRACTION           advertise removal policy\n"
+     "  --allow-contained-medium ID:PHASE:DENSITY\n"
+     "                                     advertise an authorized fluid material\n"
+     "  --allow-approximate-surface DEV    advertise surface deviation policy\n"
+     "  --approx-volume P%                 advertise immutable approximation budget\n"
+     "  --approx-shatter                   advertise budgeted shatter permission\n"
+     "  --approx-remove-residuals          advertise residual-removal permission\n"
+     "  --approx-resolve-overlaps          advertise overlap-ownership permission\n"
+     "  --allow-containment-change         advertise containment permission\n"
+     "  --allow-topology-change            advertise topology permission",
+     kReadOnlyMutation},
+    {"queue",
+     "queue status queue.json [--out queue.json|-]\n"
+     "queue reject queue.json ITEM_ID --rationale TEXT [--out queue.json] [--log decisions.json]",
+     "Inspect or persist a human rejection in an autonomy queue.",
+     "  status                  validate and print the durable queue\n"
+     "  reject                  mark one unresolved item rejected\n"
+     "  --rationale TEXT        required rejection rationale\n"
+     "  --log PATH              append a non-mutating review audit record",
+     "Reject changes queue state and optionally appends an audit record; it never mutates CAD."},
     {"viewer-check",
      "viewer-check",
      "Probe whether the OCCT viewer can run in this environment.", "",
      kReadOnlyMutation},
     {"view",
      "view input.step [--select doc:N/solid:M|solid:M]\n"
-     "                         [--candidate candidate:N]\n"
+     "                         [--candidate candidate:N|best]\n"
      "                         [--review-removal removal:N]\n"
-     "                         [--review-removals  (show all removal candidates; Tab to cycle, A/X to accept/reject)]\n"
+     "                         [--review-removals  (Qt component checklist and revision-bound batch confirmation)]\n"
      "                         [--review-hole-fill hole-fill:N [--host solid:N] [--near-removed solid:M]]\n"
-     "                         [--review-decomp candidate:N --select solid:N]\n"
+     "                         [--review-decomp candidate:N|best --select solid:N]\n"
      "                         [--review-surface-replacement candidate:N --select-face face:N.M]\n"
-     "                         [--log decisions.json] [--out output.i] [--keys A,Tab,A,Q]",
+     "                         [--log decisions.json] [--out output.i]\n"
+     "                         [--viewer-backend auto|qt|x11] [--keys A,Tab,A,Q]",
      "Open the OCCT viewer for visual review and live editing.",
      "  --log decisions.json           record accepted decisions (replayable)\n"
      "  --out output.i                 emit the MCNP deck on quit\n"
+     "  --viewer-backend auto|qt|x11   choose UI backend (default: auto; Qt preferred)\n"
      "  --keys A,Tab,A,Q               headless: replay keys, no window/display\n"
      "                                 (A=accept active, X=reject, Tab/BackTab=cycle,\n"
      "                                  R:solid:N=remove, Q=quit+commit)",
-     "Accepting (A) or removing (R) drives the session in place (suppresses "
-     "solids / adds pieces). With --log each decision is recorded; compact it "
+     "Qt mutations use explicit controls and confirmation; Ctrl+Enter accepts the\n"
+     "current non-removal proposal. Headless --keys A/R drives the session in place.\n"
+     "With --log each decision is recorded; compact it "
      "into a recipe to replay headless."},
     {"help",
      "help [verb]",
@@ -641,6 +866,23 @@ std::size_t parse_size_arg(const char* text, const char* name) {
     }
 }
 
+bool set_uniform_approximation_budget(const std::string& text,
+                                      csgify::ApproximationPolicy* policy,
+                                      std::string* error_out) {
+    double fraction = 0.0;
+    if (!csgify::parse_approximation_percent(text, &fraction, error_out))
+        return false;
+    policy->enabled = true;
+    policy->max_global_changed_volume_fraction = fraction;
+    policy->max_body_changed_volume_fraction = fraction;
+    policy->max_action_changed_volume_fraction = fraction;
+    policy->max_global_added_volume_fraction = fraction;
+    policy->max_global_removed_volume_fraction = fraction;
+    policy->max_body_added_volume_fraction = fraction;
+    policy->max_body_removed_volume_fraction = fraction;
+    return true;
+}
+
 // A small token-stream parser. Each `take_*` consumes both the flag and its
 // value if the current token matches the requested flag; otherwise leaves
 // the cursor alone and returns false. Subcommands loop over the scanner and
@@ -763,18 +1005,1284 @@ int run_volume_command(int argc, char** argv) {
     return comparison.within_tolerance ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
+int run_queue_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "queue");
+    if (argc < 4) {
+        std::cerr << "error queue_usage: expected status|reject queue.json\n";
+        return EXIT_FAILURE;
+    }
+    const std::string command = argv[2];
+    const std::string queue_path = argv[3];
+    std::string item_id;
+    int option_start = 4;
+    if (command == "reject") {
+        if (argc < 5) {
+            std::cerr << "error queue_item_required\n";
+            return EXIT_FAILURE;
+        }
+        item_id = argv[4];
+        option_start = 5;
+    } else if (command != "status") {
+        std::cerr << "error invalid_queue_command: " << command << '\n';
+        return EXIT_FAILURE;
+    }
+    std::string output_path = command == "reject" ? queue_path : "-";
+    std::string rationale;
+    std::string log_path;
+    for (int i = option_start; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc)
+            output_path = argv[++i];
+        else if (std::strcmp(argv[i], "--rationale") == 0 && i + 1 < argc)
+            rationale = argv[++i];
+        else if (std::strcmp(argv[i], "--log") == 0 && i + 1 < argc)
+            log_path = argv[++i];
+        else {
+            std::cerr << "error unrecognized_option: " << argv[i] << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    csgify::AutonomyQueue queue;
+    try {
+        queue = csgify::read_autonomy_queue_json(queue_path);
+    } catch (const std::exception& e) {
+        std::cerr << "error queue_invalid: " << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    if (command == "reject") {
+        if (rationale.empty()) {
+            std::cerr << "error queue_rejection_rationale_required\n";
+            return EXIT_FAILURE;
+        }
+        csgify::AutonomyQueueItem* selected = nullptr;
+        for (csgify::AutonomyQueueItem& item : queue.items)
+            if (item.proposal.id == item_id) { selected = &item; break; }
+        if (!selected || !csgify::reject_autonomy_queue_item(
+                queue, item_id, rationale)) {
+            std::cerr << "error queue_item_not_rejectable: " << item_id << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!log_path.empty()) {
+            try {
+                csgify::SessionPtr session = csgify::create_session();
+                csgify::attach_decision_log(
+                    *session, log_path, queue.source_path);
+                csgify::load_step(*session, queue.source_path);
+                csgify::DecisionAuditContext audit;
+                audit.actor = "human";
+                audit.proposal_actor = selected->proposal.actor;
+                audit.proposal_id = selected->proposal.id;
+                audit.rationale = rationale;
+                audit.policy_rule = selected->policy_rule;
+                audit.approval_mode = "manual";
+                const csgify::OperationDescriptor* descriptor =
+                    csgify::find_operation(selected->proposal.op);
+                csgify::record_decision_review(
+                    *session, selected->proposal.target_id,
+                    selected->proposal.id, "rejected", audit,
+                    descriptor ? descriptor->category : std::string(),
+                    selected->proposal.op, selected->proposal.candidate_id,
+                    selected->evaluated_revision);
+            } catch (const std::exception& e) {
+                std::cerr << "error queue_review_audit_failed: "
+                          << e.what() << '\n';
+                return EXIT_FAILURE;
+            }
+        }
+    }
+    if (csgify::write_autonomy_queue_json(queue, output_path) != 0) {
+        std::cerr << "error queue_write_failed: " << output_path << '\n';
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int run_context_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "context");
+    if (argc < 3) {
+        std::cerr << "error context_input_required\n";
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    std::string output_path;
+    std::string policy_path;
+    std::string project_path;
+    csgify::AutonomyContextOptions context_options;
+    csgify::AutonomyPolicy policy;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            output_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--policy-file") == 0
+                   && i + 1 < argc) {
+            policy_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--project") == 0
+                   && i + 1 < argc) {
+            project_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--target") == 0 && i + 1 < argc) {
+            context_options.target_id = argv[++i];
+        } else if (std::strcmp(argv[i], "--history") == 0 && i + 1 < argc) {
+            context_options.history_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--candidate-offset") == 0
+                   && i + 1 < argc) {
+            context_options.candidate_offset =
+                parse_size_arg(argv[++i], "--candidate-offset");
+        } else if (std::strcmp(argv[i], "--max-candidates") == 0
+                   && i + 1 < argc) {
+            context_options.max_candidates =
+                parse_size_arg(argv[++i], "--max-candidates");
+        } else if (std::strcmp(argv[i], "--solid-offset") == 0
+                   && i + 1 < argc) {
+            context_options.solid_offset =
+                parse_size_arg(argv[++i], "--solid-offset");
+        } else if (std::strcmp(argv[i], "--max-solids") == 0
+                   && i + 1 < argc) {
+            context_options.max_solids =
+                parse_size_arg(argv[++i], "--max-solids");
+        } else if (std::strcmp(argv[i], "--occurrence-offset") == 0
+                   && i + 1 < argc) {
+            context_options.occurrence_offset =
+                parse_size_arg(argv[++i], "--occurrence-offset");
+        } else if (std::strcmp(argv[i], "--max-occurrences") == 0
+                   && i + 1 < argc) {
+            context_options.max_occurrences =
+                parse_size_arg(argv[++i], "--max-occurrences");
+        } else if (std::strcmp(argv[i], "--overlap-offset") == 0
+                   && i + 1 < argc) {
+            context_options.overlap_offset =
+                parse_size_arg(argv[++i], "--overlap-offset");
+        } else if (std::strcmp(argv[i], "--max-local-overlaps") == 0
+                   && i + 1 < argc) {
+            context_options.max_local_overlaps =
+                parse_size_arg(argv[++i], "--max-local-overlaps");
+        } else if (std::strcmp(argv[i], "--max-faces-per-solid") == 0
+                   && i + 1 < argc) {
+            context_options.max_faces_per_solid =
+                parse_size_arg(argv[++i], "--max-faces-per-solid");
+        } else if (std::strcmp(argv[i], "--max-materials") == 0
+                   && i + 1 < argc) {
+            context_options.max_materials =
+                parse_size_arg(argv[++i], "--max-materials");
+        } else if (std::strcmp(argv[i], "--max-interfaces") == 0
+                   && i + 1 < argc) {
+            context_options.max_interfaces =
+                parse_size_arg(argv[++i], "--max-interfaces");
+        } else if (std::strcmp(argv[i], "--max-context-bytes") == 0
+                   && i + 1 < argc) {
+            context_options.max_serialized_bytes =
+                parse_size_arg(argv[++i], "--max-context-bytes");
+        } else if (std::strcmp(argv[i], "--max-relative-delta") == 0
+                   && i + 1 < argc) {
+            policy.max_relative_volume_delta =
+                parse_double_arg(argv[++i], "--max-relative-delta");
+        } else if (std::strcmp(argv[i], "--allow-certified-intermediate") == 0
+                   && i + 1 < argc) {
+            policy.allow_certified_intermediate_decomposition = true;
+            policy.max_intermediate_relative_volume_delta =
+                parse_double_arg(argv[++i], "--allow-certified-intermediate");
+        } else if (std::strcmp(argv[i], "--allow-removal") == 0
+                   && i + 1 < argc) {
+            policy.allow_removal = true;
+            policy.max_removal_volume_fraction =
+                parse_double_arg(argv[++i], "--allow-removal");
+        } else if (std::strcmp(argv[i], "--allow-contained-medium") == 0
+                   && i + 1 < argc) {
+            const std::string specification = argv[++i];
+            const std::size_t density_separator = specification.rfind(':');
+            const std::size_t phase_separator = density_separator == std::string::npos
+                ? std::string::npos
+                : specification.rfind(':', density_separator - 1);
+            if (phase_separator == std::string::npos
+                || density_separator == std::string::npos
+                || phase_separator == 0
+                || density_separator <= phase_separator + 1) {
+                std::cerr << "error invalid_contained_medium_material: expected ID:PHASE:DENSITY\n";
+                return EXIT_FAILURE;
+            }
+            csgify::MaterialDefinition material;
+            material.id = specification.substr(0, phase_separator);
+            const std::string phase = specification.substr(
+                phase_separator + 1,
+                density_separator - phase_separator - 1);
+            material.phase = phase == "liquid" ? csgify::MaterialPhase::liquid
+                : phase == "gas" ? csgify::MaterialPhase::gas
+                                  : csgify::MaterialPhase::unknown;
+            material.density = parse_double_arg(
+                specification.substr(density_separator + 1).c_str(),
+                "--allow-contained-medium density");
+            if (material.id.empty()
+                || material.phase == csgify::MaterialPhase::unknown
+                || !std::isfinite(material.density)) {
+                std::cerr << "error invalid_contained_medium_material: phase must be liquid or gas and density finite\n";
+                return EXIT_FAILURE;
+            }
+            policy.allow_contained_medium_generation = true;
+            policy.contained_medium_materials.push_back(std::move(material));
+        } else if (std::strcmp(argv[i], "--allow-approximate-surface") == 0
+                   && i + 1 < argc) {
+            policy.allow_approximate_surface_replacement = true;
+            policy.max_surface_deviation =
+                parse_double_arg(argv[++i], "--allow-approximate-surface");
+            policy.approximation.allow_surface_replacement = true;
+            policy.approximation.max_surface_deviation =
+                policy.max_surface_deviation;
+        } else if (std::strcmp(argv[i], "--approx-volume") == 0
+                   && i + 1 < argc) {
+            std::string error;
+            if (!set_uniform_approximation_budget(
+                    argv[++i], &policy.approximation, &error)) {
+                std::cerr << "error invalid_approximation_percent: "
+                          << error << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (std::strcmp(argv[i], "--approx-shatter") == 0) {
+            policy.approximation.allow_numerical_shatter_loss = true;
+        } else if (std::strcmp(argv[i], "--approx-remove-residuals") == 0) {
+            policy.approximation.allow_sliver_removal = true;
+        } else if (std::strcmp(argv[i], "--approx-resolve-overlaps") == 0) {
+            policy.approximation.allow_overlap_resolution = true;
+        } else if (std::strcmp(argv[i], "--allow-containment-change") == 0) {
+            policy.approximation.require_containment_preservation = false;
+        } else if (std::strcmp(argv[i], "--allow-topology-change") == 0) {
+            policy.approximation.require_topology_preservation = false;
+        } else {
+            std::cerr << "error unrecognized_option: " << argv[i] << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    if (output_path.empty()) {
+        std::cerr << "error context_output_required: use --out context.json|-\n";
+        return EXIT_FAILURE;
+    }
+    if (policy_path.empty() && !project_path.empty()) {
+        const std::filesystem::path discovered =
+            std::filesystem::path(project_path) / "project-policy.json";
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(discovered, error)) {
+            std::cerr << "error context_project_policy_missing: "
+                      << discovered.string()
+                      << "; run `csgify project init " << project_path << "`\n";
+            return EXIT_FAILURE;
+        }
+        policy_path = discovered.string();
+    }
+    csgify::AutonomyPreparationPolicy preparation;
+    if (!policy_path.empty()) {
+        const auto is_inline_policy_option = [](const char* option) {
+            return std::strcmp(option, "--max-relative-delta") == 0
+                || std::strcmp(option, "--allow-certified-intermediate") == 0
+                || std::strcmp(option, "--allow-removal") == 0
+                || std::strcmp(option, "--allow-contained-medium") == 0
+                || std::strcmp(option, "--allow-approximate-surface") == 0
+                || std::strcmp(option, "--approx-volume") == 0
+                || std::strcmp(option, "--approx-shatter") == 0
+                || std::strcmp(option, "--approx-remove-residuals") == 0
+                || std::strcmp(option, "--approx-resolve-overlaps") == 0
+                || std::strcmp(option, "--allow-containment-change") == 0
+                || std::strcmp(option, "--allow-topology-change") == 0;
+        };
+        for (int i = 3; i < argc; ++i) {
+            if (is_inline_policy_option(argv[i])) {
+                std::cerr << "error context_policy_conflict: --policy-file cannot be combined with inline policy options\n";
+                return EXIT_FAILURE;
+            }
+        }
+        try {
+            const csgify::AutonomyProjectPolicy project_policy =
+                csgify::read_autonomy_project_policy_json(policy_path);
+            context_options.project_id = project_policy.project_id;
+            context_options.intended_analysis =
+                project_policy.intended_analysis;
+            preparation = project_policy.preparation;
+            context_options.preparation = preparation;
+            policy = project_policy.authority;
+        } catch (const std::exception& e) {
+            std::cerr << "error context_policy_load_failed: " << e.what()
+                      << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    csgify::ConversionOptions context_conversion_options;
+    context_conversion_options.heal_shape = preparation.heal_shape;
+    context_conversion_options.unit_override = preparation.unit_override;
+    context_conversion_options.unit_scale_to_mm_override =
+        preparation.unit_scale_to_mm_override;
+    context_conversion_options.normalize_to_unit =
+        preparation.normalize_to_unit;
+    context_conversion_options.approximation = policy.approximation;
+    csgify::SessionPtr session =
+        csgify::create_session(context_conversion_options);
+    csgify::DocumentId document;
+    try {
+        document = csgify::load_step(*session, input_path);
+    } catch (const std::exception& e) {
+        std::cerr << "error context_load_failed: "
+                  << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    if (csgify::write_autonomy_context_json(
+            *session, document, policy, context_options, output_path) != 0) {
+        std::cerr << "error context_write_failed: " << output_path << '\n';
+        return EXIT_FAILURE;
+    }
+    return EXIT_SUCCESS;
+}
+
+int run_autonomy_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "autonomy");
+    if (argc < 3) {
+        std::cerr << "error autonomy_input_required\n";
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    std::string actions_path;
+    std::string actions_json;
+    std::string resume_path;
+    std::string queue_report_path = "-";
+    std::string log_path;
+    std::string output_path;
+    std::string step_output_path;
+    std::string project_path;
+    std::string policy_path;
+    csgify::AutonomyPolicy policy;
+    csgify::AutonomyPreparationPolicy preparation;
+    bool open_review = false;
+    bool mode_was_set = false;
+    bool preparation_was_set = false;
+    for (int i = 3; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--actions") == 0 && i + 1 < argc) {
+            actions_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--actions-json") == 0 && i + 1 < argc) {
+            actions_json = argv[++i];
+        } else if (std::strcmp(argv[i], "--resume") == 0 && i + 1 < argc) {
+            resume_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--queue-report") == 0 && i + 1 < argc) {
+            queue_report_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
+            log_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--out") == 0 && i + 1 < argc) {
+            output_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--out-step") == 0 && i + 1 < argc) {
+            step_output_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--project") == 0 && i + 1 < argc) {
+            project_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--policy-file") == 0
+                   && i + 1 < argc) {
+            policy_path = argv[++i];
+        } else if (std::strcmp(argv[i], "--units") == 0 && i + 1 < argc) {
+            preparation.unit_override = argv[++i];
+            preparation_was_set = true;
+        } else if (std::strcmp(argv[i], "--scale") == 0 && i + 1 < argc) {
+            preparation.unit_scale_to_mm_override =
+                parse_double_arg(argv[++i], "--scale");
+            preparation_was_set = true;
+        } else if (std::strcmp(argv[i], "--normalize-units") == 0
+                   && i + 1 < argc) {
+            preparation.normalize_to_unit = argv[++i];
+            preparation_was_set = true;
+        } else if (std::strcmp(argv[i], "--no-heal") == 0) {
+            preparation.heal_shape = false;
+            preparation_was_set = true;
+        } else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) {
+            const std::string mode = argv[++i];
+            mode_was_set = true;
+            if (mode == "explain") policy.mode = csgify::AutonomyMode::explain;
+            else if (mode == "propose") policy.mode = csgify::AutonomyMode::propose;
+            else if (mode == "auto") policy.mode = csgify::AutonomyMode::automatic;
+            else {
+                std::cerr << "error invalid_autonomy_mode: " << mode << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (std::strcmp(argv[i], "--max-relative-delta") == 0
+                   && i + 1 < argc) {
+            policy.max_relative_volume_delta =
+                parse_double_arg(argv[++i], "--max-relative-delta");
+        } else if (std::strcmp(argv[i], "--allow-certified-intermediate") == 0
+                   && i + 1 < argc) {
+            policy.allow_certified_intermediate_decomposition = true;
+            policy.max_intermediate_relative_volume_delta =
+                parse_double_arg(argv[++i], "--allow-certified-intermediate");
+        } else if (std::strcmp(argv[i], "--max-intermediate-pieces") == 0
+                   && i + 1 < argc) {
+            policy.max_intermediate_pieces =
+                parse_size_arg(argv[++i], "--max-intermediate-pieces");
+        } else if (std::strcmp(argv[i], "--max-intermediate-residuals") == 0
+                   && i + 1 < argc) {
+            policy.max_intermediate_residual_pieces =
+                parse_size_arg(argv[++i], "--max-intermediate-residuals");
+        } else if (std::strcmp(argv[i], "--min-piece-fraction") == 0
+                   && i + 1 < argc) {
+            policy.min_piece_volume_fraction =
+                parse_double_arg(argv[++i], "--min-piece-fraction");
+        } else if (std::strcmp(argv[i], "--allow-removal") == 0
+                   && i + 1 < argc) {
+            policy.allow_removal = true;
+            policy.max_removal_volume_fraction =
+                parse_double_arg(argv[++i], "--allow-removal");
+        } else if (std::strcmp(argv[i], "--allow-contained-medium") == 0
+                   && i + 1 < argc) {
+            const std::string specification = argv[++i];
+            const std::size_t density_separator = specification.rfind(':');
+            const std::size_t phase_separator = density_separator == std::string::npos
+                ? std::string::npos
+                : specification.rfind(':', density_separator - 1);
+            if (phase_separator == std::string::npos
+                || density_separator == std::string::npos
+                || phase_separator == 0
+                || density_separator <= phase_separator + 1) {
+                std::cerr << "error invalid_contained_medium_material: expected ID:PHASE:DENSITY\n";
+                return EXIT_FAILURE;
+            }
+            csgify::MaterialDefinition material;
+            material.id = specification.substr(0, phase_separator);
+            const std::string phase = specification.substr(
+                phase_separator + 1,
+                density_separator - phase_separator - 1);
+            material.phase = phase == "liquid" ? csgify::MaterialPhase::liquid
+                : phase == "gas" ? csgify::MaterialPhase::gas
+                                  : csgify::MaterialPhase::unknown;
+            material.density = parse_double_arg(
+                specification.substr(density_separator + 1).c_str(),
+                "--allow-contained-medium density");
+            if (material.id.empty()
+                || material.phase == csgify::MaterialPhase::unknown
+                || !std::isfinite(material.density)) {
+                std::cerr << "error invalid_contained_medium_material: phase must be liquid or gas and density finite\n";
+                return EXIT_FAILURE;
+            }
+            policy.allow_contained_medium_generation = true;
+            policy.contained_medium_materials.push_back(std::move(material));
+        } else if (std::strcmp(argv[i], "--allow-approximate-surface") == 0
+                   && i + 1 < argc) {
+            policy.allow_approximate_surface_replacement = true;
+            policy.max_surface_deviation =
+                parse_double_arg(argv[++i], "--allow-approximate-surface");
+            policy.approximation.allow_surface_replacement = true;
+            policy.approximation.max_surface_deviation =
+                policy.max_surface_deviation;
+        } else if (std::strcmp(argv[i], "--max-auto-actions") == 0
+                   && i + 1 < argc) {
+            policy.max_auto_actions =
+                parse_size_arg(argv[++i], "--max-auto-actions");
+        } else if (std::strcmp(argv[i], "--approx-volume") == 0
+                   && i + 1 < argc) {
+            std::string error;
+            if (!set_uniform_approximation_budget(
+                    argv[++i], &policy.approximation, &error)) {
+                std::cerr << "error invalid_approximation_percent: "
+                          << error << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (std::strcmp(argv[i], "--approx-shatter") == 0) {
+            policy.approximation.allow_numerical_shatter_loss = true;
+        } else if (std::strcmp(argv[i], "--approx-remove-residuals") == 0) {
+            policy.approximation.allow_sliver_removal = true;
+        } else if (std::strcmp(argv[i], "--approx-resolve-overlaps") == 0) {
+            policy.approximation.allow_overlap_resolution = true;
+        } else if (std::strcmp(argv[i], "--allow-containment-change") == 0) {
+            policy.approximation.require_containment_preservation = false;
+        } else if (std::strcmp(argv[i], "--allow-topology-change") == 0) {
+            policy.approximation.require_topology_preservation = false;
+        } else if (std::strcmp(argv[i], "--review") == 0) {
+            open_review = true;
+        } else {
+            std::cerr << "error unrecognized_option: " << argv[i] << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    if (!project_path.empty()) {
+        const std::filesystem::path project_root(project_path);
+        const std::filesystem::path database = project_root / "project.sqlite";
+        const std::filesystem::path discovered =
+            project_root / "project-policy.json";
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(database, error)
+            || !std::filesystem::is_regular_file(discovered, error)) {
+            std::cerr << "error autonomy_project_not_initialized: run `csgify project init "
+                      << project_path << "`\n";
+            return EXIT_FAILURE;
+        }
+        if (policy_path.empty() && resume_path.empty())
+            policy_path = discovered.string();
+    }
+    if (!policy_path.empty()) {
+        const auto is_inline_authority_option = [](const char* option) {
+            return std::strcmp(option, "--max-relative-delta") == 0
+                || std::strcmp(option, "--allow-certified-intermediate") == 0
+                || std::strcmp(option, "--max-intermediate-pieces") == 0
+                || std::strcmp(option, "--max-intermediate-residuals") == 0
+                || std::strcmp(option, "--min-piece-fraction") == 0
+                || std::strcmp(option, "--allow-removal") == 0
+                || std::strcmp(option, "--allow-contained-medium") == 0
+                || std::strcmp(option, "--allow-approximate-surface") == 0
+                || std::strcmp(option, "--max-auto-actions") == 0
+                || std::strcmp(option, "--approx-volume") == 0
+                || std::strcmp(option, "--approx-shatter") == 0
+                || std::strcmp(option, "--approx-remove-residuals") == 0
+                || std::strcmp(option, "--approx-resolve-overlaps") == 0
+                || std::strcmp(option, "--allow-containment-change") == 0
+                || std::strcmp(option, "--allow-topology-change") == 0;
+        };
+        for (int i = 3; i < argc; ++i) {
+            if (is_inline_authority_option(argv[i])
+                || std::strcmp(argv[i], "--units") == 0
+                || std::strcmp(argv[i], "--scale") == 0
+                || std::strcmp(argv[i], "--normalize-units") == 0
+                || std::strcmp(argv[i], "--no-heal") == 0) {
+                std::cerr << "error autonomy_policy_conflict: --policy-file cannot be combined with inline preparation or policy options\n";
+                return EXIT_FAILURE;
+            }
+        }
+        if (!resume_path.empty()) {
+            std::cerr << "error autonomy_policy_conflict: a resumed queue already contains its immutable policy\n";
+            return EXIT_FAILURE;
+        }
+        const csgify::AutonomyMode requested_mode = policy.mode;
+        try {
+            const csgify::AutonomyProjectPolicy project_policy =
+                csgify::read_autonomy_project_policy_json(policy_path);
+            preparation = project_policy.preparation;
+            policy = project_policy.authority;
+            if (mode_was_set) policy.mode = requested_mode;
+        } catch (const std::exception& e) {
+            std::cerr << "error autonomy_policy_load_failed: " << e.what()
+                      << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    const int source_count = (actions_path.empty() ? 0 : 1)
+        + (actions_json.empty() ? 0 : 1)
+        + (resume_path.empty() ? 0 : 1);
+    if (source_count != 1) {
+        std::cerr << "error autonomy_input_conflict: use exactly one of "
+                     "--actions, --actions-json, or --resume\n";
+        return EXIT_FAILURE;
+    }
+    if (policy.max_relative_volume_delta < 0.0
+        || policy.max_intermediate_relative_volume_delta < 0.0
+        || policy.min_piece_volume_fraction < 0.0
+        || policy.max_removal_volume_fraction < 0.0
+        || policy.max_surface_deviation < 0.0) {
+        std::cerr << "error invalid_autonomy_policy: tolerances must be non-negative\n";
+        return EXIT_FAILURE;
+    }
+    if (!std::isfinite(preparation.unit_scale_to_mm_override)
+        || preparation.unit_scale_to_mm_override < 0.0) {
+        std::cerr << "error invalid_autonomy_preparation: scale must be finite and non-negative\n";
+        return EXIT_FAILURE;
+    }
+
+    const auto conversion_options_for = [](
+        const csgify::AutonomyPreparationPolicy& prep,
+        const csgify::AutonomyPolicy& authority) {
+        csgify::ConversionOptions options;
+        options.heal_shape = prep.heal_shape;
+        options.unit_override = prep.unit_override;
+        options.unit_scale_to_mm_override = prep.unit_scale_to_mm_override;
+        options.normalize_to_unit = prep.normalize_to_unit;
+        options.approximation = authority.approximation;
+        return options;
+    };
+
+    csgify::AutonomyRequest request;
+    csgify::AutonomyQueue persisted;
+    bool replay_completed_output = false;
+    std::unique_ptr<csgify::ProjectStore> autonomy_project;
+    std::string project_request_digest;
+    const std::string project_lease_owner = "autonomy:"
+        + std::to_string(std::chrono::high_resolution_clock::now()
+                             .time_since_epoch().count())
+        + ':' + std::to_string(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    const std::int64_t project_lease_expires_at =
+        static_cast<std::int64_t>(std::time(nullptr)) + 300;
+    struct ProjectClaimGuard {
+        csgify::ProjectStore* project = nullptr;
+        std::string request_id;
+        std::string request_digest;
+        std::string lease_owner;
+        csgify::ProjectAutonomyRequestState previous_state =
+            csgify::ProjectAutonomyRequestState::running;
+        bool active = false;
+        bool stop_requested = false;
+        std::mutex heartbeat_mutex;
+        std::condition_variable heartbeat_condition;
+        std::thread heartbeat;
+
+        ~ProjectClaimGuard() {
+            stop_heartbeat();
+            if (!active || !project) return;
+            project->rollback_autonomy_request_claim(
+                request_id, request_digest, lease_owner, previous_state,
+                nullptr);
+        }
+
+        void stop_heartbeat() {
+            {
+                std::lock_guard<std::mutex> lock(heartbeat_mutex);
+                stop_requested = true;
+            }
+            heartbeat_condition.notify_all();
+            if (heartbeat.joinable()) heartbeat.join();
+        }
+
+        void arm(csgify::ProjectStore& store,
+                 const std::string& id,
+                 const std::string& digest,
+                 const std::string& owner,
+                 csgify::ProjectAutonomyRequestState state) {
+            project = &store;
+            request_id = id;
+            request_digest = digest;
+            lease_owner = owner;
+            previous_state = state;
+            active = true;
+            heartbeat = std::thread([this]() {
+                std::unique_lock<std::mutex> lock(heartbeat_mutex);
+                while (!heartbeat_condition.wait_for(
+                    lock, std::chrono::seconds(30),
+                    [this]() { return stop_requested; })) {
+                    lock.unlock();
+                    project->renew_autonomy_request_lease(
+                        request_id, request_digest, lease_owner,
+                        static_cast<std::int64_t>(std::time(nullptr)) + 300,
+                        nullptr);
+                    lock.lock();
+                }
+            });
+        }
+
+        void disarm() {
+            stop_heartbeat();
+            active = false;
+        }
+    } project_claim;
+    try {
+        if (!resume_path.empty()) {
+            persisted = csgify::read_autonomy_queue_json(resume_path);
+            if (persisted.request_id.empty() || persisted.request_digest.empty())
+                throw std::runtime_error(
+                    "legacy queue has no request identity; fresh evaluation is required");
+            if (!persisted.source_path.empty()
+                && persisted.source_path != input_path) {
+                throw std::runtime_error("queue source_path does not match input STEP");
+            }
+            const std::string current_digest =
+                csgify::fnv1a128_file_hex(input_path);
+            if (current_digest.empty())
+                throw std::runtime_error("input STEP digest could not be computed");
+            if (persisted.source_digest.empty())
+                throw std::runtime_error(
+                    "legacy queue has no source_digest; fresh evaluation is required");
+            if (persisted.source_digest != current_digest)
+                throw std::runtime_error(
+                    "queue source_digest does not match input STEP; fresh evaluation is required");
+            csgify::AutonomyRequest persisted_identity;
+            persisted_identity.request_id = persisted.request_id;
+            persisted_identity.source_digest = persisted.source_digest;
+            persisted_identity.expected_revision = persisted.expected_revision;
+            for (const csgify::AutonomyQueueItem& item : persisted.items)
+                persisted_identity.actions.push_back(item.proposal);
+            if (persisted.request_digest
+                != csgify::autonomy_request_digest(persisted_identity)) {
+                throw std::runtime_error(
+                    "queue request_digest does not match persisted actions; fresh evaluation is required");
+            }
+            if (persisted.policy_digest.empty())
+                throw std::runtime_error(
+                    "legacy queue has no policy_digest; fresh evaluation is required");
+            if (persisted.policy_digest
+                != csgify::autonomy_policy_digest(persisted.policy)) {
+                throw std::runtime_error(
+                    "queue policy_digest does not match persisted policy; fresh evaluation is required");
+            }
+            if (persisted.conversion_policy_digest.empty())
+                throw std::runtime_error(
+                    "legacy queue has no conversion_policy_digest; fresh evaluation is required");
+            const csgify::ConversionOptions persisted_options =
+                conversion_options_for(persisted.preparation,
+                                       persisted.policy);
+            if (persisted.conversion_policy_digest
+                != csgify::autonomy_conversion_policy_digest(
+                    persisted_options)) {
+                throw std::runtime_error(
+                    "queue conversion_policy_digest does not match preparation policy; fresh evaluation is required");
+            }
+            if (preparation_was_set) {
+                const csgify::ConversionOptions requested_options =
+                    conversion_options_for(preparation, persisted.policy);
+                if (csgify::autonomy_conversion_policy_digest(
+                        requested_options)
+                    != persisted.conversion_policy_digest) {
+                    throw std::runtime_error(
+                        "resume preparation options differ from the evaluated queue; fresh evaluation is required");
+                }
+            }
+            const csgify::AutonomyMode requested_mode = policy.mode;
+            policy = persisted.policy;
+            if (mode_was_set) policy.mode = requested_mode;
+            preparation = persisted.preparation;
+            request.request_id = persisted.request_id;
+            request.source_digest = persisted.source_digest;
+            request.expected_revision = persisted.expected_revision;
+            for (const csgify::AutonomyQueueItem& item : persisted.items) {
+                if (!item.executed && !item.rejected
+                    && item.disposition != csgify::AutonomyDisposition::denied
+                    && item.proposal.op.rfind("coverage_", 0) != 0)
+                    request.actions.push_back(item.proposal);
+            }
+        } else if (!actions_json.empty()) {
+            request = csgify::parse_autonomy_request_json(actions_json);
+        } else {
+            request = csgify::read_autonomy_request_json(actions_path);
+        }
+        if (resume_path.empty()) {
+            const std::string current_digest =
+                csgify::fnv1a128_file_hex(input_path);
+            if (current_digest.empty())
+                throw std::runtime_error(
+                    "input STEP digest could not be computed");
+            if (request.source_digest != current_digest)
+                throw std::runtime_error(
+                    "request source_digest does not match input STEP");
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "error autonomy_request_invalid: " << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    csgify::ConversionOptions autonomy_options =
+        conversion_options_for(preparation, policy);
+    if (!project_path.empty()) {
+        autonomy_project = std::make_unique<csgify::ProjectStore>(project_path);
+        std::string project_error;
+        if (!autonomy_project->open(&project_error)) {
+            std::cerr << "error autonomy_project_open_failed: "
+                      << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        const std::string policy_digest =
+            csgify::autonomy_policy_digest(policy);
+        const std::string conversion_digest =
+            csgify::autonomy_conversion_policy_digest(autonomy_options);
+        if (!resume_path.empty()) {
+            const auto existing = autonomy_project->find_autonomy_request(
+                persisted.request_id, &project_error);
+            if (!project_error.empty()) {
+                std::cerr << "error autonomy_project_lookup_failed: "
+                          << project_error << '\n';
+                return EXIT_FAILURE;
+            }
+            if (existing) {
+                if (existing->source_digest != persisted.source_digest
+                    || existing->policy_digest != policy_digest
+                    || existing->conversion_policy_digest != conversion_digest) {
+                    std::cerr << "error autonomy_project_request_conflict: request_id "
+                              << persisted.request_id
+                              << " is bound to different source or policy input\n";
+                    return EXIT_FAILURE;
+                }
+                project_request_digest = existing->request_digest;
+                if (existing->state
+                    == csgify::ProjectAutonomyRequestState::completed) {
+                    // Reconstruction may still be requested to regenerate an
+                    // output file, but the durable completed outcome is final.
+                    autonomy_project.reset();
+                } else if (!autonomy_project->claim_autonomy_request(
+                               existing->request_id,
+                               existing->request_digest,
+                               project_lease_owner,
+                               project_lease_expires_at,
+                               &project_error)) {
+                    std::cerr << "error autonomy_project_claim_failed: "
+                              << project_error << '\n';
+                    return EXIT_FAILURE;
+                } else {
+                    project_claim.arm(
+                        *autonomy_project, existing->request_id,
+                        existing->request_digest, project_lease_owner,
+                        existing->state);
+                }
+            } else {
+                csgify::ProjectAutonomyRequestRecord reservation;
+                reservation.request_id = persisted.request_id;
+                reservation.request_digest = persisted.request_digest;
+                reservation.source_digest = persisted.source_digest;
+                reservation.policy_digest = policy_digest;
+                reservation.conversion_policy_digest = conversion_digest;
+                reservation.lease_owner = project_lease_owner;
+                reservation.lease_expires_at = project_lease_expires_at;
+                reservation.created_at = static_cast<std::int64_t>(
+                    std::time(nullptr));
+                const auto reserved =
+                    autonomy_project->reserve_autonomy_request(
+                        reservation, &project_error);
+                if (reserved.status
+                    != csgify::ProjectAutonomyReservationStatus::reserved) {
+                    std::cerr << "error autonomy_project_reservation_failed: "
+                              << (project_error.empty()
+                                      ? "request identity conflict"
+                                      : project_error)
+                              << '\n';
+                    return EXIT_FAILURE;
+                }
+                project_request_digest = reservation.request_digest;
+                project_claim.arm(
+                    *autonomy_project, reservation.request_id,
+                    reservation.request_digest, project_lease_owner,
+                    csgify::ProjectAutonomyRequestState::running);
+            }
+        } else {
+            csgify::ProjectAutonomyRequestRecord reservation;
+            reservation.request_id = request.request_id;
+            reservation.request_digest =
+                csgify::autonomy_request_digest(request);
+            reservation.source_digest = request.source_digest;
+            reservation.policy_digest = policy_digest;
+            reservation.conversion_policy_digest = conversion_digest;
+            reservation.lease_owner = project_lease_owner;
+            reservation.lease_expires_at = project_lease_expires_at;
+            reservation.created_at = static_cast<std::int64_t>(
+                std::time(nullptr));
+            const auto reserved = autonomy_project->reserve_autonomy_request(
+                reservation, &project_error);
+            if (reserved.status
+                == csgify::ProjectAutonomyReservationStatus::conflict) {
+                std::cerr << "error autonomy_project_request_conflict: request_id "
+                          << request.request_id
+                          << " is already bound to different input\n";
+                return EXIT_FAILURE;
+            }
+            if (reserved.status
+                == csgify::ProjectAutonomyReservationStatus::error) {
+                std::cerr << "error autonomy_project_reservation_failed: "
+                          << project_error << '\n';
+                return EXIT_FAILURE;
+            }
+            project_request_digest = reservation.request_digest;
+            if (reserved.status
+                == csgify::ProjectAutonomyReservationStatus::reserved) {
+                project_claim.arm(
+                    *autonomy_project, reservation.request_id,
+                    reservation.request_digest, project_lease_owner,
+                    csgify::ProjectAutonomyRequestState::running);
+            }
+            if (reserved.status
+                    == csgify::ProjectAutonomyReservationStatus::existing) {
+                const csgify::ProjectAutonomyRequestRecord& existing =
+                    *reserved.record;
+                if (!existing.queue_artifact) {
+                    std::cerr << "error autonomy_project_request_in_progress: "
+                              << request.request_id << '\n';
+                    return 2;
+                }
+                if (!autonomy_project->artifacts().validate(
+                        *existing.queue_artifact, &project_error)) {
+                    std::cerr << "error autonomy_project_queue_invalid: "
+                              << project_error << '\n';
+                    return EXIT_FAILURE;
+                }
+                const std::filesystem::path stored_queue =
+                    autonomy_project->artifacts().absolute_path(
+                        *existing.queue_artifact);
+                const bool deliver_completed_output = existing.state
+                        == csgify::ProjectAutonomyRequestState::completed
+                    && (!output_path.empty() || !step_output_path.empty());
+                if (deliver_completed_output) {
+                    try {
+                        persisted = csgify::read_autonomy_queue_json(
+                            stored_queue.string());
+                    } catch (const std::exception& e) {
+                        std::cerr << "error autonomy_project_queue_read_failed: "
+                                  << e.what() << '\n';
+                        return EXIT_FAILURE;
+                    }
+                    // The database digest identifies the submitted request;
+                    // the queue digest identifies its normalized executable
+                    // actions. They intentionally differ after normalization.
+                    if (persisted.request_id != existing.request_id
+                        || persisted.source_digest != existing.source_digest) {
+                        std::cerr << "error autonomy_project_queue_identity_mismatch\n";
+                        return EXIT_FAILURE;
+                    }
+                    policy = persisted.policy;
+                    preparation = persisted.preparation;
+                    autonomy_options = conversion_options_for(
+                        preparation, policy);
+                    request.actions.clear();
+                    for (const csgify::AutonomyQueueItem& item
+                         : persisted.items) {
+                        if (!item.executed && !item.rejected
+                            && item.disposition
+                                != csgify::AutonomyDisposition::denied
+                            && item.proposal.op.rfind("coverage_", 0) != 0) {
+                            request.actions.push_back(item.proposal);
+                        }
+                    }
+                    replay_completed_output = true;
+                    // The queue result is already durable and final. Rebuild
+                    // geometry only to deliver explicitly requested outputs;
+                    // do not claim or rewrite the logical request.
+                    autonomy_project.reset();
+                    std::cerr << "autonomy_request_output_replayed "
+                              << request.request_id << '\n';
+                } else {
+                    std::ifstream stored(stored_queue, std::ios::binary);
+                    if (!stored) {
+                        std::cerr << "error autonomy_project_queue_read_failed\n";
+                        return EXIT_FAILURE;
+                    }
+                    if (queue_report_path == "-") {
+                        std::cout << stored.rdbuf();
+                    } else {
+                        std::ofstream output(
+                            queue_report_path,
+                            std::ios::binary | std::ios::trunc);
+                        output << stored.rdbuf();
+                        if (!output) {
+                            std::cerr
+                                << "error autonomy_queue_report_write_failed: "
+                                << queue_report_path << '\n';
+                            return EXIT_FAILURE;
+                        }
+                    }
+                    std::cerr << "autonomy_request_reused "
+                              << request.request_id << '\n';
+                    return existing.state
+                            == csgify::ProjectAutonomyRequestState::completed
+                        ? EXIT_SUCCESS
+                        : existing.state
+                                == csgify::ProjectAutonomyRequestState::awaiting_decision
+                            ? 2
+                            : EXIT_FAILURE;
+                }
+            }
+        }
+    }
+    const bool reconstructing_queue =
+        !resume_path.empty() || replay_completed_output;
+    csgify::SessionPtr session = csgify::create_session(autonomy_options);
+    if (!log_path.empty() && !reconstructing_queue) {
+        try {
+            csgify::attach_decision_log(*session, log_path, input_path);
+        } catch (const std::exception& e) {
+            std::cerr << "error autonomy_decision_log_open_failed: "
+                      << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    csgify::DocumentId document;
+    try {
+        document = csgify::load_step(*session, input_path);
+    } catch (const std::exception& e) {
+        std::cerr << "error autonomy_execution_audit_failed: "
+                  << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    if (!reconstructing_queue
+        && request.expected_revision
+               != csgify::document_revision(*session, document)) {
+        std::cerr << "error autonomy_request_stale: expected revision "
+                  << request.expected_revision << ", current revision "
+                  << csgify::document_revision(*session, document) << '\n';
+        return EXIT_FAILURE;
+    }
+    for (const csgify::MaterialDefinition& material
+         : policy.contained_medium_materials) {
+        csgify::CommandResult configured;
+        try {
+            configured = csgify::define_material(
+                *session, document, material);
+        } catch (const std::exception& e) {
+            std::cerr << "error autonomy_execution_audit_failed: "
+                      << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!configured.ok) {
+            std::cerr << "error contained_medium_material_configuration_failed\n";
+            return EXIT_FAILURE;
+        }
+    }
+    csgify::analyze(*session, document);
+    if (reconstructing_queue) {
+        for (const csgify::AutonomyQueueItem& item : persisted.items) {
+            if (!item.executed || !item.execution_ok || item.rejected) continue;
+            const csgify::OperationDescriptor* replay_descriptor =
+                csgify::find_operation(item.proposal.op);
+            if (replay_descriptor
+                && replay_descriptor->autonomy_kind
+                    == csgify::AutonomyOperationKind::decompose_to_fixed_point
+                && !item.evidence.mutation_applied) {
+                continue;
+            }
+            csgify::AutonomyQueueItem replay_item = item;
+            const csgify::AutonomyOperationExecution reconstruction =
+                csgify::execute_autonomy_operation(
+                    *session, document, replay_item, policy);
+            if (!reconstruction.ok) {
+                std::cerr << "error autonomy_resume_reconstruction_failed\n";
+                return EXIT_FAILURE;
+            }
+        }
+        const std::size_t reconstructed_revision =
+            csgify::document_revision(*session, document);
+        for (const csgify::AutonomyQueueItem& item : persisted.items) {
+            if (!item.executed && !item.rejected
+                && item.disposition != csgify::AutonomyDisposition::denied
+                && item.proposal.op.rfind("coverage_", 0) != 0
+                && item.evaluated_revision != reconstructed_revision) {
+                std::cerr << "error autonomy_resume_stale_revision: queued revision "
+                          << item.evaluated_revision << ", reconstructed revision "
+                          << reconstructed_revision << '\n';
+                return EXIT_FAILURE;
+            }
+        }
+    }
+    // Reconstructing already-applied queue items restores session state but is
+    // not a new decision. Attach the requested log only after reconstruction
+    // so a resume does not duplicate historical operation records.
+    if (!log_path.empty() && !resume_path.empty()) {
+        try {
+            csgify::attach_decision_log(*session, log_path, input_path);
+        } catch (const std::exception& e) {
+            std::cerr << "error autonomy_decision_log_open_failed: "
+                      << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    csgify::AutonomyQueue queue = csgify::evaluate_autonomy_queue(
+        *session, document, request.actions, policy);
+    try {
+        csgify::execute_autonomy_queue(*session, queue, policy);
+    } catch (const std::exception& e) {
+        std::cerr << "error autonomy_execution_audit_failed: "
+                  << e.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    queue.source_path = input_path;
+    queue.source_digest = csgify::fnv1a128_file_hex(input_path);
+    queue.preparation = preparation;
+    queue.policy_digest = csgify::autonomy_policy_digest(policy);
+    queue.conversion_policy_digest =
+        csgify::autonomy_conversion_policy_digest(autonomy_options);
+    if (reconstructing_queue) {
+        queue.request_id = persisted.request_id;
+        queue.request_digest = persisted.request_digest;
+        queue.expected_revision = persisted.expected_revision;
+        queue.coverage_certificate_path =
+            persisted.coverage_certificate_path;
+        queue.coverage_certificate_digest =
+            persisted.coverage_certificate_digest;
+        std::vector<csgify::AutonomyQueueItem> combined;
+        for (const csgify::AutonomyQueueItem& item : persisted.items) {
+            if (item.executed || item.rejected
+                || item.disposition == csgify::AutonomyDisposition::denied
+                || item.proposal.op.rfind("coverage_", 0) == 0)
+                combined.push_back(item);
+        }
+        combined.insert(combined.end(), queue.items.begin(), queue.items.end());
+        queue.items = std::move(combined);
+        csgify::refresh_autonomy_queue_counts(queue);
+    } else {
+        queue.request_id = request.request_id;
+        queue.expected_revision = request.expected_revision;
+        csgify::AutonomyRequest normalized_identity;
+        normalized_identity.request_id = queue.request_id;
+        normalized_identity.source_digest = queue.source_digest;
+        normalized_identity.expected_revision = queue.expected_revision;
+        for (const csgify::AutonomyQueueItem& item : queue.items)
+            normalized_identity.actions.push_back(item.proposal);
+        queue.request_digest =
+            csgify::autonomy_request_digest(normalized_identity);
+    }
+
+    const auto checkpoint_project_queue = [&]() {
+        if (!autonomy_project) return true;
+        const auto nonce = std::chrono::steady_clock::now()
+            .time_since_epoch().count();
+        const std::filesystem::path temporary =
+            autonomy_project->artifacts().root() / "tmp"
+            / ("autonomy-" + queue.request_digest + '-'
+               + std::to_string(nonce) + ".json");
+        if (csgify::write_autonomy_queue_json(queue, temporary.string()) != 0) {
+            std::cerr << "error autonomy_project_queue_write_failed\n";
+            return false;
+        }
+        csgify::ArtifactRecord artifact;
+        std::string project_error;
+        const bool published = autonomy_project->artifacts().publish_file(
+            "autonomy-queue", "json", temporary, &artifact, &project_error);
+        std::error_code remove_error;
+        std::filesystem::remove(temporary, remove_error);
+        if (!published) {
+            std::cerr << "error autonomy_project_queue_publish_failed: "
+                      << project_error << '\n';
+            return false;
+        }
+        const csgify::ProjectAutonomyRequestState state =
+            queue.denied_count > 0 || queue.failed_count > 0
+            ? csgify::ProjectAutonomyRequestState::failed
+            : queue.human_review_count > 0
+                ? csgify::ProjectAutonomyRequestState::awaiting_decision
+                : csgify::ProjectAutonomyRequestState::completed;
+        if (!autonomy_project->finish_autonomy_request(
+                queue.request_id, project_request_digest,
+                project_lease_owner, state, artifact,
+                static_cast<std::int64_t>(std::time(nullptr)),
+                &project_error)) {
+            std::cerr << "error autonomy_project_checkpoint_failed: "
+                      << project_error << '\n';
+            return false;
+        }
+        project_claim.disarm();
+        return true;
+    };
+
+    if (csgify::write_autonomy_queue_json(queue, queue_report_path) != 0) {
+        std::cerr << "error autonomy_queue_report_write_failed: "
+                  << queue_report_path << '\n';
+        return EXIT_FAILURE;
+    }
+    if (!checkpoint_project_queue()) return EXIT_FAILURE;
+    if (open_review && queue.human_review_count > 0) {
+#if CSGIFY_HAVE_TKOPENGL && CSGIFY_HAVE_QT6_VIEWER
+        const int review_result = csgify::run_qt_autonomy_queue(
+            *session, input_path, queue, queue_report_path);
+        if (review_result != 0) return review_result;
+        csgify::refresh_autonomy_queue_counts(queue);
+        if (csgify::write_autonomy_queue_json(queue, queue_report_path) != 0) {
+            std::cerr << "error autonomy_queue_report_write_failed: "
+                      << queue_report_path << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!checkpoint_project_queue()) return EXIT_FAILURE;
+#else
+        const csgify::AutonomyQueueItem* escalated = nullptr;
+        for (const csgify::AutonomyQueueItem& item : queue.items) {
+            if (item.disposition == csgify::AutonomyDisposition::human_review) {
+                escalated = &item;
+                break;
+            }
+        }
+        if (escalated) {
+            csgify::ViewerReviewContext review;
+            review.action = escalated->proposal.op;
+            review.target_id = escalated->proposal.target_id;
+            review.candidate_id = escalated->proposal.candidate_id;
+            review.review_id = escalated->proposal.id;
+            review.audit.actor = "human";
+            review.audit.proposal_actor = escalated->proposal.actor;
+            review.audit.proposal_id = escalated->proposal.id;
+            review.audit.rationale = escalated->proposal.rationale;
+            review.audit.policy_rule = escalated->policy_rule;
+            review.audit.approval_mode = "manual";
+            std::string preselect = escalated->proposal.target_id;
+            csgify::DecompositionProposal decomposition;
+            const csgify::DecompositionProposal* proposal = nullptr;
+            if (escalated->proposal.op == "apply_decomposition_candidate") {
+                review.kind = "decomposition";
+                decomposition = csgify::propose_decomposition(
+                    *session, escalated->proposal.target_id);
+                proposal = &decomposition;
+            } else if (escalated->proposal.op
+                       == "apply_surface_replacement_candidate") {
+                review.kind = "surface_replacement";
+                const csgify::SurfaceReplacementProposal surface =
+                    csgify::propose_surface_replacement(
+                        *session, escalated->proposal.target_id);
+                for (const csgify::SurfaceReplacementCandidate& candidate
+                     : surface.candidates) {
+                    if (candidate.id == escalated->proposal.candidate_id) {
+                        review.surface_replacement = candidate;
+                        review.has_surface_replacement = true;
+                        preselect = candidate.owner_target_id;
+                        break;
+                    }
+                }
+            } else if (escalated->proposal.op == "remove_solid") {
+                review.kind = "removal";
+            } else if (escalated->proposal.op == "apply_contained_medium"
+                       && escalated->proposal.medium_request) {
+                review.kind = "contained_medium";
+                review.medium_request = *escalated->proposal.medium_request;
+                review.candidate_id = review.medium_request.id;
+                review.medium_proposal = csgify::propose_contained_medium(
+                    *session, document, review.medium_request);
+                if (!review.medium_proposal.ok) {
+                    std::cerr << "error autonomy_medium_review_certificate_failed\n";
+                    return 2;
+                }
+                review.has_medium = true;
+                preselect = review.medium_proposal.host_shape_id;
+            } else {
+                std::cerr << "error autonomy_review_unsupported: "
+                          << escalated->proposal.op << '\n';
+                return 2;
+            }
+#if CSGIFY_HAVE_TKOPENGL
+#if CSGIFY_HAVE_QT6_VIEWER
+            return csgify::run_qt_viewer_command(
+                *session, input_path, document, preselect, proposal,
+                escalated->proposal.candidate_id, review, output_path);
+#else
+            return csgify::run_viewer_command(
+                *session, input_path, document, preselect, proposal,
+                escalated->proposal.candidate_id, review, output_path);
+#endif
+#else
+            std::cerr << "error viewer_not_built: use the queue report for external review\n";
+            return 2;
+#endif
+        }
+#endif
+    }
+    const bool hard_failed = queue.denied_count > 0 || queue.failed_count > 0;
+    const bool blocked = queue.human_review_count > 0 || hard_failed;
+    // Preserve certified partial progress for the next bounded shatter/review
+    // step, but never export an unchanged STEP for a zero-progress attempt.
+    if (!hard_failed && queue.applied_count > 0 && !step_output_path.empty()) {
+        csgify::CommandResult result;
+        try {
+            result = csgify::export_document_step(
+                *session, document, step_output_path);
+        } catch (const std::exception& e) {
+            std::error_code remove_error;
+            std::filesystem::remove(step_output_path, remove_error);
+            std::cerr << "error autonomy_output_audit_failed: "
+                      << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!result.ok) return EXIT_FAILURE;
+    }
+    if (!blocked && !output_path.empty()) {
+        csgify::CommandResult result;
+        try {
+            result = csgify::emit_document(
+                *session, document, output_path);
+        } catch (const std::exception& e) {
+            std::error_code remove_error;
+            std::filesystem::remove(output_path, remove_error);
+            std::cerr << "error autonomy_output_audit_failed: "
+                      << e.what() << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!result.ok) return EXIT_FAILURE;
+    }
+    if (queue.denied_count > 0 || queue.failed_count > 0) return EXIT_FAILURE;
+    if (queue.human_review_count > 0) return 2;
+    return EXIT_SUCCESS;
+}
+
 int run_view_command(int argc, char** argv) {
     if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "view");
     if (argc < 3) {
         std::cerr << "usage: " << argv[0] << " view input.step"
                      " [--select doc:N/solid:M|solid:M]"
-                     " [--candidate candidate:N]"
+                     " [--candidate candidate:N|best]"
                      " [--review-removal removal:N]"
                      " [--review-removals]"
                      " [--review-hole-fill hole-fill:N]"
                      " [--review-decomp candidate:N]"
                      " [--review-surface-replacement candidate:N --select-face face:N.M]"
                      " [--log decisions.json] [--out output.i]"
+                     " [--viewer-backend auto|qt|x11]"
                      " [--keys A,Tab,A,Q  (headless: replay keys, no window)]\n";
         return EXIT_FAILURE;
     }
@@ -791,6 +2299,7 @@ int run_view_command(int argc, char** argv) {
     std::string log_path;
     std::string commit_out_path;
     std::string headless_keys;
+    std::string viewer_backend = "auto";
     csgify::HoleFillOptions hole_fill_options;
 
     for (int i = 3; i < argc; ++i) {
@@ -802,6 +2311,8 @@ int run_view_command(int argc, char** argv) {
             commit_out_path = argv[++i];
         } else if (std::strcmp(argv[i], "--keys") == 0 && i + 1 < argc) {
             headless_keys = argv[++i];
+        } else if (std::strcmp(argv[i], "--viewer-backend") == 0 && i + 1 < argc) {
+            viewer_backend = argv[++i];
         } else if (std::strcmp(argv[i], "--candidate") == 0 && i + 1 < argc) {
             candidate_id = argv[++i];
         } else if (std::strcmp(argv[i], "--review-removal") == 0 && i + 1 < argc) {
@@ -837,6 +2348,12 @@ int run_view_command(int argc, char** argv) {
             std::cerr << "error unrecognized_option: " << argv[i] << '\n';
             return EXIT_FAILURE;
         }
+    }
+
+    if (viewer_backend != "auto" && viewer_backend != "qt"
+        && viewer_backend != "x11") {
+        std::cerr << "error invalid_viewer_backend: expected auto, qt, or x11\n";
+        return EXIT_FAILURE;
     }
 
     const int review_count = (review_removal_id.empty() ? 0 : 1)
@@ -900,9 +2417,17 @@ int run_view_command(int argc, char** argv) {
             csgify::ViewerReviewAlternative alt;
             alt.review_id = c.id;
             alt.target_id = c.solid_id;
+            alt.component_instance_id = c.component_instance_id;
+            alt.component_definition_id = c.component_definition_id;
+            alt.label = c.label;
+            alt.name = c.name;
+            alt.hierarchy_path = c.hierarchy_path;
             alt.confidence = c.confidence;
             alt.volume_fraction = c.volume_fraction;
             alt.score = c.score;
+            alt.reason_codes = c.reason_codes;
+            alt.blockers = c.blockers;
+            alt.suggested_action = c.suggested_action;
             review.alternatives.push_back(std::move(alt));
         }
     }
@@ -977,6 +2502,10 @@ int run_view_command(int argc, char** argv) {
         owned_proposal = csgify::propose_decomposition(
             *session, preselect_id, csgify::ReportIdMode::scoped);
         proposal = &owned_proposal;
+        if (candidate_id == "best") {
+            candidate_id = owned_proposal.best_candidate_id;
+            if (review_decomp_id == "best") review_decomp_id = candidate_id;
+        }
         const csgify::DecompositionCandidate* selected = nullptr;
         for (const csgify::DecompositionCandidate& c : owned_proposal.candidates) {
             if (c.id == candidate_id) {
@@ -995,10 +2524,8 @@ int run_view_command(int argc, char** argv) {
             review.action = "apply_decomposition_candidate";
             review.target_id = selected->target_id;
             review.candidate_id = selected->id;
-            if (!review_decomp_id.empty()) {
-                review.kind = "decomposition";
-                review.review_id = selected->id;
-            }
+            review.kind = "decomposition";
+            review.review_id = selected->id;
         }
     }
 
@@ -1009,7 +2536,29 @@ int run_view_command(int argc, char** argv) {
                                             std::cout, std::cerr);
     }
 
+    if (!review.action.empty()) {
+        review.audit.actor = "human";
+        review.audit.proposal_actor = "human";
+        review.audit.proposal_id = review.review_id;
+        review.audit.rationale = "accepted in the interactive geometry reviewer";
+        review.audit.policy_rule = "interactive.human_decision";
+        review.audit.approval_mode = "manual";
+    }
+
 #if CSGIFY_HAVE_TKOPENGL
+#if CSGIFY_HAVE_QT6_VIEWER
+    if (viewer_backend != "x11") {
+        return csgify::run_qt_viewer_command(
+            *session, input_path, doc_id, preselect_id, proposal, candidate_id,
+            review, commit_out_path);
+    }
+#else
+    if (viewer_backend == "qt") {
+        std::cerr << "error qt_viewer_not_built: rebuild with Qt 6 Widgets or "
+                     "use --viewer-backend x11\n";
+        return EXIT_FAILURE;
+    }
+#endif
     return csgify::run_viewer_command(
         *session, input_path, doc_id, preselect_id, proposal, candidate_id,
         review, commit_out_path);
@@ -1039,6 +2588,22 @@ int run_viewer_check_command() {
               << "true"
 #else
               << "false"
+#endif
+              << '\n';
+    std::cout << "qt6_viewer "
+#if CSGIFY_HAVE_QT6_VIEWER
+              << "true"
+#else
+              << "false"
+#endif
+              << '\n';
+    std::cout << "default_viewer_backend "
+#if CSGIFY_HAVE_QT6_VIEWER
+              << "qt"
+#elif CSGIFY_HAVE_TKOPENGL
+              << "x11"
+#else
+              << "none"
 #endif
               << '\n';
     std::cout << "graphic_driver_factory "
@@ -1211,7 +2776,13 @@ int run_remove_suggest_command(int argc, char** argv) {
 
     csgify::ConversionOptions options;
     csgify::SessionPtr session = csgify::create_session(options);
+    const auto load_started = std::chrono::steady_clock::now();
+    std::cerr << "stage load_step: started input=" << input_path << '\n';
     const csgify::DocumentId document_id = csgify::load_step(*session, input_path);
+    const double load_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - load_started).count();
+    std::cerr << "stage load_step: completed elapsed_s="
+              << std::fixed << std::setprecision(1) << load_seconds << '\n';
     csgify::RemovalProposal proposal =
         csgify::suggest_removals(*session,
                                   document_id,
@@ -1358,6 +2929,7 @@ int run_simplify_command(int argc, char** argv) {
     std::string step_out_path;
     std::string by_face_id;
     std::string candidate_id;
+    std::string overlap_owner_id;
     double max_depth_value = 4.0;
     csgify::DecompositionPolicy decomposition_policy;
     csgify::HoleFillOptions hole_fill_options;
@@ -1366,6 +2938,18 @@ int run_simplify_command(int argc, char** argv) {
     bool allow_overlaps = false;
     bool allow_shatter_volume_drift = false;
     bool union_decomposed_pieces = false;
+    std::string approximation_percent;
+    std::string approximation_body_percent;
+    std::string approximation_action_percent;
+    std::string approximation_added_percent;
+    std::string approximation_removed_percent;
+    std::string approximation_preset;
+    std::vector<std::string> protected_targets;
+    std::vector<int> protected_materials;
+    bool allow_containment_change = false;
+    bool allow_topology_change = false;
+    std::string mcnp_domain_id;
+    bool require_domain_coverage = false;
 
     OptScanner scan(argc, argv, 7);
     while (!scan.done()) {
@@ -1383,6 +2967,29 @@ int run_simplify_command(int argc, char** argv) {
         if (scan.take_string("--out-step", &step_out_path)) continue;
         if (scan.take_string("--by-face", &by_face_id)) continue;
         if (scan.take_string("--candidate", &candidate_id)) continue;
+        if (scan.take_string("--owner", &overlap_owner_id)) continue;
+        if (scan.take_string("--approx-volume", &approximation_percent)) continue;
+        if (scan.take_string("--approx-body-volume", &approximation_body_percent)) continue;
+        if (scan.take_string("--approx-action-volume", &approximation_action_percent)) continue;
+        if (scan.take_string("--approx-added-volume", &approximation_added_percent)) continue;
+        if (scan.take_string("--approx-removed-volume", &approximation_removed_percent)) continue;
+        if (scan.take_string("--approx-preset", &approximation_preset)) continue;
+        std::string protected_target;
+        if (scan.take_string("--protect", &protected_target)) {
+            protected_targets.push_back(protected_target);
+            continue;
+        }
+        std::size_t protected_material = 0;
+        if (scan.take_size("--protect-material", &protected_material)) {
+            if (protected_material > static_cast<std::size_t>(
+                    std::numeric_limits<int>::max())) {
+                std::cerr << "error invalid_protected_material\n";
+                return EXIT_FAILURE;
+            }
+            protected_materials.push_back(static_cast<int>(protected_material));
+            continue;
+        }
+        if (scan.take_string("--mcnp-domain", &mcnp_domain_id)) continue;
         if (scan.take_string("--host", &hole_fill_options.host_solid_id)) continue;
         if (scan.take_string("--near-removed",
                              &hole_fill_options.near_removed_solid_id)) continue;
@@ -1411,6 +3018,18 @@ int run_simplify_command(int argc, char** argv) {
             union_decomposed_pieces = true;
             continue;
         }
+        if (scan.take_flag("--require-domain-coverage")) {
+            require_domain_coverage = true;
+            continue;
+        }
+        if (scan.take_flag("--allow-containment-change")) {
+            allow_containment_change = true;
+            continue;
+        }
+        if (scan.take_flag("--allow-topology-change")) {
+            allow_topology_change = true;
+            continue;
+        }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1420,8 +3039,94 @@ int run_simplify_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     csgify::ConversionOptions options;
+    options.try_planar_decomposition = false;
     if (allow_overlaps) options.allow_overlaps = true;
     if (union_decomposed_pieces) options.union_decomposed_pieces = true;
+    options.mcnp_domain_id = mcnp_domain_id;
+    options.require_domain_coverage = require_domain_coverage;
+    if (!approximation_preset.empty()) {
+        if (!approximation_percent.empty()) {
+            std::cerr << "error approximation_preset_conflict: use a preset or "
+                         "--approx-volume, not both\n";
+            return EXIT_FAILURE;
+        }
+        if (approximation_preset == "conservative") approximation_percent = "0.1%";
+        else if (approximation_preset == "moderate") approximation_percent = "1%";
+        else if (approximation_preset == "permissive") approximation_percent = "2%";
+        else {
+            std::cerr << "error invalid_approximation_preset: expected "
+                         "conservative|moderate|permissive\n";
+            return EXIT_FAILURE;
+        }
+    }
+    const bool has_axis_override = !approximation_body_percent.empty()
+        || !approximation_action_percent.empty()
+        || !approximation_added_percent.empty()
+        || !approximation_removed_percent.empty();
+    if (approximation_percent.empty() && has_axis_override) {
+        std::cerr << "error approximation_global_budget_required: specify "
+                     "--approx-volume with axis overrides\n";
+        return EXIT_FAILURE;
+    }
+    if (!approximation_percent.empty()) {
+        double fraction = 0.0;
+        std::string parse_error;
+        if (!csgify::parse_approximation_percent(
+                approximation_percent, &fraction, &parse_error)) {
+            std::cerr << "error invalid_approximation_percent: "
+                      << parse_error << '\n';
+            return EXIT_FAILURE;
+        }
+        options.approximation.enabled = true;
+        options.approximation.max_global_changed_volume_fraction = fraction;
+        options.approximation.max_body_changed_volume_fraction = fraction;
+        options.approximation.max_action_changed_volume_fraction = fraction;
+        options.approximation.max_global_added_volume_fraction = fraction;
+        options.approximation.max_global_removed_volume_fraction = fraction;
+        options.approximation.max_body_added_volume_fraction = fraction;
+        options.approximation.max_body_removed_volume_fraction = fraction;
+        options.approximation.require_containment_preservation =
+            !allow_containment_change;
+        options.approximation.require_topology_preservation =
+            !allow_topology_change;
+        options.approximation.protected_target_ids = protected_targets;
+        options.approximation.protected_material_ids = protected_materials;
+        if (has_max_deviation)
+            options.approximation.max_surface_deviation = max_deviation;
+        auto override_percent = [&](const std::string& text,
+                                    const char* name,
+                                    double* destination) {
+            if (text.empty()) return true;
+            std::string override_error;
+            if (!csgify::parse_approximation_percent(
+                    text, destination, &override_error)) {
+                std::cerr << "error invalid_approximation_percent " << name
+                          << ": " << override_error << '\n';
+                return false;
+            }
+            return true;
+        };
+        if (!override_percent(approximation_body_percent,
+                              "--approx-body-volume",
+                              &options.approximation.max_body_changed_volume_fraction)
+            || !override_percent(approximation_action_percent,
+                                 "--approx-action-volume",
+                                 &options.approximation.max_action_changed_volume_fraction)
+            || !override_percent(approximation_added_percent,
+                                 "--approx-added-volume",
+                                 &options.approximation.max_global_added_volume_fraction)
+            || !override_percent(approximation_removed_percent,
+                                 "--approx-removed-volume",
+                                 &options.approximation.max_global_removed_volume_fraction)) {
+            return EXIT_FAILURE;
+        }
+        if (!approximation_added_percent.empty())
+            options.approximation.max_body_added_volume_fraction =
+                options.approximation.max_global_added_volume_fraction;
+        if (!approximation_removed_percent.empty())
+            options.approximation.max_body_removed_volume_fraction =
+                options.approximation.max_global_removed_volume_fraction;
+    }
     csgify::SessionPtr session = csgify::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -1439,7 +3144,29 @@ int run_simplify_command(int argc, char** argv) {
     csgify::ReplacementOperation operation;
     csgify::CommandResult action_result;
     if (operation_from_action(action, &operation)) {
-        if (has_volume_limits) {
+        if (options.approximation.enabled && has_volume_limits) {
+            std::cerr << "error approximation_limit_conflict: use either "
+                         "--approx-volume or legacy --max-*-delta limits\n";
+            return EXIT_FAILURE;
+        }
+        if (options.approximation.enabled) {
+            csgify::ApproximationPolicy policy = options.approximation;
+            if (operation == csgify::ReplacementOperation::bbox
+                || operation == csgify::ReplacementOperation::bbox_cylinder)
+                policy.allow_bbox_replacement = true;
+            else
+                policy.allow_surface_replacement = true;
+            const csgify::ApproximationCommandResult replacement =
+                csgify::apply_budgeted_replacement_operation(
+                    *session, target_id, operation, policy,
+                    csgify::ReportIdMode::local);
+            action_result = replacement.command;
+            if (!action_result.ok) {
+                std::cerr << "error " << replacement.budget.code << ": "
+                          << replacement.budget.message << '\n';
+                return EXIT_FAILURE;
+            }
+        } else if (has_volume_limits) {
             csgify::ReplacementCommandResult replacement =
                 csgify::apply_checked_replacement_operation(
                     *session,
@@ -1519,8 +3246,53 @@ int run_simplify_command(int argc, char** argv) {
                       << "apply to replacement commands, not remove-solid\n";
             return EXIT_FAILURE;
         }
-        action_result = csgify::remove_solid(
-            *session, target_id, csgify::ReportIdMode::local);
+        if (options.approximation.enabled) {
+            csgify::ApproximationPolicy policy = options.approximation;
+            policy.allow_sliver_removal = true;
+            const csgify::ApproximationCommandResult removed =
+                csgify::remove_residual_with_approximation(
+                    *session, target_id, policy,
+                    csgify::ReportIdMode::local);
+            action_result = removed.command;
+            if (!action_result.ok) {
+                std::cerr << "error " << removed.budget.code << ": "
+                          << removed.budget.message << '\n';
+                return EXIT_FAILURE;
+            }
+        } else {
+            action_result = csgify::remove_solid(
+                *session, target_id, csgify::ReportIdMode::local);
+        }
+    } else if (action == "--resolve-overlap") {
+        if (has_volume_limits) {
+            std::cerr << "error replacement_limit_not_applicable: overlap "
+                         "ownership requires --approx-volume\n";
+            return EXIT_FAILURE;
+        }
+        if (!options.approximation.enabled) {
+            std::cerr << "error approximation_required: --resolve-overlap "
+                         "requires --approx-volume P%\n";
+            return EXIT_FAILURE;
+        }
+        if (overlap_owner_id.empty()) {
+            std::cerr << "error missing_overlap_owner: --resolve-overlap "
+                         "requires --owner shape-id\n";
+            return EXIT_FAILURE;
+        }
+        csgify::ApproximationPolicy policy = options.approximation;
+        policy.allow_overlap_resolution = true;
+        const csgify::ApproximationCommandResult resolved =
+            csgify::resolve_overlap_with_approximation(
+                *session, target_id, overlap_owner_id, policy,
+                csgify::ReportIdMode::local);
+        action_result = resolved.command;
+        if (!action_result.ok) {
+            std::cerr << "error " << resolved.budget.code << ": "
+                      << resolved.budget.message << '\n';
+            if (!report_path.empty())
+                write_report_or_stdout(action_result.report, report_path);
+            return EXIT_FAILURE;
+        }
     } else if (action == "--fill-hole") {
         if (has_volume_limits) {
             std::cerr << "error replacement_limit_not_applicable: volume delta limits "
@@ -1565,12 +3337,27 @@ int run_simplify_command(int argc, char** argv) {
             std::cerr << "error invalid_max_depth: --max-depth must be non-negative\n";
             return EXIT_FAILURE;
         }
-        action_result = csgify::shatter(
-            *session,
-            target_id,
-            static_cast<int>(max_depth_value),
-            allow_shatter_volume_drift,
-            csgify::ReportIdMode::local);
+        if (options.approximation.enabled) {
+            csgify::ApproximationPolicy policy = options.approximation;
+            policy.allow_numerical_shatter_loss = true;
+            const csgify::ApproximationCommandResult shattered =
+                csgify::shatter_with_approximation(
+                    *session, target_id, static_cast<int>(max_depth_value),
+                    policy, csgify::ReportIdMode::local);
+            action_result = shattered.command;
+            if (!action_result.ok) {
+                std::cerr << "error " << shattered.budget.code << ": "
+                          << shattered.budget.message << '\n';
+                return EXIT_FAILURE;
+            }
+        } else {
+            action_result = csgify::shatter(
+                *session,
+                target_id,
+                static_cast<int>(max_depth_value),
+                allow_shatter_volume_drift,
+                csgify::ReportIdMode::local);
+        }
     } else if (action == "--decompose-by-face") {
         if (has_volume_limits) {
             std::cerr << "error replacement_limit_not_applicable: volume delta limits "
@@ -1624,11 +3411,24 @@ int run_simplify_command(int argc, char** argv) {
             std::cerr << "error missing_candidate: --apply-surface-candidate requires --candidate candidate:N\n";
             return EXIT_FAILURE;
         }
-        action_result = csgify::apply_surface_replacement_candidate(
-            *session,
-            target_id,
-            candidate_id,
-            csgify::ReportIdMode::local);
+        if (options.approximation.enabled) {
+            csgify::ApproximationPolicy policy = options.approximation;
+            policy.allow_surface_replacement = true;
+            const csgify::ApproximationCommandResult replaced =
+                csgify::apply_budgeted_surface_replacement_candidate(
+                    *session, target_id, candidate_id, policy,
+                    csgify::ReportIdMode::local);
+            action_result = replaced.command;
+            if (!action_result.ok) {
+                std::cerr << "error " << replaced.budget.code << ": "
+                          << replaced.budget.message << '\n';
+                return EXIT_FAILURE;
+            }
+        } else {
+            action_result = csgify::apply_surface_replacement_candidate(
+                *session, target_id, candidate_id,
+                csgify::ReportIdMode::local);
+        }
     } else {
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -1785,18 +3585,28 @@ int run_inspect_command(int argc, char** argv) {
     const std::string input_path = argv[2];
     std::string report_path;
     std::string log_path;
+    std::string project_path;
+    std::string progress_json_path;
     std::string units_override;
     std::string normalize_to;
     double scale_override = 0.0;
     bool disable_overlap_check = false;
     bool allow_overlaps = false;
+    std::vector<std::string> analysis_targets;
 
     OptScanner scan(argc, argv, 3);
     while (!scan.done()) {
         if (scan.take_string("--report", &report_path)) continue;
         if (scan.take_string("--log", &log_path)) continue;
+        if (scan.take_string("--project", &project_path)) continue;
+        if (scan.take_string("--progress-json", &progress_json_path)) continue;
         if (scan.take_string("--units", &units_override)) continue;
         if (scan.take_string("--normalize-units", &normalize_to)) continue;
+        std::string target_id;
+        if (scan.take_string("--target", &target_id)) {
+            analysis_targets.push_back(target_id);
+            continue;
+        }
         if (scan.take_double("--scale", &scale_override)) continue;
         if (scan.take_flag("--no-overlap-check")) { disable_overlap_check = true; continue; }
         if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
@@ -1812,6 +3622,8 @@ int run_inspect_command(int argc, char** argv) {
     options.unit_override = units_override;
     options.normalize_to_unit = normalize_to;
     options.unit_scale_to_mm_override = scale_override;
+    options.analysis_target_ids = analysis_targets;
+    if (!analysis_targets.empty()) options.check_overlaps = false;
     if (disable_overlap_check) options.check_overlaps = false;
     if (allow_overlaps) options.allow_overlaps = true;
     csgify::SessionPtr session = csgify::create_session(options);
@@ -1824,8 +3636,32 @@ int run_inspect_command(int argc, char** argv) {
         }
     }
     const csgify::DocumentId document_id = csgify::load_step(*session, input_path);
+    std::ofstream progress_file;
+    std::ostream* progress_out = nullptr;
+    if (!progress_json_path.empty()) {
+        if (progress_json_path == "-") {
+            progress_out = &std::cout;
+        } else {
+            progress_file.open(progress_json_path, std::ios::trunc);
+            if (!progress_file) {
+                std::cerr << "error progress_json_open_failed: "
+                          << progress_json_path << '\n';
+                return EXIT_FAILURE;
+            }
+            progress_out = &progress_file;
+        }
+    }
+    const csgify::JobProgressCallback progress = progress_out
+        ? csgify::JobProgressCallback([progress_out](
+              const csgify::JobProgressEvent& event) {
+              *progress_out << csgify::job_progress_event_json(event) << '\n';
+              progress_out->flush();
+              return static_cast<bool>(*progress_out);
+          })
+        : csgify::JobProgressCallback{};
     csgify::CommandResult inspect =
-        csgify::analyze(*session, document_id, csgify::ReportIdMode::local);
+        csgify::analyze(*session, document_id,
+                        csgify::ReportIdMode::local, progress);
     csgify::ConversionReport report = inspect.report;
     print_diagnostics(report);
 
@@ -1840,7 +3676,925 @@ int run_inspect_command(int argc, char** argv) {
             return EXIT_FAILURE;
         }
     }
+    if (!project_path.empty()) {
+        std::string project_error;
+        csgify::ProjectStore project(project_path);
+        const csgify::ProjectSnapshot snapshot =
+            csgify::project_snapshot_from_report(report);
+        if (!project.open(&project_error)
+            || !project.persist_snapshot(snapshot, &project_error)
+            || !project.replace_spatial_entries(
+                snapshot.source_digest,
+                csgify::spatial_entries_from_report(report),
+                &project_error)) {
+            std::cerr << "error project_persist_failed: " << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        csgify::DefinitionCacheSyncResult cache_sync;
+        if (!project.sync_definition_recognition_cache(
+                report, options, &cache_sync, &project_error)) {
+            std::cerr << "error definition_cache_sync_failed: "
+                      << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        std::cerr << "Definition recognition cache: " << cache_sync.hits
+                  << " hit(s), " << cache_sync.misses << " miss(es), "
+                  << cache_sync.published << " published, "
+                  << cache_sync.skipped_unverified << " skipped.\n";
+        if (!report_path.empty() && report_path != "-") {
+            csgify::ArtifactRecord artifact;
+            if (!project.artifacts().publish_file(
+                    "inspection-report", "json", report_path,
+                    &artifact, &project_error)
+                || !project.record_artifact(artifact, &project_error)) {
+                std::cerr << "error project_artifact_failed: "
+                          << project_error << '\n';
+                return EXIT_FAILURE;
+            }
+        }
+    }
     return report.ok() ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int run_handoff_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) {
+        return print_verb_help_and_exit(argv[0], "handoff");
+    }
+    if (argc < 3) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    std::string output_path;
+    std::string project_path;
+    std::string report_path;
+    OptScanner scan(argc, argv, 3);
+    while (!scan.done()) {
+        if (scan.take_string("--out", &output_path)) continue;
+        if (scan.take_string("--project", &project_path)) continue;
+        if (scan.take_string("--report", &report_path)) continue;
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        return EXIT_FAILURE;
+    }
+    if (output_path.empty()) {
+        std::cerr << "error handoff_output_required: use --out PATH|-\n";
+        return EXIT_FAILURE;
+    }
+
+    std::cerr << "stage alea_handoff_load_and_convert: started\n";
+    csgify::ConversionOptions options;
+    csgify::ConversionResult conversion =
+        csgify::convert_step_file(input_path, options);
+    if (!project_path.empty()) {
+        csgify::ProjectStore project(project_path);
+        csgify::ArtifactRecord geometry_artifact;
+        csgify::ArtifactRecord manifest_artifact;
+        std::string project_error;
+        if (!project.open(&project_error)) {
+            std::cerr << "error alea_handoff_project_open_failed: "
+                      << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        const std::filesystem::path temporary_geometry =
+            project.artifacts().root() / "tmp" /
+            ("alea-handoff-" + std::to_string(
+                static_cast<unsigned long long>(
+                    std::chrono::steady_clock::now().time_since_epoch().count()))
+             + ".i");
+        const bool geometry_exported =
+            csgify::export_mcnp(conversion.system.get(),
+                                temporary_geometry.string()) == 0;
+        const bool geometry_published = geometry_exported
+            && project.artifacts().publish_file(
+                "alea_geometry_mcnp", "i", temporary_geometry,
+                &geometry_artifact, &project_error)
+            && project.record_artifact(geometry_artifact, &project_error)
+            && csgify::add_alea_handoff_chunk(
+                conversion.handoff, geometry_artifact, &project_error);
+        std::remove(temporary_geometry.string().c_str());
+        if (!geometry_published
+            || !csgify::publish_alea_handoff_manifest(
+                project.artifacts(), conversion.handoff, &manifest_artifact,
+                &project_error)
+            || !project.record_artifact(manifest_artifact, &project_error)) {
+            std::cerr << "error alea_handoff_project_publish_failed: "
+                      << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        conversion.report.alea_handoff.contract_digest =
+            conversion.handoff.contract_digest;
+        conversion.report.alea_handoff.chunk_count =
+            conversion.handoff.chunks.size();
+        std::cerr << "stage alea_handoff_project_publish: completed manifest="
+                  << manifest_artifact.digest << ", geometry="
+                  << geometry_artifact.digest << '\n';
+    }
+    std::string validation_error;
+    const bool valid = csgify::validate_alea_handoff_manifest(
+        conversion.handoff, &validation_error);
+    if (!valid) {
+        std::cerr << "error alea_handoff_invalid: " << validation_error << '\n';
+    }
+    const std::string serialized =
+        csgify::serialize_alea_handoff_manifest(conversion.handoff);
+    if (output_path == "-") {
+        std::cout << serialized;
+    } else {
+        std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+        output << serialized;
+        if (!output) {
+            std::cerr << "error alea_handoff_write_failed: " << output_path
+                      << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+    if (!report_path.empty()
+        && write_report_or_stdout(conversion.report, report_path) != 0) {
+        std::cerr << "error report_write_failed: " << report_path << '\n';
+        return EXIT_FAILURE;
+    }
+    std::cerr << "stage alea_handoff: completed cells="
+              << conversion.handoff.cells.size()
+              << ", surfaces=" << conversion.handoff.surfaces.size()
+              << ", universes=" << conversion.handoff.universes.size()
+              << ", sidecar_entities=" << conversion.handoff.sidecar.size()
+              << ", contract_digest=" << conversion.handoff.contract_digest
+              << '\n';
+    return valid && conversion.report.ok() ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int run_voids_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) {
+        return print_verb_help_and_exit(argv[0], "voids");
+    }
+    if (argc < 3) {
+        usage(argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string input_path = argv[2];
+    std::string output_path;
+    std::string mcnp_path;
+    std::string project_path;
+    std::string domain_id = "domain:modeled";
+    std::string bounds_text;
+    double margin = 0.05;
+    std::size_t max_depth = 8;
+    std::size_t workers = 0;
+    std::size_t scratch_bytes = 512ULL * 1024ULL * 1024ULL;
+    std::size_t samples = 7;
+    double min_size = 0.0;
+    bool merge = true;
+    bool graveyard = true;
+    bool open_review = false;
+    OptScanner scan(argc, argv, 3);
+    while (!scan.done()) {
+        if (scan.take_string("--out", &output_path)) continue;
+        if (scan.take_string("--out-mcnp", &mcnp_path)) continue;
+        if (scan.take_string("--project", &project_path)) continue;
+        if (scan.take_string("--domain-id", &domain_id)) continue;
+        if (scan.take_string("--bounds", &bounds_text)) continue;
+        if (scan.take_double("--margin", &margin)) continue;
+        if (scan.take_size("--max-depth", &max_depth)) continue;
+        if (scan.take_double("--min-size", &min_size)) continue;
+        if (scan.take_size("--workers", &workers)) continue;
+        if (scan.take_size("--scratch-bytes", &scratch_bytes)) continue;
+        if (scan.take_size("--samples", &samples)) continue;
+        if (scan.take_flag("--no-merge")) { merge = false; continue; }
+        if (scan.take_flag("--no-graveyard")) { graveyard = false; continue; }
+        if (scan.take_flag("--review")) { open_review = true; continue; }
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        return EXIT_FAILURE;
+    }
+    if (output_path.empty()) {
+        std::cerr << "error coverage_output_required: use --out PATH|-\n";
+        return EXIT_FAILURE;
+    }
+    if (margin < 0.0 || max_depth > static_cast<std::size_t>(
+            std::numeric_limits<int>::max())
+        || samples > 1000) {
+        std::cerr << "error invalid_void_policy: invalid margin, depth, workers, or samples\n";
+        return EXIT_FAILURE;
+    }
+
+    csgify::AleaVoidPolicy policy;
+    policy.max_depth = static_cast<int>(max_depth);
+    policy.min_size = min_size;
+    policy.requested_workers = workers;
+    policy.max_parallel_scratch_bytes = scratch_bytes;
+    policy.coverage_samples_per_axis = samples;
+    policy.merge = merge;
+    policy.add_graveyard = graveyard;
+
+    std::cerr << "stage alea_void_load_and_convert: started\n";
+    csgify::ConversionOptions conversion_options;
+    csgify::CadModel source_model =
+        csgify::load_step_model(input_path, conversion_options);
+    csgify::ConversionReport source_analysis =
+        csgify::analyze_model(source_model, conversion_options);
+    csgify::ConversionResult conversion =
+        csgify::convert_model(source_model, conversion_options);
+    if (conversion.report.solids_seen == 0
+        || conversion.report.solids_converted
+               != conversion.report.solids_seen) {
+        std::cerr << "error alea_void_input_not_emit_ready: converted "
+                  << conversion.report.solids_converted << '/'
+                  << conversion.report.solids_seen
+                  << " solids; simplify/decompose the STEP before void generation\n";
+        return EXIT_FAILURE;
+    }
+    csgify::AleaVoidDomain domain =
+        csgify::default_alea_void_domain(source_analysis, margin);
+    if (!domain.bounds.valid) {
+        domain = csgify::default_alea_void_domain(conversion.handoff, margin);
+    }
+    domain.domain_id = domain_id;
+    if (!bounds_text.empty()) {
+        std::replace(bounds_text.begin(), bounds_text.end(), ',', ' ');
+        std::istringstream values(bounds_text);
+        double trailing = 0.0;
+        if (!(values >> domain.bounds.xmin >> domain.bounds.ymin
+                    >> domain.bounds.zmin >> domain.bounds.xmax
+                    >> domain.bounds.ymax >> domain.bounds.zmax)
+            || (values >> trailing)
+            || !(domain.bounds.xmin < domain.bounds.xmax)
+            || !(domain.bounds.ymin < domain.bounds.ymax)
+            || !(domain.bounds.zmin < domain.bounds.zmax)) {
+            std::cerr << "error alea_void_bounds_invalid: expected finite "
+                         "xmin,ymin,zmin,xmax,ymax,zmax\n";
+            return EXIT_FAILURE;
+        }
+        domain.bounds.valid = std::isfinite(domain.bounds.xmin)
+            && std::isfinite(domain.bounds.ymin)
+            && std::isfinite(domain.bounds.zmin)
+            && std::isfinite(domain.bounds.xmax)
+            && std::isfinite(domain.bounds.ymax)
+            && std::isfinite(domain.bounds.zmax);
+    }
+    if (!domain.bounds.valid) {
+        std::cerr << "error alea_void_domain_missing: no finite analyzed solid bounds\n";
+        return EXIT_FAILURE;
+    }
+    const std::string domain_digest = csgify::alea_void_domain_digest(domain);
+    const std::string policy_digest = csgify::alea_void_policy_digest(policy);
+    const std::string cache_key = "alea-void-v1:" +
+        conversion.handoff.contract_digest + ":" + domain_digest + ":" +
+        policy_digest;
+
+    std::unique_ptr<csgify::ProjectStore> project;
+    std::optional<csgify::ClaimedProjectJob> claimed;
+    std::string project_error;
+    if (!project_path.empty()) {
+        project = std::make_unique<csgify::ProjectStore>(project_path);
+        if (!project->open(&project_error)) {
+            std::cerr << "error alea_void_project_open_failed: "
+                      << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        const auto cached = project->find_conversion_cache(cache_key, &project_error);
+        if (!project_error.empty()) {
+            std::cerr << "error alea_void_cache_query_failed: "
+                      << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        if (cached && project->artifacts().validate(cached->artifact, &project_error)) {
+            const auto certificate_artifact = project->find_artifact(
+                cached->certificate_digest, "alea_coverage_certificate",
+                &project_error);
+            if (certificate_artifact
+                && project->artifacts().validate(*certificate_artifact, &project_error)) {
+                const std::filesystem::path certificate_source =
+                    project->artifacts().absolute_path(*certificate_artifact);
+                std::ifstream input(certificate_source, std::ios::binary);
+                const std::string certificate_text(
+                    (std::istreambuf_iterator<char>(input)),
+                    std::istreambuf_iterator<char>());
+                if (!input && certificate_text.empty()) {
+                    std::cerr << "error alea_void_cached_certificate_read_failed\n";
+                    return EXIT_FAILURE;
+                }
+                if (output_path == "-") {
+                    std::cout << certificate_text;
+                } else {
+                    std::filesystem::copy_file(
+                        certificate_source, output_path,
+                        std::filesystem::copy_options::overwrite_existing);
+                }
+                if (!mcnp_path.empty()) {
+                    std::filesystem::copy_file(
+                        project->artifacts().absolute_path(cached->artifact),
+                        mcnp_path,
+                        std::filesystem::copy_options::overwrite_existing);
+                }
+                const bool certified = certificate_text.find(
+                    "\"status\": \"certified\"") != std::string::npos;
+                std::cerr << "stage alea_void_resume: reused certificate="
+                          << cached->certificate_digest << ", geometry="
+                          << cached->artifact.digest << '\n';
+                if (open_review) {
+#if CSGIFY_HAVE_QT6_VIEWER
+                    const csgify::AleaCoverageCertificate parsed =
+                        csgify::parse_alea_coverage_certificate_json(
+                            certificate_text);
+                    const int review_result = csgify::run_qt_coverage_review(
+                        parsed, certificate_source.string());
+                    if (review_result != 0) return review_result;
+#else
+                    std::cerr << "error viewer_not_built: use `csgify coverage status`\n";
+                    return EXIT_FAILURE;
+#endif
+                }
+                return certified ? EXIT_SUCCESS : EXIT_FAILURE;
+            }
+        }
+        project_error.clear();
+        csgify::ProjectJobSpec job;
+        job.job_id = cache_key;
+        job.target_id = domain.domain_id;
+        job.operation = "alea_void_generate_v1";
+        job.input_digest = conversion.handoff.contract_digest;
+        job.policy_digest = policy_digest;
+        job.max_attempts = 2;
+        job.limits.memory_bytes = scratch_bytes;
+        if (!project->enqueue_job(job, {}, &project_error)) {
+            std::cerr << "error alea_void_job_enqueue_failed: "
+                      << project_error << '\n';
+            return EXIT_FAILURE;
+        }
+        claimed = project->claim_next_job(
+            "csgify-void-cli",
+            static_cast<std::int64_t>(std::time(nullptr)), &project_error);
+        if (!claimed || claimed->spec.job_id != job.job_id) {
+            std::cerr << "error alea_void_job_claim_failed: "
+                      << (project_error.empty() ? "job unavailable" : project_error)
+                      << '\n';
+            return EXIT_FAILURE;
+        }
+    }
+
+    const auto project_run_start = std::chrono::steady_clock::now();
+    std::unique_ptr<csgify::ProjectJobProgressSink> project_progress;
+    if (project && claimed) {
+        project_progress = std::make_unique<csgify::ProjectJobProgressSink>(
+            *project, *claimed);
+        if (!project_progress->ready()) {
+            std::cerr << "error alea_void_progress_sink_failed: "
+                      << project_progress->last_error() << '\n';
+            std::string ignored;
+            project->fail_job(claimed->spec.job_id, claimed->worker_id,
+                              "progress_sink_failed",
+                              project_progress->last_error(), true,
+                              static_cast<std::int64_t>(std::time(nullptr)),
+                              &ignored);
+            return EXIT_FAILURE;
+        }
+    }
+    const auto project_event = [&](csgify::JobPhase phase,
+                                   const std::string& code,
+                                   csgify::JobOutcome outcome =
+                                       csgify::JobOutcome::none,
+                                   const std::string& artifact_digest = {}) {
+        if (!project_progress) return true;
+        csgify::JobProgressEvent event;
+        event.operation = csgify::JobOperation::alea_void_generation;
+        event.phase = phase;
+        event.outcome = outcome;
+        event.message_code = code;
+        event.target_id = domain.domain_id;
+        event.elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - project_run_start).count();
+        event.artifact_id = artifact_digest;
+        return project_progress->consume(event, artifact_digest);
+    };
+    const auto fail_project_job = [&](const std::string& code,
+                                      const std::string& message,
+                                      bool retryable) {
+        if (!project || !claimed) return;
+        if (project_progress && !project_progress->terminal_seen()) {
+            project_event(csgify::JobPhase::finished, code,
+                          code == "job_cancelled"
+                              ? csgify::JobOutcome::cancelled
+                              : csgify::JobOutcome::failed);
+        }
+        std::string ignored;
+        project->fail_job(claimed->spec.job_id, claimed->worker_id,
+                          code, message, retryable,
+                          static_cast<std::int64_t>(std::time(nullptr)),
+                          &ignored);
+    };
+
+    if (!project_event(csgify::JobPhase::certifying_solids,
+                       "alea_void_generation_started")) {
+        const bool cancelled = project_progress
+            && project_progress->cancellation_seen();
+        fail_project_job(cancelled ? "job_cancelled" : "progress_sink_failed",
+                         cancelled ? "Cancellation requested before void generation"
+                                   : project_progress->last_error(),
+                         !cancelled);
+        return EXIT_FAILURE;
+    }
+
+    std::cerr << "stage alea_void_generate: started domain=" << domain.domain_id
+              << ", max_depth=" << policy.max_depth
+              << ", workers=" << policy.requested_workers
+              << ", scratch_bytes=" << policy.max_parallel_scratch_bytes << '\n';
+    csgify::AleaCoverageCertificate certificate;
+    std::string void_error;
+    std::mutex project_monitor_mutex;
+    std::condition_variable project_monitor_cv;
+    bool project_monitor_done = false;
+    std::atomic_bool project_monitor_cancelled{false};
+    std::atomic_bool project_monitor_failed{false};
+    std::string project_monitor_error;
+    std::thread project_monitor;
+    if (project && claimed) {
+        const std::filesystem::path monitor_root = project->root();
+        const std::string monitor_job_id = claimed->spec.job_id;
+        const std::string monitor_worker_id = claimed->worker_id;
+        project_monitor = std::thread([&, monitor_root, monitor_job_id,
+                                       monitor_worker_id]() {
+            csgify::ProjectStore monitor_store(monitor_root);
+            std::string monitor_error;
+            if (!monitor_store.open(&monitor_error)) {
+                project_monitor_error = monitor_error;
+                project_monitor_failed.store(true);
+                return;
+            }
+            std::unique_lock<std::mutex> lock(project_monitor_mutex);
+            while (!project_monitor_cv.wait_for(
+                lock, std::chrono::seconds(5),
+                [&]() { return project_monitor_done; })) {
+                lock.unlock();
+                const auto timestamp =
+                    static_cast<std::int64_t>(std::time(nullptr));
+                bool cancelled = false;
+                if (!monitor_store.heartbeat_job(
+                        monitor_job_id, monitor_worker_id, timestamp,
+                        &monitor_error)
+                    || !monitor_store.job_cancellation_requested(
+                        monitor_job_id, monitor_worker_id, &cancelled,
+                        &monitor_error)) {
+                    project_monitor_error = monitor_error;
+                    project_monitor_failed.store(true);
+                    return;
+                }
+                if (cancelled) project_monitor_cancelled.store(true);
+                lock.lock();
+            }
+        });
+    }
+    const bool generated = csgify::generate_alea_domain_voids(
+            conversion.system.get(), source_analysis, conversion.handoff,
+            domain, policy, &certificate, &void_error);
+    {
+        std::lock_guard<std::mutex> lock(project_monitor_mutex);
+        project_monitor_done = true;
+    }
+    project_monitor_cv.notify_one();
+    if (project_monitor.joinable()) project_monitor.join();
+    if (project_monitor_failed.load()) {
+        fail_project_job("project_heartbeat_failed", project_monitor_error, true);
+        std::cerr << "error project_heartbeat_failed: "
+                  << project_monitor_error << '\n';
+        return EXIT_FAILURE;
+    }
+    if (project_monitor_cancelled.load()) {
+        fail_project_job("job_cancelled",
+                         "Cancellation requested during void generation",
+                         false);
+        std::cerr << "error job_cancelled: void generation result discarded\n";
+        return EXIT_FAILURE;
+    }
+    if (!generated) {
+        fail_project_job("alea_void_generation_failed", void_error, true);
+        std::cerr << "error alea_void_generation_failed: " << void_error << '\n';
+        return EXIT_FAILURE;
+    }
+    if (!project_event(csgify::JobPhase::terminal_verification,
+                       "alea_void_validating_certificate")) {
+        const bool cancelled = project_progress
+            && project_progress->cancellation_seen();
+        fail_project_job(cancelled ? "job_cancelled" : "progress_sink_failed",
+                         cancelled ? "Cancellation requested after void generation"
+                                   : project_progress->last_error(),
+                         !cancelled);
+        return EXIT_FAILURE;
+    }
+    std::string validation_error;
+    if (!csgify::validate_alea_coverage_certificate(
+            certificate, &validation_error)) {
+        std::cerr << "error alea_coverage_certificate_invalid: "
+                  << validation_error << '\n';
+        fail_project_job("alea_coverage_certificate_invalid",
+                         validation_error, false);
+        return EXIT_FAILURE;
+    }
+    const std::string certificate_text =
+        csgify::serialize_alea_coverage_certificate(certificate);
+    if (output_path == "-") {
+        std::cout << certificate_text;
+    } else {
+        std::ofstream output(output_path, std::ios::binary | std::ios::trunc);
+        output << certificate_text;
+        if (!output) {
+            std::cerr << "error alea_coverage_write_failed: " << output_path << '\n';
+            fail_project_job("alea_coverage_write_failed",
+                             "Could not write " + output_path, true);
+            return EXIT_FAILURE;
+        }
+    }
+    if (!mcnp_path.empty()
+        && csgify::export_mcnp(conversion.system.get(), mcnp_path) != 0) {
+        std::cerr << "error alea_void_mcnp_export_failed: " << alea_error() << '\n';
+        fail_project_job("alea_void_mcnp_export_failed", alea_error(), true);
+        return EXIT_FAILURE;
+    }
+
+    if (project && claimed) {
+        if (!project_event(csgify::JobPhase::committing,
+                           "alea_void_publishing_artifacts")) {
+            const bool cancelled = project_progress->cancellation_seen();
+            fail_project_job(cancelled ? "job_cancelled" : "progress_sink_failed",
+                             cancelled ? "Cancellation requested before artifact publication"
+                                       : project_progress->last_error(),
+                             !cancelled);
+            return EXIT_FAILURE;
+        }
+        const std::filesystem::path temporary_geometry =
+            project->artifacts().root() / "tmp" /
+            ("alea-void-" + std::to_string(
+                static_cast<unsigned long long>(
+                    std::chrono::steady_clock::now().time_since_epoch().count()))
+             + ".i");
+        csgify::ArtifactRecord geometry_artifact;
+        csgify::ArtifactRecord certificate_artifact;
+        const bool published =
+            csgify::export_mcnp(conversion.system.get(),
+                                temporary_geometry.string()) == 0
+            && project->artifacts().publish_file(
+                "alea_void_geometry_mcnp", "i", temporary_geometry,
+                &geometry_artifact, &project_error)
+            && project->record_artifact(geometry_artifact, &project_error)
+            && csgify::publish_alea_coverage_certificate(
+                project->artifacts(), certificate, &certificate_artifact,
+                &project_error)
+            && project->record_artifact(certificate_artifact, &project_error);
+        std::remove(temporary_geometry.string().c_str());
+        if (!published) {
+            std::cerr << "error alea_void_project_publish_failed: "
+                      << project_error << '\n';
+            fail_project_job("alea_void_project_publish_failed",
+                             project_error, true);
+            return EXIT_FAILURE;
+        }
+        csgify::JobProgressEvent terminal_event;
+        terminal_event.operation = csgify::JobOperation::alea_void_generation;
+        terminal_event.phase = csgify::JobPhase::finished;
+        terminal_event.outcome = csgify::JobOutcome::committed;
+        terminal_event.message_code = "alea_void_generation_finished";
+        terminal_event.target_id = domain.domain_id;
+        terminal_event.elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - project_run_start).count();
+        if (!project_progress->complete(
+                terminal_event, geometry_artifact,
+                certificate_artifact.digest)) {
+            project_error = project_progress->last_error();
+            std::cerr << "error alea_void_project_checkpoint_failed: "
+                      << project_error << '\n';
+            const bool cancelled = project_progress->cancellation_seen();
+            fail_project_job(cancelled ? "job_cancelled"
+                                       : "alea_void_project_checkpoint_failed",
+                             cancelled ? "Cancellation won the final commit race"
+                                       : project_error,
+                             !cancelled);
+            return EXIT_FAILURE;
+        }
+        csgify::ConversionCacheEntry cache;
+        cache.cache_key = cache_key;
+        cache.geometry_digest = conversion.handoff.contract_digest;
+        cache.policy_digest = policy_digest;
+        cache.artifact = geometry_artifact;
+        cache.certificate_digest = certificate_artifact.digest;
+        if (!project->record_conversion_cache(cache, &project_error)) {
+            std::cerr << "warning alea_void_cache_checkpoint_failed: "
+                      << project_error << '\n';
+        }
+        std::cerr << "stage alea_void_checkpoint: completed certificate="
+                  << certificate_artifact.digest << ", geometry="
+                  << geometry_artifact.digest << '\n';
+    }
+    std::cerr << "stage alea_void_generate: completed status="
+              << csgify::alea_coverage_status_name(certificate.status)
+              << ", void_cells=" << certificate.intentional_void_cell_count
+              << ", coverage_samples=" << certificate.coverage.sample_count
+              << ", workers=" << certificate.execution.actual_workers << '\n';
+    if (open_review) {
+#if CSGIFY_HAVE_QT6_VIEWER
+        const int review_result = csgify::run_qt_coverage_review(
+            certificate, output_path == "-" ? std::string("generated certificate")
+                                             : output_path);
+        if (review_result != 0) return review_result;
+#else
+        std::cerr << "error viewer_not_built: use `csgify coverage status`\n";
+        return EXIT_FAILURE;
+#endif
+    }
+    return certificate.status == csgify::AleaCoverageCertificateStatus::certified
+        ? EXIT_SUCCESS : EXIT_FAILURE;
+}
+
+int run_project_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) return print_verb_help_and_exit(argv[0], "project");
+    if (argc >= 3 && std::string(argv[2]) == "review"
+        && (argc == 3 || (argc == 4 && std::string(argv[3]) == "--smoke-test"))) {
+#if CSGIFY_HAVE_QT6_VIEWER
+        return csgify::run_qt_project_launcher(argc == 4);
+#else
+        std::cerr << "error qt_viewer_not_built: project review requires Qt 6 Widgets\n";
+        return EXIT_FAILURE;
+#endif
+    }
+    if (argc < 4) {
+        std::cerr << "error project_usage: expected init|status|events|cancel DIR or review [DIR]\n";
+        return EXIT_FAILURE;
+    }
+    const std::string action = argv[2];
+    const std::string project_path = argv[3];
+    std::string source_path;
+    std::string coverage_path;
+    std::string queue_path;
+    std::size_t limit = 20;
+    std::size_t after_sequence = 0;
+    std::string job_id;
+    bool smoke_test = false;
+    OptScanner scan(argc, argv, 4);
+    while (!scan.done()) {
+        if (scan.take_string("--source", &source_path)) continue;
+        if (scan.take_string("--coverage", &coverage_path)) continue;
+        if (scan.take_string("--queue", &queue_path)) continue;
+        if (scan.take_size("--limit", &limit)) continue;
+        if (scan.take_size("--after", &after_sequence)) continue;
+        if (scan.take_string("--job", &job_id)) continue;
+        if (scan.take_flag("--smoke-test")) { smoke_test = true; continue; }
+        std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+        return EXIT_FAILURE;
+    }
+    if (action != "init" && action != "status" && action != "events" && action != "cancel"
+        && action != "review") {
+        std::cerr << "error project_action_invalid: expected init, status, events, cancel, or review\n";
+        return EXIT_FAILURE;
+    }
+    csgify::ProjectStore project(project_path);
+    std::string error;
+    if (action == "init") {
+        if (argc != 4) {
+            std::cerr << "error project_usage: init accepts only DIR\n";
+            return EXIT_FAILURE;
+        }
+        if (!project.open(&error)) {
+            std::cerr << "error project_init_failed: " << error << '\n';
+            return EXIT_FAILURE;
+        }
+        const std::filesystem::path policy_path =
+            project.root() / "project-policy.json";
+        std::error_code policy_error;
+        const bool policy_exists = std::filesystem::exists(
+            policy_path, policy_error);
+        if (policy_error) {
+            std::cerr << "error project_policy_probe_failed: "
+                      << policy_error.message() << '\n';
+            return EXIT_FAILURE;
+        }
+        if (policy_exists) {
+            if (!std::filesystem::is_regular_file(policy_path, policy_error)) {
+                std::cerr << "error project_policy_invalid: expected regular file "
+                          << policy_path.string() << '\n';
+                return EXIT_FAILURE;
+            }
+            try {
+                (void)csgify::read_autonomy_project_policy_json(
+                    policy_path.string());
+            } catch (const std::exception& e) {
+                std::cerr << "error project_policy_invalid: " << e.what()
+                          << '\n';
+                return EXIT_FAILURE;
+            }
+        } else {
+            std::string project_id =
+                project.root().lexically_normal().filename().string();
+            if (project_id.empty()) project_id = "csgify-project";
+            if (csgify::write_default_autonomy_project_policy_json(
+                    policy_path.string(), project_id) != 0) {
+                std::cerr << "error project_policy_create_failed: "
+                          << policy_path.string() << '\n';
+                return EXIT_FAILURE;
+            }
+        }
+        std::cout << "project_initialized " << project.root()
+                  << " schema=" << project.schema_version(&error)
+                  << " policy=" << policy_path.string() << '\n';
+        return error.empty() ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    std::error_code project_path_error;
+    const bool initialized = std::filesystem::is_regular_file(
+        project.database_path(), project_path_error);
+    if (project_path_error || !initialized) {
+        std::cerr << "error project_open_failed: project is not initialized; run `"
+                  << argv[0] << " project init " << project_path << "`\n";
+        return EXIT_FAILURE;
+    }
+    const bool read_only = action == "status" || action == "events";
+    if (!(read_only ? project.open_read_only(&error) : project.open(&error))) {
+        std::cerr << "error project_open_failed: " << error << '\n';
+        return EXIT_FAILURE;
+    }
+    if (action == "events") {
+        if (job_id.empty()) {
+            std::cerr << "error project_job_required: events requires --job JOB_ID\n";
+            return EXIT_FAILURE;
+        }
+        const auto events = project.list_job_events(
+            job_id, static_cast<std::uint64_t>(after_sequence), limit, &error);
+        if (!error.empty()) {
+            std::cerr << "error project_job_events_failed: " << error << '\n';
+            return EXIT_FAILURE;
+        }
+        for (const auto& event : events)
+            std::cout << csgify::job_progress_event_json(event.event) << '\n';
+        return EXIT_SUCCESS;
+    }
+    if (action == "cancel") {
+        if (job_id.empty()) {
+            std::cerr << "error project_job_required: cancel requires --job JOB_ID\n";
+            return EXIT_FAILURE;
+        }
+        const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+        if (!project.request_job_cancellation(job_id, now, &error)) {
+            std::cerr << "error project_job_cancel_failed: " << error << '\n';
+            return EXIT_FAILURE;
+        }
+        std::cout << "cancel_requested " << job_id << '\n';
+        return EXIT_SUCCESS;
+    }
+    if (action == "status") {
+        const csgify::ProjectCounts counts = project.counts(&error);
+        const csgify::ProjectJobCounts jobs = project.job_counts(&error);
+        if (!error.empty()) {
+            std::cerr << "error project_query_failed: " << error << '\n';
+            return EXIT_FAILURE;
+        }
+        std::cout << "Project: " << project.root() << '\n'
+                  << "Schema: " << project.schema_version(&error) << '\n'
+                  << "Assembly: sources=" << counts.sources
+                  << ", definitions=" << counts.component_definitions
+                  << ", instances=" << counts.component_instances
+                  << ", materials=" << counts.materials << '\n'
+                  << "Cache: artifacts=" << counts.artifacts
+                  << ", conversions=" << counts.conversion_cache_entries
+                  << ", spatial=" << counts.spatial_entities
+                  << ", autonomy_requests=" << counts.autonomy_requests << '\n'
+                  << "Jobs: queued=" << jobs.queued << ", running=" << jobs.running
+                  << ", succeeded=" << jobs.succeeded << ", failed=" << jobs.failed
+                  << ", cancelled=" << jobs.cancelled << '\n';
+        for (const auto& source : project.list_sources(limit, 0, &error))
+            std::cout << "source " << source.source_digest << ' ' << source.source_path << '\n';
+        for (const auto& job : project.list_jobs(limit, 0, {}, &error))
+            std::cout << "job " << job.job_id << ' '
+                      << csgify::project_job_state_name(job.state) << ' '
+                      << job.operation << ' ' << job.target_id << " attempt="
+                      << job.attempt << '/' << job.max_attempts
+                      << " phase=" << (job.latest_sequence
+                          ? csgify::job_phase_name(job.latest_phase) : "none")
+                      << " sequence=" << job.latest_sequence
+                      << " progress=" << job.completed << '/'
+                      << (job.total_known ? std::to_string(job.total)
+                                          : std::string("unknown"))
+                      << " heartbeat=" << job.heartbeat_at << '\n';
+        return error.empty() ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+#if CSGIFY_HAVE_QT6_VIEWER
+    return csgify::run_qt_project_workspace(
+        project_path, source_path, coverage_path, queue_path, smoke_test);
+#else
+    std::cerr << "error qt_viewer_not_built: project review requires Qt 6 Widgets\n";
+    return EXIT_FAILURE;
+#endif
+}
+
+int run_coverage_command(int argc, char** argv) {
+    if (wants_help(argc, argv)) {
+        return print_verb_help_and_exit(argv[0], "coverage");
+    }
+    if (argc < 4) {
+        std::cerr << "error coverage_usage: expected status|review|queue coverage.json\n";
+        return EXIT_FAILURE;
+    }
+    const std::string action = argv[2];
+    if (action != "status" && action != "review" && action != "queue") {
+        std::cerr << "error coverage_action_invalid: expected status, review, or queue\n";
+        return EXIT_FAILURE;
+    }
+    if (action != "queue" && argc != 4) {
+        std::cerr << "error coverage_usage: status/review accept only coverage.json\n";
+        return EXIT_FAILURE;
+    }
+    csgify::AleaCoverageCertificate certificate;
+    try {
+        certificate = csgify::read_alea_coverage_certificate_json(argv[3]);
+    } catch (const std::exception& exception) {
+        std::cerr << "error coverage_certificate_invalid: "
+                  << exception.what() << '\n';
+        return EXIT_FAILURE;
+    }
+    const auto findings = csgify::alea_coverage_review_items(certificate);
+    const bool certified = certificate.status
+        == csgify::AleaCoverageCertificateStatus::certified;
+    if (action == "queue") {
+        std::string output_path;
+        std::string source_path;
+        std::string resume_path;
+        OptScanner scan(argc, argv, 4);
+        while (!scan.done()) {
+            if (scan.take_string("--out", &output_path)) continue;
+            if (scan.take_string("--source", &source_path)) continue;
+            if (scan.take_string("--resume", &resume_path)) continue;
+            std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
+            return EXIT_FAILURE;
+        }
+        if (output_path.empty()) {
+            std::cerr << "error coverage_queue_output_required: use --out queue.json|-\n";
+            return EXIT_FAILURE;
+        }
+        csgify::AutonomyQueue queue;
+        if (!resume_path.empty()) {
+            try {
+                queue = csgify::read_autonomy_queue_json(resume_path);
+            } catch (const std::exception& exception) {
+                std::cerr << "error coverage_queue_resume_invalid: "
+                          << exception.what() << '\n';
+                return EXIT_FAILURE;
+            }
+            if (!source_path.empty()) queue.source_path = source_path;
+            csgify::reconcile_coverage_autonomy_queue(
+                queue, certificate, argv[3]);
+        } else {
+            csgify::AutonomyPolicy policy;
+            policy.mode = csgify::AutonomyMode::propose;
+            queue = csgify::make_coverage_autonomy_queue(
+                certificate, argv[3], source_path, policy);
+        }
+        if (csgify::write_autonomy_queue_json(queue, output_path) != 0) {
+            std::cerr << "error coverage_queue_write_failed: " << output_path << '\n';
+            return EXIT_FAILURE;
+        }
+        std::cerr << "stage coverage_queue: completed blockers="
+                  << queue.human_review_count << ", certificate="
+                  << certificate.certificate_digest << '\n';
+        return certified ? EXIT_SUCCESS : 2;
+    }
+    if (action == "status") {
+        std::cout << "Coverage domain: " << certificate.domain.domain_id << '\n'
+                  << "Status: "
+                  << csgify::alea_coverage_status_name(certificate.status) << '\n'
+                  << "Cells: material=" << certificate.material_cell_count
+                  << ", void=" << certificate.intentional_void_cell_count
+                  << ", graveyard=" << certificate.graveyard_cell_count << '\n'
+                  << "Ownership: samples=" << certificate.coverage.sample_count
+                  << ", unique=" << certificate.coverage.unique_count
+                  << ", gaps=" << certificate.coverage.gap_count
+                  << ", overlaps=" << certificate.coverage.overlap_count
+                  << ", undefined_fills="
+                  << certificate.coverage.undefined_fill_count
+                  << ", unresolved=" << certificate.coverage.unresolved_count
+                  << ", truncated=" << certificate.coverage.truncated_count
+                  << '\n'
+                  << "Source overlap evidence: "
+                  << certificate.source_overlap_count << " overlap(s), "
+                  << certificate.source_overlap_unknown_count << " unknown\n"
+                  << "Execution: workers=" << certificate.execution.actual_workers
+                  << ", reserved_scratch_bytes="
+                  << certificate.execution.reserved_parallel_scratch_bytes
+                  << '\n'
+                  << "Instance reuse: fills=" << certificate.fill_instance_count
+                  << ", universes=" << certificate.reused_universe_count
+                  << ", duplicated_cells_avoided="
+                  << certificate.estimated_duplicated_cells_avoided << '\n';
+        for (const csgify::AleaCoverageReviewItem& finding : findings) {
+            std::cout << (finding.blocking ? "BLOCKER " : "INFO ")
+                      << finding.id << " count=" << finding.count << ": "
+                      << finding.summary << " Next: "
+                      << finding.recommended_action << '\n';
+        }
+        return certified ? EXIT_SUCCESS : 2;
+    }
+#if CSGIFY_HAVE_QT6_VIEWER
+    const int viewer_result = csgify::run_qt_coverage_review(
+        certificate, argv[3]);
+    if (viewer_result != 0) return viewer_result;
+    return certified ? EXIT_SUCCESS : 2;
+#else
+    std::cerr << "error viewer_not_built: use `csgify coverage status`\n";
+    return EXIT_FAILURE;
+#endif
 }
 
 // Human-readable face description used by `explain` to surface why a
@@ -2066,6 +4820,7 @@ int run_decompose_apply_command(int argc, char** argv) {
     std::string log_path;
     std::string step_out_path;
     std::string report_path;
+    std::string progress_json_path;
     std::string policy_name = "auto";
     std::size_t max_depth_value = 4;
     bool has_max_depth = false;
@@ -2073,9 +4828,34 @@ int run_decompose_apply_command(int argc, char** argv) {
     bool allow_bbox_fallback = false;
     std::string apply_removal_confidence;
     std::size_t max_splits_value = 16;
+    std::size_t prismatic_max_pieces = 4096;
+    std::size_t prismatic_max_splitter_calls = 10000;
     std::size_t max_targets_value = 0;
     std::vector<std::string> selected_targets;
     bool allow_overlaps = false;
+    std::string mcnp_domain_id;
+    bool require_domain_coverage = false;
+    bool fixed_point = true;
+    bool fixed_point_explicit = false;
+    bool no_partial_commit = false;
+    bool allow_shatter_fallback = false;
+    bool use_incremental_trials = true;
+    bool run_parallel_plane_batches = true;
+    bool verify_incremental_state = false;
+    std::size_t fixed_max_actions = 64;
+    std::size_t fixed_max_active_pieces = 4096;
+    std::size_t fixed_max_candidate_evaluations = 4096;
+    std::size_t fixed_max_candidates_per_target = 64;
+    std::size_t fixed_max_splitter_calls = 4096;
+    std::size_t fixed_max_residual_pieces = 256;
+    std::size_t fixed_max_elapsed_ms = 0;
+    std::size_t fixed_max_parallel_families = 8;
+    std::size_t fixed_max_planes_per_batch = 64;
+    std::size_t fixed_max_local_boolean_calls = 2048;
+    std::size_t fixed_max_stagnant_target_visits = 2;
+    double fixed_max_cumulative_volume_delta = 1.0e-6;
+    double fixed_max_action_volume_delta = 1.0e-6;
+    std::string approximation_percent;
 
     OptScanner scan(argc, argv, 5);
     while (!scan.done()) {
@@ -2083,22 +4863,85 @@ int run_decompose_apply_command(int argc, char** argv) {
         if (scan.take_string("--log", &log_path)) continue;
         if (scan.take_string("--out-step", &step_out_path)) continue;
         if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--progress-json", &progress_json_path)) continue;
         if (scan.take_string("--policy", &policy_name)) continue;
         if (scan.take_string("--apply-removal-candidates",
                              &apply_removal_confidence)) continue;
         if (scan.take_size("--max-depth", &max_depth_value, &has_max_depth)) continue;
         if (scan.take_size("--max-splits", &max_splits_value)) continue;
+        if (scan.take_size("--prismatic-max-pieces",
+                           &prismatic_max_pieces)) continue;
+        if (scan.take_size("--prismatic-max-splitter-calls",
+                           &prismatic_max_splitter_calls)) continue;
         if (scan.take_size("--max-targets", &max_targets_value)) continue;
+        if (scan.take_size("--max-actions", &fixed_max_actions)) continue;
+        if (scan.take_size("--max-active-pieces", &fixed_max_active_pieces)) continue;
+        if (scan.take_size("--max-candidate-evaluations",
+                           &fixed_max_candidate_evaluations)) continue;
+        if (scan.take_size("--max-candidates-per-target",
+                           &fixed_max_candidates_per_target)) continue;
+        if (scan.take_size("--max-splitter-calls",
+                           &fixed_max_splitter_calls)) continue;
+        if (scan.take_size("--max-residual-pieces",
+                           &fixed_max_residual_pieces)) continue;
+        if (scan.take_size("--max-elapsed-ms", &fixed_max_elapsed_ms)) continue;
+        if (scan.take_size("--max-parallel-families",
+                           &fixed_max_parallel_families)) continue;
+        if (scan.take_size("--max-planes-per-batch",
+                           &fixed_max_planes_per_batch)) continue;
+        if (scan.take_size("--max-local-boolean-calls",
+                           &fixed_max_local_boolean_calls)) continue;
+        if (scan.take_size("--max-stagnant-target-visits",
+                           &fixed_max_stagnant_target_visits)) continue;
+        if (scan.take_double("--max-cumulative-volume-delta",
+                             &fixed_max_cumulative_volume_delta)) continue;
+        if (scan.take_double("--max-action-volume-delta",
+                             &fixed_max_action_volume_delta)) continue;
+        if (scan.take_string("--approx-volume", &approximation_percent)) continue;
         if (scan.take_string("--target", &target_id)) {
             selected_targets.push_back(target_id);
             continue;
         }
+        if (scan.take_string("--mcnp-domain", &mcnp_domain_id)) continue;
         if (scan.take_flag("--allow-medium-confidence-auto")) { allow_medium = true; continue; }
         if (scan.take_flag("--allow-bbox-fallback-auto")) { allow_bbox_fallback = true; continue; }
         if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
+        if (scan.take_flag("--fixed-point")) {
+            fixed_point = true;
+            fixed_point_explicit = true;
+            continue;
+        }
+        if (scan.take_flag("--single-pass")) { fixed_point = false; continue; }
+        if (scan.take_flag("--no-partial-commit")) { no_partial_commit = true; continue; }
+        if (scan.take_flag("--allow-shatter-fallback")) { allow_shatter_fallback = true; continue; }
+        if (scan.take_flag("--legacy-global-trials")) {
+            use_incremental_trials = false;
+            continue;
+        }
+        if (scan.take_flag("--no-parallel-plane-batches")) {
+            run_parallel_plane_batches = false;
+            continue;
+        }
+        if (scan.take_flag("--verify-incremental-state")) {
+            verify_incremental_state = true;
+            continue;
+        }
+        if (scan.take_flag("--require-domain-coverage")) {
+            require_domain_coverage = true;
+            continue;
+        }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
+    }
+
+    if (step_out_path.empty()) {
+        const std::size_t slash = output_path.find_last_of("/\\");
+        const std::size_t dot = output_path.find_last_of('.');
+        const bool has_extension = dot != std::string::npos
+            && (slash == std::string::npos || dot > slash);
+        step_out_path = (has_extension ? output_path.substr(0, dot) : output_path)
+            + "_decomposed.step";
     }
 
     csgify::DecompositionPolicy policy;
@@ -2121,6 +4964,7 @@ int run_decompose_apply_command(int argc, char** argv) {
     } else if (policy_name == "low") {
         policy.allow_high_confidence_face_auto = true;
         policy.allow_medium_confidence_auto = true;
+        policy.allow_low_confidence_auto = true;
         policy.allow_bbox_fallback_auto = true;
     } else {
         std::cerr << "error invalid_policy: expected auto|medium|low|"
@@ -2140,7 +4984,27 @@ int run_decompose_apply_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     csgify::ConversionOptions options;
+    // This command performs its own bounded BSP decomposition below.  If a
+    // target remains unresolved, do not let emission retry with the legacy
+    // all-planar-faces splitter: on solids with many planar faces that single
+    // splitter call can construct a combinatorial arrangement and exhaust
+    // memory (while also ignoring --max-splits/--max-depth).
+    options.try_planar_decomposition = false;
+    options.prismatic_max_pieces = prismatic_max_pieces;
+    options.prismatic_max_splitter_calls = prismatic_max_splitter_calls;
     if (allow_overlaps) options.allow_overlaps = true;
+    options.mcnp_domain_id = mcnp_domain_id;
+    options.require_domain_coverage = require_domain_coverage;
+    if (!approximation_percent.empty()) {
+        std::string parse_error;
+        if (!set_uniform_approximation_budget(
+                approximation_percent, &options.approximation, &parse_error)) {
+            std::cerr << "error invalid_approximation_percent: "
+                      << parse_error << '\n';
+            return EXIT_FAILURE;
+        }
+        options.approximation.allow_overlap_resolution = true;
+    }
     csgify::SessionPtr session = csgify::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -2150,7 +5014,50 @@ int run_decompose_apply_command(int argc, char** argv) {
             return EXIT_FAILURE;
         }
     }
+    const auto decompose_load_started = std::chrono::steady_clock::now();
+    std::cerr << "stage load_step: started input=" << input_path << '\n';
     const csgify::DocumentId document_id = csgify::load_step(*session, input_path);
+    const double decompose_load_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - decompose_load_started).count();
+    std::cerr << "stage load_step: completed elapsed_s="
+              << std::fixed << std::setprecision(1)
+              << decompose_load_seconds << '\n';
+
+    // A positive-volume region must belong to exactly one MCNP component.
+    // With an explicit budget, resolve each detected input overlap using a
+    // stable ownership rule: lexicographically smaller stable ID owns the
+    // region, the other component is cut. Geometry measurement and the
+    // cumulative ledger decide whether "small" is actually acceptable.
+    if (options.approximation.enabled) {
+        const csgify::CommandResult overlap_analysis = csgify::analyze(
+            *session, document_id, csgify::ReportIdMode::local);
+        const std::vector<csgify::SolidOverlap> overlaps =
+            overlap_analysis.report.overlaps;
+        for (const csgify::SolidOverlap& overlap : overlaps) {
+            const std::string owner = std::min(overlap.solid_a_id,
+                                               overlap.solid_b_id);
+            const std::string loser = owner == overlap.solid_a_id
+                ? overlap.solid_b_id : overlap.solid_a_id;
+            const csgify::ApproximationCommandResult resolved =
+                csgify::resolve_overlap_with_approximation(
+                    *session, loser, owner, options.approximation,
+                    csgify::ReportIdMode::local);
+            if (!resolved.command.ok) {
+                std::cerr << "error " << resolved.budget.code << ": "
+                          << resolved.budget.message << " (owner=" << owner
+                          << ", loser=" << loser << ")\n";
+                if (!report_path.empty())
+                    write_report_or_stdout(resolved.command.report,
+                                           report_path);
+                return EXIT_FAILURE;
+            }
+            std::cerr << "overlap ownership: owner=" << owner
+                      << ", loser=" << loser
+                      << ", removed=" << resolved.metrics.removed_volume
+                      << ", fraction="
+                      << resolved.metrics.changed_volume_fraction << '\n';
+        }
+    }
 
     if (!apply_removal_confidence.empty()) {
         csgify::RemovalProposal removals =
@@ -2178,6 +5085,238 @@ int run_decompose_apply_command(int argc, char** argv) {
                   << " (policy=" << apply_removal_confidence << ")\n";
     }
 
+    // The legacy target-filtered form remains a single-pass debugging API.
+    // An explicitly requested fixed-point run rejects the filter so callers
+    // cannot mistake a local score for the document-wide invariant.
+    if (fixed_point && !fixed_point_explicit && !selected_targets.empty()) {
+        fixed_point = false;
+    }
+
+    if (fixed_point) {
+        if (!selected_targets.empty()) {
+            std::cerr << "error fixed_point_target_filter_not_supported: "
+                         "fixed-point currently evaluates the complete document\n";
+            return EXIT_FAILURE;
+        }
+        csgify::FixedPointDecompositionPolicy fixed_policy;
+        fixed_policy.candidate_policy = policy;
+        fixed_policy.max_actions = fixed_max_actions;
+        fixed_policy.max_candidate_evaluations =
+            fixed_max_candidate_evaluations;
+        fixed_policy.max_candidates_per_target =
+            fixed_max_candidates_per_target;
+        fixed_policy.max_splitter_calls = fixed_max_splitter_calls;
+        fixed_policy.max_active_pieces = fixed_max_active_pieces;
+        fixed_policy.max_residual_pieces = fixed_max_residual_pieces;
+        fixed_policy.max_elapsed_ms = fixed_max_elapsed_ms;
+        fixed_policy.max_target_depth = has_max_depth
+            ? static_cast<int>(max_depth_value) : fixed_policy.max_target_depth;
+        fixed_policy.max_cumulative_relative_volume_delta =
+            fixed_max_cumulative_volume_delta;
+        fixed_policy.max_action_relative_volume_delta =
+            fixed_max_action_volume_delta;
+        fixed_policy.min_piece_volume_fraction =
+            policy.min_piece_volume_fraction;
+        fixed_policy.allow_medium_certified_progress =
+            policy_name != "conservative";
+        fixed_policy.allow_low_certified_progress = policy_name == "low";
+        fixed_policy.allow_bbox_fallback = policy.allow_bbox_fallback_auto;
+        fixed_policy.run_shatter_fallback = allow_shatter_fallback;
+        fixed_policy.commit_certified_partial_progress = !no_partial_commit;
+        fixed_policy.use_incremental_trials = use_incremental_trials;
+        fixed_policy.run_parallel_plane_batches = run_parallel_plane_batches;
+        fixed_policy.verify_incremental_state_each_action =
+            verify_incremental_state;
+        fixed_policy.max_parallel_families_per_target =
+            fixed_max_parallel_families;
+        fixed_policy.max_planes_per_batch = fixed_max_planes_per_batch;
+        fixed_policy.max_local_boolean_calls =
+            fixed_max_local_boolean_calls;
+        fixed_policy.max_stagnant_target_visits =
+            fixed_max_stagnant_target_visits;
+
+        std::ofstream progress_file;
+        std::ostream* progress_out = nullptr;
+        if (!progress_json_path.empty()) {
+            if (progress_json_path == "-") progress_out = &std::cout;
+            else {
+                progress_file.open(progress_json_path);
+                if (!progress_file) {
+                    std::cerr << "error progress_json_open_failed: "
+                              << progress_json_path << '\n';
+                    return EXIT_FAILURE;
+                }
+                progress_out = &progress_file;
+            }
+        }
+        const csgify::FixedPointProgressCallback progress =
+            [progress_out](const csgify::FixedPointProgressEvent& event) {
+                if (event.phase == csgify::FixedPointProgressPhase::started) {
+                    std::cerr
+                        << "stage fixed_point_initial_analysis_and_overlap: "
+                           "started\n";
+                } else if (event.phase == csgify::FixedPointProgressPhase::
+                               initial_analysis_completed) {
+                    std::cerr
+                        << "stage fixed_point_initial_analysis_and_overlap: "
+                           "completed, residuals="
+                        << event.state.residual_count
+                        << ", exact_bodies=" << event.state.exact_body_count
+                        << ", overlap_errors="
+                        << event.state.overlap_error_count
+                        << ", elapsed_s=" << std::fixed
+                        << std::setprecision(1)
+                        << event.elapsed_ms / 1000.0 << '\n';
+                } else if (event.phase
+                           == csgify::FixedPointProgressPhase::target_started) {
+                    std::cerr << "stage fixed_point_target: target="
+                              << event.target_id;
+                    if (!event.strategy.empty()) {
+                        std::cerr << ", strategy=" << event.strategy;
+                    }
+                    std::cerr << ", elapsed_s=" << std::fixed
+                              << std::setprecision(1)
+                              << event.elapsed_ms / 1000.0 << '\n';
+                } else if (event.phase
+                    == csgify::FixedPointProgressPhase::action_accepted) {
+                    std::cerr << "fixed-point progress: action="
+                              << event.actions_applied
+                              << ", target=" << event.target_id
+                              << ", strategy=" << event.strategy
+                              << ", residuals=" << event.state.residual_count
+                              << ", active-pieces="
+                              << event.state.active_piece_count << '\n';
+                } else if (event.phase
+                           == csgify::FixedPointProgressPhase::
+                               terminal_verification_started) {
+                    std::cerr
+                        << "stage fixed_point_terminal_verification: started"
+                        << ", actions=" << event.actions_applied
+                        << ", elapsed_s=" << std::fixed
+                        << std::setprecision(1)
+                        << event.elapsed_ms / 1000.0 << '\n';
+                } else if (event.phase
+                           == csgify::FixedPointProgressPhase::finished) {
+                    std::cerr << "stage fixed_point: finished stop="
+                              << csgify::fixed_point_stop_reason_name(
+                                     event.stop_reason)
+                              << ", elapsed_s=" << std::fixed
+                              << std::setprecision(1)
+                              << event.elapsed_ms / 1000.0 << '\n';
+                }
+                if (progress_out) {
+                    // IDs and strategy names are generated by csgify and do
+                    // not contain JSON control characters.
+                    *progress_out
+                        << "{\"schema\":\"csgify.fixed-point-progress\""
+                        << ",\"phase\":\""
+                        << csgify::fixed_point_progress_phase_name(event.phase)
+                        << "\",\"actions_applied\":" << event.actions_applied
+                        << ",\"candidates_evaluated\":"
+                        << event.candidates_evaluated
+                        << ",\"splitter_calls\":" << event.splitter_calls
+                        << ",\"target\":\"" << event.target_id
+                        << "\",\"candidate\":\"" << event.candidate_id
+                        << "\",\"strategy\":\"" << event.strategy
+                        << "\",\"residual_count\":"
+                        << event.state.residual_count
+                        << ",\"residual_volume\":" << std::setprecision(17)
+                        << event.state.residual_volume
+                        << ",\"active_piece_count\":"
+                        << event.state.active_piece_count
+                        << ",\"exact_body_count\":"
+                        << event.state.exact_body_count
+                        << ",\"elapsed_ms\":" << event.elapsed_ms
+                        << ",\"stop_reason\":\""
+                        << (event.phase
+                                == csgify::FixedPointProgressPhase::finished
+                            ? csgify::fixed_point_stop_reason_name(
+                                  event.stop_reason)
+                            : "none")
+                        << "\"}\n";
+                    progress_out->flush();
+                }
+                return true;
+            };
+        std::mutex heartbeat_mutex;
+        std::condition_variable heartbeat_cv;
+        bool heartbeat_done = false;
+        const auto fixed_started = std::chrono::steady_clock::now();
+        std::thread heartbeat([&]() {
+            std::unique_lock<std::mutex> lock(heartbeat_mutex);
+            while (!heartbeat_cv.wait_for(
+                lock, std::chrono::seconds(30),
+                [&]() { return heartbeat_done; })) {
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - fixed_started).count();
+                std::cerr << "stage fixed_point: working elapsed_s="
+                          << std::fixed << std::setprecision(1) << seconds
+                          << '\n';
+            }
+        });
+        csgify::FixedPointDecompositionResult fixed =
+            csgify::decompose_to_fixed_point(
+                *session, document_id, fixed_policy,
+                csgify::ReportIdMode::local, progress);
+        {
+            std::lock_guard<std::mutex> lock(heartbeat_mutex);
+            heartbeat_done = true;
+        }
+        heartbeat_cv.notify_one();
+        heartbeat.join();
+        std::cerr << "fixed-point: stop="
+                  << csgify::fixed_point_stop_reason_name(
+                         fixed.summary.stop_reason)
+                  << ", actions=" << fixed.summary.actions_applied
+                  << ", residuals=" << fixed.summary.final_state.residual_count
+                  << ", active-pieces="
+                  << fixed.summary.final_state.active_piece_count
+                  << ", candidates=" << fixed.summary.candidates_evaluated
+                  << ", splitters=" << fixed.summary.splitter_calls << '\n';
+
+        if (!fixed.summary.exact) {
+            if (!step_out_path.empty() && fixed.summary.mutated) {
+                csgify::CommandResult step_result =
+                    csgify::export_document_step(
+                        *session, document_id, step_out_path,
+                        csgify::ReportIdMode::local);
+                if (!step_result.ok) print_diagnostics(step_result.report);
+            }
+            if (!report_path.empty()
+                && write_report_or_stdout(fixed.command.report,
+                                          report_path) != 0) {
+                std::cerr << "error report_write_failed: " << report_path << '\n';
+            }
+            print_diagnostics(fixed.command.report);
+            print_summary(fixed.command.report);
+            return EXIT_FAILURE;
+        }
+        if (!step_out_path.empty()) {
+            csgify::CommandResult step_result = csgify::export_document_step(
+                *session, document_id, step_out_path,
+                csgify::ReportIdMode::local);
+            if (!step_result.ok) {
+                print_diagnostics(step_result.report);
+                return EXIT_FAILURE;
+            }
+        }
+        csgify::CommandResult emitted = csgify::emit_document(
+            *session, document_id, output_path, csgify::ReportIdMode::local);
+        print_diagnostics(emitted.report);
+        print_summary(emitted.report);
+        if (!report_path.empty()
+            && write_report_or_stdout(emitted.report, report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+            return EXIT_FAILURE;
+        }
+        return emitted.report.ok() && emitted.report.solids_converted > 0
+            ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
+    // Legacy single-pass target discovery needs a complete analysis. The
+    // fixed-point branch above deliberately avoids this pass because its
+    // initial ledger reconciliation computes the same authoritative state;
+    // analyzing immediately beforehand doubles the assembly-wide cost.
     csgify::CommandResult analysis =
         csgify::analyze(*session, document_id, csgify::ReportIdMode::local);
 
@@ -2206,16 +5345,63 @@ int run_decompose_apply_command(int argc, char** argv) {
     std::size_t succeeded = 0;
     std::size_t needs_decision = 0;
     std::size_t other_failure = 0;
+    std::size_t prismatic_applied = 0;
+    std::size_t shell_differences_applied = 0;
+    std::size_t pipe_annuli_applied = 0;
+    std::size_t revolutions_applied = 0;
+    std::size_t partial = 0;
+    csgify::CommandResult last_operation_result = analysis;
     for (const std::string& id : targets) {
         ++attempted;
-        csgify::CommandResult r =
-            csgify::auto_decompose_bsp(*session, id,
+        const auto analyzed = std::find_if(
+            analysis.report.solids.begin(), analysis.report.solids.end(),
+            [&](const csgify::AnalyzedSolid& solid) { return solid.id == id; });
+        const bool use_shell_difference = analyzed != analysis.report.solids.end()
+            && analyzed->topology.cavity_shell_count > 0;
+        const bool use_pipe_annulus = !use_shell_difference
+            && analyzed != analysis.report.solids.end()
+            && analyzed->topology.pipe_annulus.candidate;
+        const bool use_revolution = !use_shell_difference && !use_pipe_annulus
+            && analyzed != analysis.report.solids.end()
+            && analyzed->topology.revolution.candidate
+            && analyzed->topology.revolution.full_revolution;
+        const bool use_prismatic = !use_shell_difference && !use_pipe_annulus
+            && !use_revolution
+            && analyzed != analysis.report.solids.end()
+            && analyzed->topology.prismatic_candidate
+            && !(has_max_depth && max_depth_value == 0);
+        csgify::CommandResult r = use_shell_difference
+            ? csgify::decompose_shell_difference(*session, id,
+                                                 csgify::ReportIdMode::local)
+            : use_pipe_annulus
+                ? csgify::decompose_pipe_annulus(*session, id,
+                                                 csgify::ReportIdMode::local)
+                : use_revolution
+                    ? csgify::decompose_revolution(
+                          *session, id, csgify::ReportIdMode::local)
+                    : use_prismatic
+                ? csgify::decompose_prismatic(*session, id,
+                                              csgify::ReportIdMode::local)
+                : csgify::auto_decompose_bsp(*session, id,
                                         static_cast<int>(max_depth_value),
                                         policy,
                                         csgify::ReportIdMode::local,
                                         /*defer_analysis=*/true);
+        last_operation_result = r;
+        const bool has_residual = std::any_of(
+            r.report.decomposed_pieces.begin(),
+            r.report.decomposed_pieces.end(),
+            [](const csgify::AnalyzedDecomposedPiece& piece) {
+                return piece.needs_decomposition
+                    || piece.needs_surface_replacement;
+            });
         if (r.ok) {
-            ++succeeded;
+            if (has_residual) ++partial;
+            else ++succeeded;
+            if (use_prismatic) ++prismatic_applied;
+            if (use_shell_difference) ++shell_differences_applied;
+            if (use_pipe_annulus) ++pipe_annuli_applied;
+            if (use_revolution) ++revolutions_applied;
         } else {
             const bool stuck_on_confidence = std::any_of(
                 r.report.diagnostics.begin(), r.report.diagnostics.end(),
@@ -2232,6 +5418,11 @@ int run_decompose_apply_command(int argc, char** argv) {
               << " (selected=" << targets.size()
               << ", available=" << available_targets
               << ", policy=" << policy_name
+              << ", prismatic=" << prismatic_applied
+              << ", shell-difference=" << shell_differences_applied
+              << ", pipe-annulus=" << pipe_annuli_applied
+              << ", revolution=" << revolutions_applied
+              << ", partial=" << partial
               << ", max-depth=" << max_depth_value << ")\n";
     if (needs_decision > 0) {
         std::cerr << "  " << needs_decision
@@ -2242,6 +5433,29 @@ int run_decompose_apply_command(int argc, char** argv) {
     if (other_failure > 0) {
         std::cerr << "  " << other_failure
                   << " failed for other reasons; see report diagnostics.\n";
+    }
+
+    // A progressive decomposition may commit an exact volume partition while
+    // honestly retaining residual non-convex cells.  Return that report and
+    // optional STEP artifact, but do not ask emission to convert a model that
+    // is known to be incomplete.
+    if (partial > 0 || other_failure > 0) {
+        if (!report_path.empty()
+            && write_report_or_stdout(last_operation_result.report,
+                                      report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!step_out_path.empty()) {
+            csgify::CommandResult step_result =
+                csgify::export_document_step(*session, document_id,
+                                              step_out_path,
+                                              csgify::ReportIdMode::local);
+            if (!step_result.ok) print_diagnostics(step_result.report);
+        }
+        print_diagnostics(last_operation_result.report);
+        print_summary(last_operation_result.report);
+        return EXIT_FAILURE;
     }
 
     if (!step_out_path.empty()) {
@@ -2293,6 +5507,11 @@ int run_shatter_command(int argc, char** argv) {
     bool allow_volume_drift = false;
     bool allow_overlaps = false;
     std::vector<std::string> selected_targets;
+    std::string mcnp_domain_id;
+    bool require_domain_coverage = false;
+    std::string approximation_percent;
+    bool allow_containment_change = false;
+    bool allow_topology_change = false;
 
     OptScanner scan(argc, argv, 5);
     while (!scan.done()) {
@@ -2300,6 +5519,8 @@ int run_shatter_command(int argc, char** argv) {
         if (scan.take_string("--log", &log_path)) continue;
         if (scan.take_string("--out-step", &step_out_path)) continue;
         if (scan.take_string("--report", &report_path)) continue;
+        if (scan.take_string("--mcnp-domain", &mcnp_domain_id)) continue;
+        if (scan.take_string("--approx-volume", &approximation_percent)) continue;
         if (scan.take_double("--max-depth", &max_depth_value)) continue;
         if (scan.take_string("--target", &target_id)) {
             selected_targets.push_back(target_id);
@@ -2311,6 +5532,18 @@ int run_shatter_command(int argc, char** argv) {
             continue;
         }
         if (scan.take_flag("--allow-overlaps")) { allow_overlaps = true; continue; }
+        if (scan.take_flag("--require-domain-coverage")) {
+            require_domain_coverage = true;
+            continue;
+        }
+        if (scan.take_flag("--allow-containment-change")) {
+            allow_containment_change = true;
+            continue;
+        }
+        if (scan.take_flag("--allow-topology-change")) {
+            allow_topology_change = true;
+            continue;
+        }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -2331,6 +5564,26 @@ int run_shatter_command(int argc, char** argv) {
 
     csgify::ConversionOptions options;
     if (allow_overlaps) options.allow_overlaps = true;
+    options.mcnp_domain_id = mcnp_domain_id;
+    options.require_domain_coverage = require_domain_coverage;
+    if (!approximation_percent.empty()) {
+        std::string error;
+        if (!set_uniform_approximation_budget(
+                approximation_percent, &options.approximation, &error)) {
+            std::cerr << "error invalid_approximation_percent: " << error << '\n';
+            return EXIT_FAILURE;
+        }
+        options.approximation.allow_numerical_shatter_loss = true;
+        options.approximation.require_containment_preservation =
+            !allow_containment_change;
+        options.approximation.require_topology_preservation =
+            !allow_topology_change;
+    }
+    if (allow_volume_drift && options.approximation.enabled) {
+        std::cerr << "error shatter_drift_policy_conflict: use --approx-volume "
+                     "instead of --allow-shatter-volume-drift\n";
+        return EXIT_FAILURE;
+    }
     csgify::SessionPtr session = csgify::create_session(options);
     if (!log_path.empty()) {
         try {
@@ -2364,16 +5617,33 @@ int run_shatter_command(int argc, char** argv) {
     std::size_t attempted = 0;
     std::size_t succeeded = 0;
     std::size_t residual = 0;
+    std::size_t partial = 0;
     std::size_t other_failure = 0;
+    csgify::CommandResult last_operation_result;
     for (const std::string& id : targets) {
         ++attempted;
-        csgify::CommandResult r =
-            csgify::shatter(*session, id,
-                             static_cast<int>(max_depth_value),
-                             allow_volume_drift,
-                             csgify::ReportIdMode::local);
+        csgify::CommandResult r;
+        if (options.approximation.enabled) {
+            r = csgify::shatter_with_approximation(
+                *session, id, static_cast<int>(max_depth_value),
+                options.approximation, csgify::ReportIdMode::local).command;
+        } else {
+            r = csgify::shatter(*session, id,
+                                 static_cast<int>(max_depth_value),
+                                 allow_volume_drift,
+                                 csgify::ReportIdMode::local);
+        }
+        last_operation_result = r;
+        const bool has_partial = std::any_of(
+            r.report.decomposed_pieces.begin(),
+            r.report.decomposed_pieces.end(),
+            [](const csgify::AnalyzedDecomposedPiece& piece) {
+                return piece.needs_decomposition
+                    || piece.needs_surface_replacement;
+            });
         if (r.ok) {
-            ++succeeded;
+            if (has_partial) ++partial;
+            else ++succeeded;
         } else {
             const bool stuck = std::any_of(
                 r.report.diagnostics.begin(), r.report.diagnostics.end(),
@@ -2387,7 +5657,8 @@ int run_shatter_command(int argc, char** argv) {
 
     std::cerr << "shatter: " << succeeded << "/" << attempted
               << " solid(s) reduced to convex pieces"
-              << " (max-depth=" << static_cast<int>(max_depth_value) << ")\n";
+              << " (partial=" << partial
+              << ", max-depth=" << static_cast<int>(max_depth_value) << ")\n";
     if (residual > 0) {
         std::cerr << "  " << residual
                   << " solid(s) left residual (need surface replacement, not"
@@ -2396,6 +5667,30 @@ int run_shatter_command(int argc, char** argv) {
     if (other_failure > 0) {
         std::cerr << "  " << other_failure
                   << " failed for other reasons; see report diagnostics.\n";
+    }
+
+    // Do not feed an unresolved source solid into emit's legacy fallback.
+    // Preserve the operation diagnostics first; callers must always receive a
+    // report even when a later STEP export is also requested.
+    if (partial > 0 || residual > 0 || other_failure > 0) {
+        if (!report_path.empty()
+            && write_report_or_stdout(last_operation_result.report,
+                                      report_path) != 0) {
+            std::cerr << "error report_write_failed: " << report_path << '\n';
+            return EXIT_FAILURE;
+        }
+        if (!step_out_path.empty()) {
+            csgify::CommandResult step_result =
+                csgify::export_document_step(*session, document_id,
+                                              step_out_path,
+                                              csgify::ReportIdMode::local);
+            if (!step_result.ok) {
+                print_diagnostics(step_result.report);
+            }
+        }
+        print_diagnostics(last_operation_result.report);
+        print_summary(last_operation_result.report);
+        return EXIT_FAILURE;
     }
 
     if (!step_out_path.empty()) {
@@ -2447,6 +5742,8 @@ int run_preprocess_command(int argc, char** argv) {
     std::size_t max_targets_value = 0;
     std::vector<std::string> selected_targets;
     bool safe_all = false;
+    std::size_t prismatic_max_pieces = 4096;
+    std::size_t prismatic_max_splitter_calls = 10000;
     bool dry_run = false;
     bool allow_overlaps = false;
     bool has_max_deviation = false;
@@ -2463,6 +5760,10 @@ int run_preprocess_command(int argc, char** argv) {
                              &apply_removal_confidence)) continue;
         if (scan.take_size("--max-depth", &max_depth_value, &has_max_depth)) continue;
         if (scan.take_size("--max-splits", &max_splits_value)) continue;
+        if (scan.take_size("--prismatic-max-pieces",
+                           &prismatic_max_pieces)) continue;
+        if (scan.take_size("--prismatic-max-splitter-calls",
+                           &prismatic_max_splitter_calls)) continue;
         if (scan.take_size("--max-targets", &max_targets_value)) continue;
         if (scan.take_double("--max-deviation", &max_deviation,
                              &has_max_deviation)) continue;
@@ -2504,6 +5805,7 @@ int run_preprocess_command(int argc, char** argv) {
     } else if (policy_name == "low") {
         policy.allow_high_confidence_face_auto = true;
         policy.allow_medium_confidence_auto = true;
+        policy.allow_low_confidence_auto = true;
         policy.allow_bbox_fallback_auto = true;
     } else {
         std::cerr << "error invalid_policy: expected auto|medium|low|"
@@ -2523,6 +5825,8 @@ int run_preprocess_command(int argc, char** argv) {
               << ", Alea " << alea_version() << '\n';
 
     csgify::ConversionOptions options;
+    options.prismatic_max_pieces = prismatic_max_pieces;
+    options.prismatic_max_splitter_calls = prismatic_max_splitter_calls;
     if (allow_overlaps) options.allow_overlaps = true;
     csgify::SessionPtr session = csgify::create_session(options);
     if (!log_path.empty()) {
@@ -2654,6 +5958,10 @@ int run_preprocess_command(int argc, char** argv) {
     std::size_t succeeded = 0;
     std::size_t needs_decision = 0;
     std::size_t other_failure = 0;
+    std::size_t prismatic_applied = 0;
+    std::size_t shell_differences_applied = 0;
+    std::size_t pipe_annuli_applied = 0;
+    std::size_t revolutions_applied = 0;
     if (dry_run) {
         std::cerr << "preprocess [dry-run]: would attempt BSP decomposition on "
                   << targets.size() << " non-convex target(s)"
@@ -2662,14 +5970,47 @@ int run_preprocess_command(int argc, char** argv) {
     } else {
         for (const std::string& id : targets) {
             ++attempted;
-            csgify::CommandResult r =
-                csgify::auto_decompose_bsp(*session, id,
+            const auto analyzed = std::find_if(
+                analysis.report.solids.begin(), analysis.report.solids.end(),
+                [&](const csgify::AnalyzedSolid& solid) { return solid.id == id; });
+            const bool use_shell_difference =
+                analyzed != analysis.report.solids.end()
+                && analyzed->topology.cavity_shell_count > 0;
+            const bool use_pipe_annulus = !use_shell_difference
+                && analyzed != analysis.report.solids.end()
+                && analyzed->topology.pipe_annulus.candidate;
+            const bool use_revolution = !use_shell_difference
+                && !use_pipe_annulus
+                && analyzed != analysis.report.solids.end()
+                && analyzed->topology.revolution.candidate
+                && analyzed->topology.revolution.full_revolution;
+            const bool use_prismatic = !use_shell_difference && !use_pipe_annulus
+                && !use_revolution
+                && analyzed != analysis.report.solids.end()
+                && analyzed->topology.prismatic_candidate;
+            csgify::CommandResult r = use_shell_difference
+                ? csgify::decompose_shell_difference(
+                      *session, id, csgify::ReportIdMode::local)
+                : use_pipe_annulus
+                    ? csgify::decompose_pipe_annulus(
+                          *session, id, csgify::ReportIdMode::local)
+                    : use_revolution
+                        ? csgify::decompose_revolution(
+                              *session, id, csgify::ReportIdMode::local)
+                        : use_prismatic
+                    ? csgify::decompose_prismatic(*session, id,
+                                                  csgify::ReportIdMode::local)
+                    : csgify::auto_decompose_bsp(*session, id,
                                             static_cast<int>(max_depth_value),
                                             policy,
                                             csgify::ReportIdMode::local,
                                             /*defer_analysis=*/true);
             if (r.ok) {
                 ++succeeded;
+                if (use_prismatic) ++prismatic_applied;
+                if (use_shell_difference) ++shell_differences_applied;
+                if (use_pipe_annulus) ++pipe_annuli_applied;
+                if (use_revolution) ++revolutions_applied;
             } else {
                 const bool stuck_on_confidence = std::any_of(
                     r.report.diagnostics.begin(), r.report.diagnostics.end(),
@@ -2688,6 +6029,10 @@ int run_preprocess_command(int argc, char** argv) {
                   << " (selected=" << targets.size()
                   << ", available=" << available_targets
                   << ", policy=" << policy_name
+                  << ", prismatic=" << prismatic_applied
+                  << ", shell-difference=" << shell_differences_applied
+                  << ", pipe-annulus=" << pipe_annuli_applied
+                  << ", revolution=" << revolutions_applied
                   << ", max-depth=" << max_depth_value
                   << ", max-splits=" << max_splits_value << ")\n";
         if (needs_decision > 0) {
@@ -3074,9 +6419,14 @@ int run_compact_command(int argc, char** argv) {
     }
     const std::string log_path = argv[2];
     std::string recipe_path;
+    bool preserve_step_exports = false;
     OptScanner scan(argc, argv, 3);
     while (!scan.done()) {
         if (scan.take_string("--out", &recipe_path)) continue;
+        if (scan.take_flag("--preserve-step-exports")) {
+            preserve_step_exports = true;
+            continue;
+        }
         std::cerr << "error unrecognized_option: " << scan.peek() << '\n';
         usage(argv[0]);
         return EXIT_FAILURE;
@@ -3085,7 +6435,9 @@ int run_compact_command(int argc, char** argv) {
         std::cerr << "error: compact requires --out path\n";
         return EXIT_FAILURE;
     }
-    return csgify::compact_log_to_recipe(log_path, recipe_path) == 0
+    csgify::CompactRecipeOptions options;
+    options.preserve_step_exports = preserve_step_exports;
+    return csgify::compact_log_to_recipe(log_path, recipe_path, options) == 0
         ? EXIT_SUCCESS
         : EXIT_FAILURE;
 }
@@ -3356,6 +6708,10 @@ int main(int argc, char** argv) {
     }
 
     if (verb == "inspect") return run_inspect_command(argc, argv);
+    if (verb == "handoff") return run_handoff_command(argc, argv);
+    if (verb == "voids") return run_voids_command(argc, argv);
+    if (verb == "coverage") return run_coverage_command(argc, argv);
+    if (verb == "project") return run_project_command(argc, argv);
     if (verb == "explain") return run_explain_command(argc, argv);
     if (verb == "decision-pack") return run_decision_pack_command(argc, argv);
     if (verb == "dump-assembly") return run_dump_assembly_command(argc, argv);
@@ -3374,6 +6730,9 @@ int main(int argc, char** argv) {
     if (verb == "auto-fit") return run_auto_fit_command(argc, argv);
     if (verb == "propose") return run_propose_command(argc, argv);
     if (verb == "apply") return run_apply_command(argc, argv);
+    if (verb == "autonomy") return run_autonomy_command(argc, argv);
+    if (verb == "context") return run_context_command(argc, argv);
+    if (verb == "queue") return run_queue_command(argc, argv);
     if (verb == "lua") return run_lua_command(argc, argv);
     if (verb == "viewer-check") return run_viewer_check_command();
     if (verb == "view") return run_view_command(argc, argv);

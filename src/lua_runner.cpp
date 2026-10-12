@@ -82,11 +82,18 @@ ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
          "unit_scale_to_mm_override", "scale", "linear_tolerance",
          "angular_tolerance", "small_volume_fraction", "small_bbox_fraction",
          "thin_plate_ratio", "long_body_ratio", "heal_shape",
-         "require_convex_cells", "try_planar_decomposition",
-         "split_union_cells", "decomposition_relative_volume_tolerance",
+         "require_convex_cells", "analyze_topology_metrics",
+         "analyze_face_metrics",
+         "analyze_fitted_replacements",
+         "defer_curved_halfspace_certificates", "try_planar_decomposition",
+         "split_union_cells", "union_decomposed_pieces",
+         "decomposition_relative_volume_tolerance",
          "shatter_relative_volume_tolerance",
-         "check_overlaps", "allow_overlaps", "overlap_volume_threshold",
-         "overlap_volume_fraction"},
+         "prismatic_max_pieces", "prismatic_max_splitter_calls",
+         "check_overlaps", "overlap_parallelism", "allow_overlaps",
+         "overlap_volume_threshold",
+         "overlap_volume_fraction", "mcnp_domain_id",
+         "require_domain_coverage"},
         "conversion");
 
     auto take_string = [&](const char* key, std::string* out) {
@@ -110,6 +117,14 @@ ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
         }
         lua_pop(L, 1);
     };
+    auto take_size = [&](const char* key, std::size_t* out) {
+        lua_getfield(L, index, key);
+        if (lua_isinteger(L, -1)) {
+            const lua_Integer value = lua_tointeger(L, -1);
+            if (value >= 0) *out = static_cast<std::size_t>(value);
+        }
+        lua_pop(L, 1);
+    };
 
     take_string("unit_override", &options.unit_override);
     take_string("units",        &options.unit_override);
@@ -125,16 +140,30 @@ ConversionOptions conversion_options_from_lua(lua_State* L, int index) {
     take_double("long_body_ratio",       &options.long_body_ratio);
     take_bool("heal_shape",             &options.heal_shape);
     take_bool("require_convex_cells",   &options.require_convex_cells);
+    take_bool("analyze_topology_metrics",
+              &options.analyze_topology_metrics);
+    take_bool("analyze_face_metrics", &options.analyze_face_metrics);
+    take_bool("analyze_fitted_replacements",
+              &options.analyze_fitted_replacements);
+    take_bool("defer_curved_halfspace_certificates",
+              &options.defer_curved_halfspace_certificates);
     take_bool("try_planar_decomposition", &options.try_planar_decomposition);
     take_bool("split_union_cells",      &options.split_union_cells);
+    take_bool("union_decomposed_pieces", &options.union_decomposed_pieces);
     take_double("shatter_relative_volume_tolerance",
                 &options.shatter_relative_volume_tolerance);
     take_double("decomposition_relative_volume_tolerance",
                 &options.decomposition_relative_volume_tolerance);
+    take_size("prismatic_max_pieces", &options.prismatic_max_pieces);
+    take_size("prismatic_max_splitter_calls",
+              &options.prismatic_max_splitter_calls);
     take_bool("check_overlaps",         &options.check_overlaps);
+    take_size("overlap_parallelism",    &options.overlap_parallelism);
     take_bool("allow_overlaps",         &options.allow_overlaps);
     take_double("overlap_volume_threshold", &options.overlap_volume_threshold);
     take_double("overlap_volume_fraction",  &options.overlap_volume_fraction);
+    take_string("mcnp_domain_id", &options.mcnp_domain_id);
+    take_bool("require_domain_coverage", &options.require_domain_coverage);
     return options;
 }
 
@@ -149,6 +178,11 @@ void set_number_field(lua_State* L, const char* key, double value) {
 }
 
 void set_integer_field(lua_State* L, const char* key, std::size_t value) {
+    lua_pushinteger(L, static_cast<lua_Integer>(value));
+    lua_setfield(L, -2, key);
+}
+
+void set_signed_integer_field(lua_State* L, const char* key, long long value) {
     lua_pushinteger(L, static_cast<lua_Integer>(value));
     lua_setfield(L, -2, key);
 }
@@ -219,6 +253,141 @@ void push_geometry_certificate_table(lua_State* L,
     set_string_field(L, "failure_code", certificate.failure_code);
 }
 
+void push_topology_table(lua_State* L, const SolidTopology& topology) {
+    lua_newtable(L);
+    set_integer_field(L, "vertex_count", topology.vertex_count);
+    set_integer_field(L, "edge_count", topology.edge_count);
+    set_integer_field(L, "face_count", topology.face_count);
+    set_integer_field(L, "shell_count", topology.shell_count);
+    set_integer_field(L, "closed_shell_count", topology.closed_shell_count);
+    set_integer_field(L, "cavity_shell_count", topology.cavity_shell_count);
+    set_integer_field(L, "face_inner_wire_count", topology.face_inner_wire_count);
+    set_integer_field(L, "manifold_edge_count", topology.manifold_edge_count);
+    set_integer_field(L, "boundary_edge_count", topology.boundary_edge_count);
+    set_integer_field(L, "nonmanifold_edge_count", topology.nonmanifold_edge_count);
+    set_integer_field(L, "linear_edge_count", topology.linear_edge_count);
+    set_integer_field(L, "planar_face_count", topology.planar_face_count);
+    set_integer_field(L, "concave_edge_count", topology.concave_edge_count);
+    set_integer_field(L, "convex_edge_count", topology.convex_edge_count);
+    set_integer_field(L, "tangent_or_unknown_edge_count",
+                      topology.tangent_or_unknown_edge_count);
+    set_signed_integer_field(L, "raw_euler_characteristic",
+                             topology.raw_euler_characteristic);
+    set_signed_integer_field(L, "euler_characteristic",
+                             topology.euler_characteristic);
+    set_integer_field(L, "unique_plane_count", topology.unique_plane_count);
+    set_integer_field(L, "normal_direction_count",
+                      topology.normal_direction_count);
+    set_number_field(L, "bbox_fill_ratio", topology.bbox_fill_ratio);
+    set_boolean_field(L, "prismatic_candidate", topology.prismatic_candidate);
+    push_vec3_table(L, topology.prism_axis);
+    lua_setfield(L, -2, "prism_axis");
+    set_integer_field(L, "axial_level_count", topology.axial_level_count);
+    set_integer_field(L, "axial_end_face_count", topology.axial_end_face_count);
+    set_integer_field(L, "extrusion_profile_hole_count",
+                      topology.extrusion_profile_hole_count);
+    set_boolean_field(L, "constant_cross_section_candidate",
+                      topology.constant_cross_section_candidate);
+    const PipeAnnulusTopology& pipe = topology.pipe_annulus;
+    lua_newtable(L);
+    set_boolean_field(L, "candidate", pipe.candidate);
+    set_boolean_field(L, "conical", pipe.conical);
+    push_vec3_table(L, pipe.axis_origin);
+    lua_setfield(L, -2, "axis_origin");
+    push_vec3_table(L, pipe.axis_direction);
+    lua_setfield(L, -2, "axis_direction");
+    set_number_field(L, "inner_radius", pipe.inner_radius);
+    set_number_field(L, "outer_radius", pipe.outer_radius);
+    set_number_field(L, "top_inner_radius", pipe.top_inner_radius);
+    set_number_field(L, "top_outer_radius", pipe.top_outer_radius);
+    set_number_field(L, "axial_length", pipe.axial_length);
+    set_integer_field(L, "cylindrical_face_count", pipe.cylindrical_face_count);
+    set_integer_field(L, "conical_face_count", pipe.conical_face_count);
+    set_integer_field(L, "planar_end_face_count", pipe.planar_end_face_count);
+    lua_newtable(L);
+    for (std::size_t i = 0; i < pipe.ports.size(); ++i) {
+        const PipePortTopology& port = pipe.ports[i];
+        lua_newtable(L);
+        set_string_field(L, "id", port.id);
+        push_vec3_table(L, port.center);
+        lua_setfield(L, -2, "center");
+        push_vec3_table(L, port.normal);
+        lua_setfield(L, -2, "normal");
+        set_number_field(L, "radius", port.radius);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "ports");
+    lua_setfield(L, -2, "pipe_annulus");
+    const RevolutionTopology& revolution = topology.revolution;
+    lua_newtable(L);
+    set_boolean_field(L, "candidate", revolution.candidate);
+    set_boolean_field(L, "full_revolution", revolution.full_revolution);
+    push_vec3_table(L, revolution.axis_origin);
+    lua_setfield(L, -2, "axis_origin");
+    push_vec3_table(L, revolution.axis_direction);
+    lua_setfield(L, -2, "axis_direction");
+    set_number_field(L, "angular_extent", revolution.angular_extent);
+    set_integer_field(L, "axial_level_count", revolution.axial_level_count);
+    set_integer_field(L, "cylindrical_face_count",
+                      revolution.cylindrical_face_count);
+    set_integer_field(L, "conical_face_count", revolution.conical_face_count);
+    set_integer_field(L, "toroidal_face_count",
+                      revolution.toroidal_face_count);
+    set_integer_field(L, "spherical_face_count",
+                      revolution.spherical_face_count);
+    set_integer_field(L, "radial_seam_face_count",
+                      revolution.radial_seam_face_count);
+    lua_setfield(L, -2, "revolution");
+    lua_newtable(L);
+    for (std::size_t i = 0; i < topology.recognition_candidates.size(); ++i) {
+        const RecognitionCandidate& candidate = topology.recognition_candidates[i];
+        lua_newtable(L);
+        set_string_field(L, "kind", candidate.kind);
+        set_string_field(L, "strategy", candidate.strategy);
+        set_string_field(L, "confidence", candidate.confidence);
+        set_number_field(L, "score", candidate.score);
+        set_boolean_field(L, "exact", candidate.exact);
+        lua_newtable(L);
+        for (std::size_t j = 0; j < candidate.reason_codes.size(); ++j) {
+            lua_pushstring(L, candidate.reason_codes[j].c_str());
+            lua_rawseti(L, -2, static_cast<lua_Integer>(j + 1));
+        }
+        lua_setfield(L, -2, "reason_codes");
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "recognition_candidates");
+    set_string_field(L, "selected_recognition_kind",
+                     topology.selected_recognition_kind);
+    set_string_field(L, "recommended_strategy", topology.recommended_strategy);
+    lua_newtable(L);
+    for (std::size_t i = 0; i < topology.reason_codes.size(); ++i) {
+        lua_pushstring(L, topology.reason_codes[i].c_str());
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "reason_codes");
+    lua_newtable(L);
+    for (std::size_t i = 0; i < topology.shells.size(); ++i) {
+        const ShellTopology& shell = topology.shells[i];
+        lua_newtable(L);
+        set_integer_field(L, "index", shell.index);
+        set_string_field(L, "role", shell.role);
+        set_integer_field(L, "vertex_count", shell.vertex_count);
+        set_integer_field(L, "edge_count", shell.edge_count);
+        set_integer_field(L, "face_count", shell.face_count);
+        set_integer_field(L, "face_inner_wire_count",
+                          shell.face_inner_wire_count);
+        set_signed_integer_field(L, "raw_euler_characteristic",
+                                 shell.raw_euler_characteristic);
+        set_signed_integer_field(L, "euler_characteristic",
+                                 shell.euler_characteristic);
+        set_boolean_field(L, "closed", shell.closed);
+        set_boolean_field(L, "genus_known", shell.genus_known);
+        set_signed_integer_field(L, "genus", shell.genus);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "shells");
+}
+
 void push_solid_table(lua_State* L, const AnalyzedSolid& solid) {
     lua_newtable(L);
     set_string_field(L, "id", solid.id);
@@ -246,8 +415,12 @@ void push_solid_table(lua_State* L, const AnalyzedSolid& solid) {
     set_boolean_field(L, "needs_spline_replacement", solid.needs_spline_replacement);
     set_boolean_field(L, "needs_surface_replacement", solid.needs_surface_replacement);
     set_boolean_field(L, "needs_user_decision", solid.needs_user_decision);
+    set_boolean_field(L, "convexity_certificate_deferred",
+                      solid.convexity_certificate_deferred);
     push_geometry_certificate_table(L, solid.certificate);
     lua_setfield(L, -2, "geometry_certificate");
+    push_topology_table(L, solid.topology);
+    lua_setfield(L, -2, "topology");
 
     lua_newtable(L);
     for (std::size_t i = 0; i < solid.face_ids.size(); ++i) {
@@ -328,6 +501,14 @@ void push_performance_table(lua_State* L, const PerformanceMetrics& perf) {
     set_integer_field(L, "candidates_evaluated", perf.candidates_evaluated);
     set_integer_field(L, "splitter_calls",       perf.splitter_calls);
     set_integer_field(L, "pieces_produced",      perf.pieces_produced);
+    set_integer_field(L, "definition_recognition_cache_hits",
+                      perf.definition_recognition_cache_hits);
+    set_integer_field(L, "definition_recognition_cache_misses",
+                      perf.definition_recognition_cache_misses);
+    set_integer_field(L, "definition_conversion_cache_hits",
+                      perf.definition_conversion_cache_hits);
+    set_integer_field(L, "definition_conversion_cache_published",
+                      perf.definition_conversion_cache_published);
 }
 
 void push_assembly_table(lua_State* L, const AssemblyNode& node) {
@@ -356,6 +537,8 @@ void push_decomposition_candidate_piece_table(
     set_boolean_field(L, "needs_spline_replacement", piece.needs_spline_replacement);
     set_boolean_field(L, "needs_surface_replacement", piece.needs_surface_replacement);
     set_boolean_field(L, "needs_user_decision", piece.needs_user_decision);
+    set_integer_field(L, "halfspace_violation_count",
+                      piece.halfspace_violation_count);
 }
 
 void push_decomposition_candidate_table(lua_State* L,
@@ -405,6 +588,11 @@ void push_decomposition_candidate_table(lua_State* L,
     set_number_field(L, "max_piece_volume_fraction",
                      candidate.max_piece_volume_fraction);
     set_number_field(L, "volume_balance", candidate.volume_balance);
+    set_integer_field(L, "parent_halfspace_violation_count",
+                      candidate.parent_halfspace_violation_count);
+    set_integer_field(L, "max_piece_halfspace_violation_count",
+                      candidate.max_piece_halfspace_violation_count);
+    set_number_field(L, "progress_ratio", candidate.progress_ratio);
 
     lua_newtable(L);
     for (std::size_t i = 0; i < candidate.pieces.size(); ++i) {
@@ -504,6 +692,10 @@ void push_removal_candidate_table(lua_State* L,
     lua_newtable(L);
     set_string_field(L, "id", candidate.id);
     set_string_field(L, "solid_id", candidate.solid_id);
+    set_string_field(L, "component_instance_id",
+                     candidate.component_instance_id);
+    set_string_field(L, "component_definition_id",
+                     candidate.component_definition_id);
     set_string_field(L, "label", candidate.label);
     set_string_field(L, "name", candidate.name);
     set_string_field(L, "hierarchy_path", candidate.hierarchy_path);
@@ -627,6 +819,235 @@ void push_hole_fill_proposal_table(lua_State* L,
     lua_setfield(L, -2, "diagnostics");
 }
 
+MaterialPhase material_phase_from_string(const std::string& value) {
+    if (value == "solid") return MaterialPhase::solid;
+    if (value == "liquid") return MaterialPhase::liquid;
+    if (value == "gas") return MaterialPhase::gas;
+    if (value == "vacuum") return MaterialPhase::vacuum;
+    return MaterialPhase::unknown;
+}
+
+MediumPortDisposition medium_disposition_from_string(
+    const std::string& value) {
+    if (value == "cap_here") return MediumPortDisposition::cap_here;
+    if (value == "interface_to_external_model")
+        return MediumPortDisposition::interface_to_external_model;
+    if (value == "open_to_domain")
+        return MediumPortDisposition::open_to_domain;
+    if (value == "connect_to_port")
+        return MediumPortDisposition::connect_to_port;
+    return MediumPortDisposition::unresolved;
+}
+
+MediumValveState medium_valve_from_string(const std::string& value) {
+    if (value == "open") return MediumValveState::open;
+    if (value == "closed") return MediumValveState::closed;
+    if (value == "unresolved") return MediumValveState::unresolved;
+    return MediumValveState::not_applicable;
+}
+
+MediumGenerationRequest medium_request_from_lua(lua_State* L, int index) {
+    index = lua_absindex(L, index);
+    luaL_checktype(L, index, LUA_TTABLE);
+    MediumGenerationRequest request;
+    auto string_field = [&](const char* key) {
+        lua_getfield(L, index, key);
+        const std::string value = lua_isstring(L, -1)
+            ? lua_tostring(L, -1) : std::string{};
+        lua_pop(L, 1);
+        return value;
+    };
+    request.id = string_field("id");
+    request.material_id = string_field("material_id");
+    request.complement_material_id = string_field("complement_material_id");
+    const std::string fill_mode = string_field("fill_mode");
+    request.fill_mode = fill_mode == "level" ? MediumFillMode::level
+        : fill_mode == "bounded_segment" ? MediumFillMode::bounded_segment
+                                           : MediumFillMode::full;
+    lua_getfield(L, index, "gravity_direction");
+    if (lua_istable(L, -1) && lua_rawlen(L, -1) == 3) {
+        for (lua_Integer i = 1; i <= 3; ++i) {
+            lua_rawgeti(L, -1, i);
+            if (lua_isnumber(L, -1))
+                request.gravity_direction[static_cast<std::size_t>(i - 1)] =
+                    lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, index, "fill_level");
+    if (lua_isnumber(L, -1)) request.fill_level = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, index, "target_volume_fraction");
+    if (lua_isnumber(L, -1))
+        request.target_volume_fraction = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, index, "host_component_ids");
+    if (lua_istable(L, -1)) {
+        const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, -1));
+        for (lua_Integer i = 1; i <= count; ++i) {
+            lua_rawgeti(L, -1, i);
+            if (lua_isstring(L, -1))
+                request.host_component_ids.emplace_back(lua_tostring(L, -1));
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, index, "ports");
+    if (lua_istable(L, -1)) {
+        const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, -1));
+        for (lua_Integer i = 1; i <= count; ++i) {
+            lua_rawgeti(L, -1, i);
+            if (lua_istable(L, -1)) {
+                MediumPortDecision port;
+                lua_getfield(L, -1, "port_id");
+                if (lua_isstring(L, -1)) port.port_id = lua_tostring(L, -1);
+                lua_pop(L, 1);
+                lua_getfield(L, -1, "disposition");
+                if (lua_isstring(L, -1))
+                    port.disposition = medium_disposition_from_string(
+                        lua_tostring(L, -1));
+                lua_pop(L, 1);
+                lua_getfield(L, -1, "peer_port_id");
+                if (lua_isstring(L, -1))
+                    port.peer_port_id = lua_tostring(L, -1);
+                lua_pop(L, 1);
+                lua_getfield(L, -1, "valve_state");
+                if (lua_isstring(L, -1))
+                    port.valve_state = medium_valve_from_string(
+                        lua_tostring(L, -1));
+                lua_pop(L, 1);
+                request.ports.push_back(std::move(port));
+            }
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, index, "seed_points_or_faces");
+    if (lua_istable(L, -1)) {
+        const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, -1));
+        for (lua_Integer i = 1; i <= count; ++i) {
+            lua_rawgeti(L, -1, i);
+            if (lua_istable(L, -1)) {
+                GeometricSeed seed;
+                lua_getfield(L, -1, "kind");
+                if (lua_isstring(L, -1)
+                    && std::string(lua_tostring(L, -1)) == "face")
+                    seed.kind = GeometricSeedKind::face;
+                lua_pop(L, 1);
+                lua_getfield(L, -1, "entity_id");
+                if (lua_isstring(L, -1))
+                    seed.entity_id = lua_tostring(L, -1);
+                lua_pop(L, 1);
+                lua_getfield(L, -1, "point");
+                if (lua_istable(L, -1) && lua_rawlen(L, -1) == 3) {
+                    for (lua_Integer coordinate = 1; coordinate <= 3;
+                         ++coordinate) {
+                        lua_rawgeti(L, -1, coordinate);
+                        if (lua_isnumber(L, -1))
+                            seed.point[static_cast<std::size_t>(coordinate - 1)] =
+                                lua_tonumber(L, -1);
+                        lua_pop(L, 1);
+                    }
+                }
+                lua_pop(L, 1);
+                request.seed_points_or_faces.push_back(std::move(seed));
+            }
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, index, "internal_components_to_subtract");
+    if (lua_istable(L, -1)) {
+        const lua_Integer count = static_cast<lua_Integer>(lua_rawlen(L, -1));
+        for (lua_Integer i = 1; i <= count; ++i) {
+            lua_rawgeti(L, -1, i);
+            if (lua_isstring(L, -1))
+                request.internal_components_to_subtract.emplace_back(
+                    lua_tostring(L, -1));
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, index, "allow_disconnected_pockets");
+    if (lua_isboolean(L, -1))
+        request.allow_disconnected_pockets = lua_toboolean(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, index, "max_worker_count");
+    if (lua_isinteger(L, -1) && lua_tointeger(L, -1) > 0)
+        request.max_worker_count = static_cast<std::size_t>(
+            lua_tointeger(L, -1));
+    lua_pop(L, 1);
+    return request;
+}
+
+void push_medium_generation_proposal_table(
+    lua_State* L,
+    const MediumGenerationProposal& proposal) {
+    lua_newtable(L);
+    set_boolean_field(L, "ok", proposal.ok);
+    set_boolean_field(L, "conical", proposal.conical);
+    set_string_field(L, "host_shape_id", proposal.host_shape_id);
+    set_string_field(L, "host_component_id", proposal.host_component_id);
+    push_vec3_table(L, proposal.base);
+    lua_setfield(L, -2, "base");
+    push_vec3_table(L, proposal.height);
+    lua_setfield(L, -2, "height");
+    set_number_field(L, "radius", proposal.radius);
+    set_number_field(L, "top_radius", proposal.top_radius);
+    lua_newtable(L);
+    set_boolean_field(L, "solid_valid", proposal.certificate.solid_valid);
+    set_boolean_field(L, "closed", proposal.certificate.closed);
+    set_boolean_field(L, "leak_test_passed",
+                      proposal.certificate.leak_test_passed);
+    set_boolean_field(L, "overlap_test_passed",
+                      proposal.certificate.overlap_test_passed);
+    set_integer_field(L, "unresolved_port_count",
+                      proposal.certificate.unresolved_port_count);
+    set_number_field(L, "generated_volume",
+                     proposal.certificate.generated_volume);
+    set_integer_field(L, "network_segment_count",
+                      proposal.certificate.network_segment_count);
+    set_integer_field(L, "network_connection_count",
+                      proposal.certificate.network_connection_count);
+    set_integer_field(L, "network_connected_component_count",
+                      proposal.certificate.network_connected_component_count);
+    set_boolean_field(L, "obstacle_subtraction_passed",
+                      proposal.certificate.obstacle_subtraction_passed);
+    set_boolean_field(L, "phase_coverage_passed",
+                      proposal.certificate.phase_coverage_passed);
+    set_boolean_field(L, "protected_interface_passed",
+                      proposal.certificate.protected_interface_passed);
+    set_number_field(L, "liquid_volume",
+                     proposal.certificate.liquid_volume);
+    set_number_field(L, "gas_volume", proposal.certificate.gas_volume);
+    set_number_field(L, "phase_coverage_delta",
+                     proposal.certificate.phase_coverage_delta);
+    set_number_field(L, "phase_overlap_volume",
+                     proposal.certificate.phase_overlap_volume);
+    set_integer_field(L, "liquid_pocket_count",
+                      proposal.certificate.liquid_pocket_count);
+    set_integer_field(L, "gas_pocket_count",
+                      proposal.certificate.gas_pocket_count);
+    set_integer_field(L, "worker_count_used",
+                      proposal.certificate.worker_count_used);
+    set_number_field(L, "material_overlap_volume",
+                     proposal.certificate.material_overlap_volume);
+    lua_setfield(L, -2, "certificate");
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.decision_requests.size(); ++i) {
+        push_decision_request_table(L, proposal.decision_requests[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "decision_requests");
+    lua_newtable(L);
+    for (std::size_t i = 0; i < proposal.diagnostics.size(); ++i) {
+        push_diagnostic_table(L, proposal.diagnostics[i]);
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "diagnostics");
+}
+
 void push_surface_replacement_candidate_table(
     lua_State* L,
     const SurfaceReplacementCandidate& candidate) {
@@ -639,6 +1060,8 @@ void push_surface_replacement_candidate_table(
     set_string_field(L, "confidence", candidate.confidence);
     set_string_field(L, "reason", candidate.reason);
     set_boolean_field(L, "exact", candidate.exact);
+    set_boolean_field(L, "deviation_certified",
+                      candidate.deviation_certified);
     set_boolean_field(L, "usable", candidate.usable);
     set_number_field(L, "score", candidate.score);
     set_number_field(L, "max_deviation", candidate.max_deviation);
@@ -887,6 +1310,94 @@ ReplacementLimits replacement_limits_from_lua(lua_State* L, int index) {
     return limits;
 }
 
+bool lua_table_has_field(lua_State* L, int index, const char* key) {
+    lua_getfield(L, index, key);
+    const bool present = !lua_isnil(L, -1);
+    lua_pop(L, 1);
+    return present;
+}
+
+double lua_optional_number(lua_State* L, int index, const char* key,
+                           double fallback) {
+    lua_getfield(L, index, key);
+    const double value = lua_isnil(L, -1) ? fallback
+                                          : luaL_checknumber(L, -1);
+    lua_pop(L, 1);
+    return value;
+}
+
+bool lua_optional_bool(lua_State* L, int index, const char* key,
+                       bool fallback) {
+    lua_getfield(L, index, key);
+    const bool value = lua_isnil(L, -1) ? fallback
+                                        : lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    return value;
+}
+
+ApproximationPolicy approximation_policy_from_lua(lua_State* L, int index) {
+    ApproximationPolicy p;
+    p.enabled = true;
+    p.max_global_changed_volume_fraction =
+        lua_optional_number(L, index, "approx_global_limit", 0.0);
+    p.max_body_changed_volume_fraction =
+        lua_optional_number(L, index, "approx_body_limit",
+                            p.max_global_changed_volume_fraction);
+    p.max_action_changed_volume_fraction =
+        lua_optional_number(L, index, "approx_action_limit",
+                            p.max_body_changed_volume_fraction);
+    p.max_global_added_volume_fraction =
+        lua_optional_number(L, index, "approx_global_added_limit",
+                            p.max_global_changed_volume_fraction);
+    p.max_global_removed_volume_fraction =
+        lua_optional_number(L, index, "approx_global_removed_limit",
+                            p.max_global_changed_volume_fraction);
+    p.max_body_added_volume_fraction =
+        lua_optional_number(L, index, "approx_body_added_limit",
+                            p.max_body_changed_volume_fraction);
+    p.max_body_removed_volume_fraction =
+        lua_optional_number(L, index, "approx_body_removed_limit",
+                            p.max_body_changed_volume_fraction);
+    p.max_surface_deviation =
+        lua_optional_number(L, index, "approx_surface_deviation_limit", 0.0);
+    p.allow_surface_replacement =
+        lua_optional_bool(L, index, "allow_surface_replacement", false);
+    p.allow_bbox_replacement =
+        lua_optional_bool(L, index, "allow_bbox_replacement", false);
+    p.allow_sliver_removal =
+        lua_optional_bool(L, index, "allow_sliver_removal", false);
+    p.allow_numerical_shatter_loss =
+        lua_optional_bool(L, index, "allow_numerical_shatter_loss", false);
+    p.allow_overlap_resolution =
+        lua_optional_bool(L, index, "allow_overlap_resolution", false);
+    p.require_containment_preservation =
+        lua_optional_bool(L, index, "require_containment_preservation", true);
+    p.require_topology_preservation =
+        lua_optional_bool(L, index, "require_topology_preservation", true);
+    lua_getfield(L, index, "protected_target_ids");
+    if (lua_istable(L, -1)) {
+        const std::size_t count = lua_rawlen(L, -1);
+        for (std::size_t i = 1; i <= count; ++i) {
+            lua_rawgeti(L, -1, static_cast<lua_Integer>(i));
+            p.protected_target_ids.emplace_back(luaL_checkstring(L, -1));
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    lua_getfield(L, index, "protected_material_ids");
+    if (lua_istable(L, -1)) {
+        const std::size_t count = lua_rawlen(L, -1);
+        for (std::size_t i = 1; i <= count; ++i) {
+            lua_rawgeti(L, -1, static_cast<lua_Integer>(i));
+            p.protected_material_ids.push_back(
+                static_cast<int>(luaL_checkinteger(L, -1)));
+            lua_pop(L, 1);
+        }
+    }
+    lua_pop(L, 1);
+    return p;
+}
+
 HoleFillOptions hole_fill_options_from_lua(lua_State* L, int index) {
     HoleFillOptions options;
     if (!lua_istable(L, index)) {
@@ -1076,6 +1587,53 @@ int l_propose_hole_fills(lua_State* L) {
     return 1;
 }
 
+int l_define_material(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    luaL_checktype(L, 3, LUA_TTABLE);
+    MaterialDefinition material;
+    lua_getfield(L, 3, "id");
+    if (lua_isstring(L, -1)) material.id = lua_tostring(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, 3, "phase");
+    if (lua_isstring(L, -1))
+        material.phase = material_phase_from_string(lua_tostring(L, -1));
+    lua_pop(L, 1);
+    lua_getfield(L, 3, "density");
+    if (lua_isnumber(L, -1)) material.density = lua_tonumber(L, -1);
+    lua_pop(L, 1);
+    return push_command_result_table(
+        L, define_material(*s->session, document_id, material));
+}
+
+int l_propose_contained_medium(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    const MediumGenerationRequest request = medium_request_from_lua(L, 3);
+    push_medium_generation_proposal_table(
+        L, propose_contained_medium(*s->session, document_id, request));
+    return 1;
+}
+
+int l_stage_contained_medium_request(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    const MediumGenerationRequest request = medium_request_from_lua(L, 3);
+    return push_command_result_table(L, stage_contained_medium_request(
+        *s->session, document_id, request));
+}
+
+int l_apply_contained_medium(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    const MediumGenerationRequest request = medium_request_from_lua(L, 3);
+    lua_getfield(L, 3, "user_approved");
+    const bool approved = lua_toboolean(L, -1) != 0;
+    lua_pop(L, 1);
+    return push_command_result_table(L, apply_contained_medium(
+        *s->session, document_id, request, approved));
+}
+
 int l_fill_hole(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* document_id = luaL_checkstring(L, 2);
@@ -1088,7 +1646,42 @@ int l_fill_hole(lua_State* L) {
 int l_remove_solid(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* shape_id = luaL_checkstring(L, 2);
+    if (lua_gettop(L) >= 3 && lua_istable(L, 3)
+        && lua_table_has_field(L, 3, "approx_global_limit")) {
+        ApproximationPolicy policy = approximation_policy_from_lua(L, 3);
+        policy.allow_sliver_removal = true;
+        const ApproximationCommandResult result =
+            remove_residual_with_approximation(*s->session, shape_id, policy);
+        return push_command_result(L, result.command);
+    }
     return push_command_result(L, remove_solid(*s->session, shape_id));
+}
+
+int l_remove_solids(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    luaL_checktype(L, 2, LUA_TTABLE);
+    const lua_Integer count = luaL_len(L, 2);
+    std::vector<std::string> shape_ids;
+    shape_ids.reserve(static_cast<std::size_t>(count));
+    for (lua_Integer i = 1; i <= count; ++i) {
+        lua_rawgeti(L, 2, i);
+        shape_ids.emplace_back(luaL_checkstring(L, -1));
+        lua_pop(L, 1);
+    }
+    return push_command_result(L, remove_solids(*s->session, shape_ids));
+}
+
+int l_resolve_overlap(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* loser_id = luaL_checkstring(L, 2);
+    const char* owner_id = luaL_checkstring(L, 3);
+    luaL_checktype(L, 4, LUA_TTABLE);
+    ApproximationPolicy policy = approximation_policy_from_lua(L, 4);
+    policy.allow_overlap_resolution = true;
+    const ApproximationCommandResult result =
+        resolve_overlap_with_approximation(*s->session, loser_id, owner_id,
+                                           policy);
+    return push_command_result(L, result.command);
 }
 
 int l_replace_solid(lua_State* L) {
@@ -1097,6 +1690,13 @@ int l_replace_solid(lua_State* L) {
     const ReplacementOperation op = replacement_operation_from_lua(L, 3);
 
     if (lua_gettop(L) >= 4 && lua_istable(L, 4)) {
+        if (lua_table_has_field(L, 4, "approx_global_limit")) {
+            ApproximationPolicy policy = approximation_policy_from_lua(L, 4);
+            const ApproximationCommandResult result =
+                apply_budgeted_replacement_operation(*s->session, shape_id,
+                                                       op, policy);
+            return push_command_result(L, result.command);
+        }
         const ReplacementLimits limits = replacement_limits_from_lua(L, 4);
         ReplacementCommandResult result =
             apply_checked_replacement_operation(*s->session, shape_id, op, limits);
@@ -1194,17 +1794,56 @@ int l_apply_surface_replacement_candidate(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* face_id = luaL_checkstring(L, 2);
     const char* candidate_id = luaL_checkstring(L, 3);
-    return push_command_result(
-        L,
-        apply_surface_replacement_candidate(*s->session,
-                                            face_id,
-                                            candidate_id));
+    if (lua_gettop(L) >= 4 && lua_istable(L, 4)
+        && lua_table_has_field(L, 4, "approx_global_limit")) {
+        ApproximationPolicy policy = approximation_policy_from_lua(L, 4);
+        policy.allow_surface_replacement = true;
+        const ApproximationCommandResult result =
+            apply_budgeted_surface_replacement_candidate(
+                *s->session, face_id, candidate_id, policy);
+        return push_command_result(L, result.command);
+    }
+    return push_command_result(L, apply_surface_replacement_candidate(
+        *s->session, face_id, candidate_id));
 }
 
 int l_decompose_planar(lua_State* L) {
     LuaSession* s = check_session(L, 1);
     const char* shape_id = luaL_checkstring(L, 2);
     return push_command_result(L, decompose_planar(*s->session, shape_id));
+}
+
+int l_decompose_prismatic(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* shape_id = luaL_checkstring(L, 2);
+    return push_command_result(L, decompose_prismatic(*s->session, shape_id));
+}
+
+int l_decompose_revolution(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* shape_id = luaL_checkstring(L, 2);
+    return push_command_result(L, decompose_revolution(*s->session, shape_id));
+}
+
+int l_reuse_definition_conversion(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* target_id = luaL_checkstring(L, 2);
+    const char* source_id = luaL_checkstring(L, 3);
+    return push_command_result(L, reuse_definition_conversion(
+        *s->session, target_id, source_id));
+}
+
+int l_decompose_shell_difference(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* shape_id = luaL_checkstring(L, 2);
+    return push_command_result(
+        L, decompose_shell_difference(*s->session, shape_id));
+}
+
+int l_decompose_pipe_annulus(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* shape_id = luaL_checkstring(L, 2);
+    return push_command_result(L, decompose_pipe_annulus(*s->session, shape_id));
 }
 
 int l_decompose_by_face(lua_State* L) {
@@ -1277,6 +1916,14 @@ int l_shatter(lua_State* L) {
                 allow_volume_drift = lua_toboolean(L, -1) != 0;
             }
             lua_pop(L, 1);
+            if (lua_table_has_field(L, 3, "approx_global_limit")) {
+                ApproximationPolicy policy = approximation_policy_from_lua(L, 3);
+                policy.allow_numerical_shatter_loss = true;
+                const ApproximationCommandResult result =
+                    shatter_with_approximation(*s->session, shape_id,
+                                               max_depth, policy);
+                return push_command_result(L, result.command);
+            }
         } else if (!lua_isnil(L, 3)) {
             return luaL_error(L, "shatter expects a number or "
                                  "{ max_depth = number, allow_volume_drift = bool }");
@@ -1328,6 +1975,11 @@ int l_auto_decompose_bsp(lua_State* L) {
                 policy.allow_medium_confidence_auto = lua_toboolean(L, -1) != 0;
             }
             lua_pop(L, 1);
+            lua_getfield(L, 3, "allow_low_confidence_auto");
+            if (!lua_isnil(L, -1)) {
+                policy.allow_low_confidence_auto = lua_toboolean(L, -1) != 0;
+            }
+            lua_pop(L, 1);
             lua_getfield(L, 3, "max_relative_delta");
             if (!lua_isnil(L, -1)) {
                 policy.max_relative_delta = luaL_checknumber(L, -1);
@@ -1352,6 +2004,86 @@ int l_auto_decompose_bsp(lua_State* L) {
                                                      shape_id,
                                                      max_depth,
                                                      policy));
+}
+
+// s:decompose_to_fixed_point(doc_id[, opts])
+int l_decompose_to_fixed_point(lua_State* L) {
+    LuaSession* s = check_session(L, 1);
+    const char* document_id = luaL_checkstring(L, 2);
+    FixedPointDecompositionPolicy policy;
+    if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
+        auto take_size = [&](const char* name, std::size_t* out) {
+            lua_getfield(L, 3, name);
+            if (lua_isnumber(L, -1)) {
+                const lua_Integer value = lua_tointeger(L, -1);
+                if (value > 0) *out = static_cast<std::size_t>(value);
+            }
+            lua_pop(L, 1);
+        };
+        auto take_number = [&](const char* name, double* out) {
+            lua_getfield(L, 3, name);
+            if (lua_isnumber(L, -1)) *out = lua_tonumber(L, -1);
+            lua_pop(L, 1);
+        };
+        auto take_bool = [&](const char* name, bool* out) {
+            lua_getfield(L, 3, name);
+            if (!lua_isnil(L, -1)) *out = lua_toboolean(L, -1) != 0;
+            lua_pop(L, 1);
+        };
+        take_size("max_actions", &policy.max_actions);
+        take_size("max_candidate_evaluations", &policy.max_candidate_evaluations);
+        take_size("max_candidates_per_target",
+                  &policy.max_candidates_per_target);
+        take_size("max_splitter_calls", &policy.max_splitter_calls);
+        take_size("max_active_pieces", &policy.max_active_pieces);
+        take_size("max_residual_pieces", &policy.max_residual_pieces);
+        take_size("max_parallel_families_per_target",
+                  &policy.max_parallel_families_per_target);
+        take_size("max_planes_per_batch", &policy.max_planes_per_batch);
+        take_size("max_local_boolean_calls",
+                  &policy.max_local_boolean_calls);
+        take_size("max_stagnant_target_visits",
+                  &policy.max_stagnant_target_visits);
+        take_number("max_action_relative_volume_delta",
+                    &policy.max_action_relative_volume_delta);
+        take_number("max_cumulative_relative_volume_delta",
+                    &policy.max_cumulative_relative_volume_delta);
+        take_bool("allow_medium_certified_progress",
+                  &policy.allow_medium_certified_progress);
+        take_bool("allow_low_certified_progress",
+                  &policy.allow_low_certified_progress);
+        take_bool("allow_bbox_fallback", &policy.allow_bbox_fallback);
+        take_bool("run_shatter_fallback", &policy.run_shatter_fallback);
+        take_bool("commit_certified_partial_progress",
+                  &policy.commit_certified_partial_progress);
+        take_bool("remove_residual_slivers", &policy.remove_residual_slivers);
+        take_bool("use_incremental_trials", &policy.use_incremental_trials);
+        take_bool("run_parallel_plane_batches",
+                  &policy.run_parallel_plane_batches);
+        take_bool("verify_incremental_state_each_action",
+                  &policy.verify_incremental_state_each_action);
+    }
+    FixedPointDecompositionResult result = decompose_to_fixed_point(
+        *s->session, document_id, policy, ReportIdMode::local);
+    lua_newtable(L);
+    set_boolean_field(L, "ok", result.command.ok);
+    set_boolean_field(L, "exact", result.summary.exact);
+    set_boolean_field(L, "mutated", result.summary.mutated);
+    set_string_field(L, "stop_reason",
+                     fixed_point_stop_reason_name(result.summary.stop_reason));
+    set_integer_field(L, "actions_applied", result.summary.actions_applied);
+    set_integer_field(L, "candidates_evaluated",
+                      result.summary.candidates_evaluated);
+    set_integer_field(L, "splitter_calls", result.summary.splitter_calls);
+    set_integer_field(L, "peak_active_pieces",
+                      result.summary.peak_active_pieces);
+    set_integer_field(L, "residual_count",
+                      result.summary.final_state.residual_count);
+    set_number_field(L, "residual_volume",
+                     result.summary.final_state.residual_volume);
+    set_number_field(L, "total_volume",
+                     result.summary.final_state.total_volume);
+    return 1;
 }
 
 int l_auto_fit_splines(lua_State* L) {
@@ -1449,6 +2181,7 @@ int l_preprocess_safe_all(lua_State* L) {
             L, 3,
             {"allow_overlaps", "apply_removal_candidates", "max_depth",
              "max_deviation", "allow_medium_confidence_auto",
+             "allow_low_confidence_auto",
              "allow_bbox_fallback_auto"},
             "preprocess_safe_all");
         lua_getfield(L, 3, "allow_overlaps");
@@ -1471,6 +2204,11 @@ int l_preprocess_safe_all(lua_State* L) {
         lua_getfield(L, 3, "allow_medium_confidence_auto");
         if (!lua_isnil(L, -1)) {
             policy.allow_medium_confidence_auto = lua_toboolean(L, -1) != 0;
+        }
+        lua_pop(L, 1);
+        lua_getfield(L, 3, "allow_low_confidence_auto");
+        if (!lua_isnil(L, -1)) {
+            policy.allow_low_confidence_auto = lua_toboolean(L, -1) != 0;
         }
         lua_pop(L, 1);
         lua_getfield(L, 3, "allow_bbox_fallback_auto");
@@ -1528,14 +2266,19 @@ int l_preprocess_safe_all(lua_State* L) {
     if (!apply_removal_confidence.empty()) {
         RemovalProposal removals = suggest_removals(*s->session, doc_id,
                                                      ReportIdMode::local);
+        std::vector<std::string> removal_targets;
         for (const RemovalCandidate& c : removals.candidates) {
             const bool allowed = c.confidence == "high"
                 || (apply_removal_confidence == "medium"
                     && c.confidence == "medium");
             if (!allowed || c.suggested_action == "manual") continue;
-            CommandResult r = remove_solid(*s->session, c.solid_id,
+            removal_targets.push_back(c.solid_id);
+        }
+        if (!removal_targets.empty()) {
+            CommandResult r = remove_solids(*s->session,
+                                            removal_targets,
                                             ReportIdMode::local);
-            if (r.ok) ++removed;
+            if (r.ok) removed += removal_targets.size();
         }
     }
 
@@ -1819,10 +2562,22 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "suggest_removals");
     lua_pushcfunction(L, l_propose_hole_fills);
     lua_setfield(L, -2, "propose_hole_fills");
+    lua_pushcfunction(L, l_define_material);
+    lua_setfield(L, -2, "define_material");
+    lua_pushcfunction(L, l_propose_contained_medium);
+    lua_setfield(L, -2, "propose_contained_medium");
+    lua_pushcfunction(L, l_stage_contained_medium_request);
+    lua_setfield(L, -2, "stage_contained_medium_request");
+    lua_pushcfunction(L, l_apply_contained_medium);
+    lua_setfield(L, -2, "apply_contained_medium");
     lua_pushcfunction(L, l_fill_hole);
     lua_setfield(L, -2, "fill_hole");
     lua_pushcfunction(L, l_remove_solid);
     lua_setfield(L, -2, "remove_solid");
+    lua_pushcfunction(L, l_remove_solids);
+    lua_setfield(L, -2, "remove_solids");
+    lua_pushcfunction(L, l_resolve_overlap);
+    lua_setfield(L, -2, "resolve_overlap");
     lua_pushcfunction(L, l_replace_solid);
     lua_setfield(L, -2, "replace_solid");
     lua_pushcfunction(L, l_replace_solid_with_bbox);
@@ -1843,6 +2598,16 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "apply_surface_replacement_candidate");
     lua_pushcfunction(L, l_decompose_planar);
     lua_setfield(L, -2, "decompose_planar");
+    lua_pushcfunction(L, l_decompose_prismatic);
+    lua_setfield(L, -2, "decompose_prismatic");
+    lua_pushcfunction(L, l_decompose_revolution);
+    lua_setfield(L, -2, "decompose_revolution");
+    lua_pushcfunction(L, l_reuse_definition_conversion);
+    lua_setfield(L, -2, "reuse_definition_conversion");
+    lua_pushcfunction(L, l_decompose_shell_difference);
+    lua_setfield(L, -2, "decompose_shell_difference");
+    lua_pushcfunction(L, l_decompose_pipe_annulus);
+    lua_setfield(L, -2, "decompose_pipe_annulus");
     lua_pushcfunction(L, l_decompose_by_face);
     lua_setfield(L, -2, "decompose_by_face");
     lua_pushcfunction(L, l_decompose_by_plane);
@@ -1857,6 +2622,8 @@ void register_session(lua_State* L) {
     lua_setfield(L, -2, "apply_decomposition_candidate");
     lua_pushcfunction(L, l_auto_decompose_bsp);
     lua_setfield(L, -2, "auto_decompose_bsp");
+    lua_pushcfunction(L, l_decompose_to_fixed_point);
+    lua_setfield(L, -2, "decompose_to_fixed_point");
     lua_pushcfunction(L, l_auto_fit_splines);
     lua_setfield(L, -2, "auto_fit_splines");
     lua_pushcfunction(L, l_compare_volumes);
@@ -1940,6 +2707,15 @@ int l_module_operations(lua_State* L) {
         set_integer_field(L, "version", descriptor.version);
         set_string_field(L, "cli_flag", descriptor.cli_flag);
         set_string_field(L, "lua_value", descriptor.lua_value);
+        set_string_field(L, "autonomy_argument_schema",
+                         descriptor.autonomy_argument_schema);
+        set_boolean_field(L, "autonomy_supported",
+                          descriptor.autonomy_supported);
+        set_boolean_field(L, "qt_review_supported",
+                          descriptor.qt_review_supported);
+        set_boolean_field(L, "restart_supported",
+                          descriptor.restart_supported);
+        set_string_field(L, "recovery_action", descriptor.recovery_action);
         lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
     }
     return 1;

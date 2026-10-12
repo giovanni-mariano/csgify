@@ -13,6 +13,7 @@
 #include "decompose.hpp"
 #include "engine_internal.hpp"
 #include "engine_model.hpp"
+#include "topology_analysis.hpp"
 
 #include <cmath>
 #include <cstddef>
@@ -45,35 +46,30 @@ bool shatter_solid(CadModel& model,
         return false;
     }
 
-    std::size_t target_index = 0;
-    if (!parse_solid_id(id, &target_index)) {
+    std::string source_solid_id;
+    TopoDS_Shape active_shape;
+    if (!active_shape_for_id(model, id, &active_shape, &source_solid_id)) {
         model.diagnostics.push_back({
             DiagnosticSeverity::error, "solid_not_found",
-            "Shatter target must be a solid:N identifier.", id});
+            "Requested active solid or decomposition piece was not found.", id});
         return false;
     }
-
     TopoDS_Solid root_solid;
-    std::size_t solid_index = 0;
-    bool found = false;
-    {
-        std::size_t i = 0;
-        for (TopExp_Explorer exp(model.root, TopAbs_SOLID); exp.More(); exp.Next()) {
-            ++i;
-            if (i == target_index) {
-                root_solid = TopoDS::Solid(exp.Current());
-                solid_index = i;
-                found = true;
-                break;
-            }
-        }
+    if (active_shape.ShapeType() == TopAbs_SOLID) {
+        root_solid = TopoDS::Solid(active_shape);
+    } else {
+        TopExp_Explorer exp(active_shape, TopAbs_SOLID);
+        if (exp.More()) root_solid = TopoDS::Solid(exp.Current());
     }
-    if (!found) {
+    if (root_solid.IsNull()) {
         model.diagnostics.push_back({
             DiagnosticSeverity::error, "solid_not_found",
-            "Requested solid ID was not found.", id});
+            "Requested target does not materialize as one solid.", id});
         return false;
     }
+    std::size_t solid_index = 100000 + model.decomposed_pieces.size();
+    std::size_t imported_index = 0;
+    if (parse_solid_id(id, &imported_index)) solid_index = imported_index;
 
     GProp_GProps root_props;
     BRepGProp::VolumeProperties(root_solid, root_props);
@@ -100,6 +96,27 @@ bool shatter_solid(CadModel& model,
                                               scratch, false, false, false,
                                               &model.face_replacements);
     };
+
+    if (is_simple(root_solid)) {
+        model.diagnostics.push_back({
+            DiagnosticSeverity::info, "shatter_not_needed",
+            "Solid already validates as a single convex halfspace cell; "
+            "no subdivision applied.", id});
+        return true;
+    }
+
+    // All-planar prismatic non-convex solids are the pathological case for
+    // the legacy all-surfaces fallback: one batch splitter builds the complete
+    // 3D plane arrangement. Use the bounded sequential profile/slab strategy.
+    const SolidTopology topology =
+        analyze_solid_topology(root_solid, original_volume, options);
+    if (topology.prismatic_candidate) {
+        return decompose_solid_prismatic(model, id, options);
+    }
+    if (topology.revolution.candidate
+        && topology.revolution.full_revolution) {
+        return decompose_solid_revolution(model, id, options);
+    }
 
     auto face_at = [](const TopoDS_Solid& solid, std::size_t index) -> TopoDS_Face {
         std::size_t i = 0;
@@ -189,9 +206,10 @@ bool shatter_solid(CadModel& model,
         }
         model.diagnostics.push_back({
             DiagnosticSeverity::error, "shatter_residual_nonconvex",
-            "Solid is non-convex but no surface cut subdivided it; it likely "
-            "needs surface replacement (torus/spline) rather than "
-            "decomposition. No CSG emitted.", id});
+            "Solid is non-convex but no bounded surface or closure-plane cut "
+            "subdivided it. Surface replacement may help for curved supports; "
+            "otherwise an additional decomposition strategy is required. No "
+            "CSG was emitted.", id});
         return false;
     }
 
@@ -267,14 +285,23 @@ bool shatter_solid(CadModel& model,
             : DiagnosticSeverity::warning,
         "shatter", msg.str(), id});
 
-    remove_solid(model, id);
+    bool deactivated = false;
+    for (DecomposedSolidPiece& existing : model.decomposed_pieces) {
+        if (existing.id == id && existing.active) {
+            existing.active = false;
+            deactivated = true;
+            break;
+        }
+    }
+    if (!deactivated) remove_solid(model, id);
     for (const TopoDS_Solid& piece : kept) {
         GProp_GProps props;
         BRepGProp::VolumeProperties(piece, props);
         DecomposedSolidPiece decomposed;
         decomposed.id = "piece:" + std::to_string(model.decomposed_pieces.size() + 1);
         decomposed.label = decomposed.id + "/from_" + id;
-        decomposed.source_solid_id = id;
+        decomposed.source_solid_id = source_solid_id.empty()
+            ? id : source_solid_id;
         decomposed.solid = piece;
         decomposed.volume = std::abs(props.Mass());
         model.decomposed_pieces.push_back(decomposed);

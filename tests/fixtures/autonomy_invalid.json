@@ -1,0 +1,16 @@
+{
+  "schema": "csgify.autonomy-actions",
+  "schema_version": 2,
+  "request_id": "request:invented-op",
+  "source_digest": "5990a67a9bfdb9444fa199d46e9d2e02",
+  "expected_revision": 0,
+  "actor": "llm:test",
+  "actions": [
+    {
+      "id": "invented-op",
+      "op": "delete_everything",
+      "target": "doc:1",
+      "rationale": "This operation must be denied."
+    }
+  ]
+}

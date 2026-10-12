@@ -70,10 +70,9 @@ decomp_step="$outdir/l_shape_decomposed.step"
 decomp_dump="$outdir/l_shape_decomposed_assembly.txt"
 "$exe" dump-assembly "$decomp_step" >"$decomp_dump" 2>/dev/null \
     || fail "could not re-import decomposed STEP assembly"
-grep -q "piece:1" "$decomp_dump" \
-    || fail "decomposed STEP did not preserve piece:1 name"
-grep -q "piece:2" "$decomp_dump" \
-    || fail "decomposed STEP did not preserve piece:2 name"
+piece_names=$(grep -c "^solid:.* / piece:" "$decomp_dump")
+[[ "$piece_names" -eq 2 ]] \
+    || fail "decomposed STEP did not preserve two coalesced piece names"
 
 # Fully auto-fitted spline primitives should not leak their original
 # B-spline faces into the review STEP.

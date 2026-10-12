@@ -12,6 +12,8 @@ namespace csgify {
 
 struct DocumentRevisionState {
     CadModel model;
+    ApproximationLedger approximation_ledger;
+    bool approximation_ledger_initialized = false;
     std::size_t synthetic_body_high_water = 0;
     std::size_t decomposed_piece_high_water = 0;
     std::vector<std::pair<std::string, std::string>> known_overlap_pairs;
@@ -24,6 +26,8 @@ struct CadDocument {
     CadModel model;
     ConversionReport report;
     PerformanceMetrics performance;
+    ApproximationLedger approximation_ledger;
+    bool approximation_ledger_initialized = false;
 
     // High-water marks for the mutation-overlap check. After each
     // mutating call, only synthetic bodies / decomposed pieces with
@@ -59,6 +63,7 @@ struct Session {
     HoleFillProposal last_hole_fill_proposal_value;
     SurfaceReplacementProposal last_surface_replacement_proposal_value;
     std::vector<CadDocument> documents;
+    std::vector<DecisionReviewRecord> reviews;
     std::unique_ptr<DecisionLog> log;
 };
 

@@ -24,13 +24,21 @@ namespace csgify {
 struct ViewerReviewAlternative {
     std::string review_id;          // removal:N
     std::string target_id;          // scoped solid id to highlight and act on
+    std::string component_instance_id;
+    std::string component_definition_id;
+    std::string label;
+    std::string name;
+    std::string hierarchy_path;
     std::string confidence;         // high, medium, low
     double volume_fraction = 0.0;
     double score = 0.0;
+    std::vector<std::string> reason_codes;
+    std::vector<std::string> blockers;
+    std::string suggested_action;
 };
 
 struct ViewerReviewContext {
-    std::string kind;         // removal, removal_set, hole_fill, decomposition, surface_replacement, or empty
+    std::string kind;         // removal, removal_set, hole_fill, decomposition, surface_replacement, contained_medium, or empty
     std::string review_id;    // removal:N, hole-fill:N, candidate:N
     std::string action;       // remove_solid, fill_hole, apply_decomposition_candidate, ...
     std::string target_id;    // scoped solid id when available
@@ -39,10 +47,14 @@ struct ViewerReviewContext {
     bool has_hole_fill = false;
     SurfaceReplacementCandidate surface_replacement;
     bool has_surface_replacement = false;
+    MediumGenerationProposal medium_proposal;
+    MediumGenerationRequest medium_request;
+    bool has_medium = false;
     // When non-empty (kind == "removal_set"), the viewer shows every
     // alternative at once and lets the user Tab through them; A/X act on the
     // active one. `action` still names the command emitted on accept.
     std::vector<ViewerReviewAlternative> alternatives;
+    DecisionAuditContext audit;
 };
 
 enum class AltState { pending, accepted, rejected };
@@ -90,6 +102,11 @@ public:
     ViewerAction reject_active();                       // X
     ViewerAction remove_target(const std::string& id);  // R (GUI passes selection)
     ViewerAction cycle(bool forward);                   // Tab / Shift-Tab
+    ViewerAction select_candidate(const std::string& id); // GUI candidate table
+    void configure_decomposition_review(const std::string& target_id,
+                                        const std::string& candidate_id,
+                                        const DecisionAuditContext& audit = {});
+    ViewerAction undo();                                // U
     bool commit(const std::string& out_path);           // Q + --out -> emit deck
 
 private:

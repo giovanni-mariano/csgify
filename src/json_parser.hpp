@@ -142,7 +142,9 @@ private:
             const std::string key = parse_string_raw();
             skip_ws();
             expect(':');
-            v->obj[key] = parse_value();
+            if (v->obj.find(key) != v->obj.end())
+                fail("duplicate object key '" + key + "'");
+            v->obj.emplace(key, parse_value());
             skip_ws();
             const char c = peek();
             if (c == ',') { ++pos_; continue; }

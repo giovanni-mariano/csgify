@@ -6,8 +6,8 @@
 #   - default convert (`csgify input.step output.i`) refuses to write
 #     the .i file when overlaps are present
 #   - preprocess --safe-all refuses to proceed
-#   - --allow-overlaps downgrades the diagnostic to warning and lets
-#     emit proceed (escape hatch for advanced workflows)
+#   - --allow-overlaps downgrades inspection/intermediate diagnostics only;
+#     production MCNP emission remains blocked
 #
 # Each branch is checked here so the gate cannot silently regress.
 
@@ -32,6 +32,16 @@ status=$?
     || fail "default convert should refuse overlapping input (got exit 0)"
 [ ! -e "$outdir/refused.i" ] \
     || fail "default convert wrote a .i file despite overlap"
+
+# A failed attempt must not clobber an earlier valid deck or leave a temporary
+# deck that could be mistaken for usable output.
+printf '%s\n' 'previous-valid-deck' >"$outdir/preserved.i"
+"$exe" "$bad" "$outdir/preserved.i" >/dev/null 2>&1 || true
+grep -qx 'previous-valid-deck' "$outdir/preserved.i" \
+    || fail "failed emission clobbered an existing deck"
+if compgen -G "$outdir/preserved.i.csgify-tmp-*" >/dev/null; then
+    fail "failed emission left a temporary MCNP artifact"
+fi
 
 # ---- direct session emit refuses without caller-side analyze -------------
 cat >"$outdir/direct_emit.lua" <<'LUA'
@@ -73,7 +83,7 @@ grep -q "preprocess_overlaps_present" "$outdir/safe_all.err" \
 [ ! -e "$outdir/safe_all.step" ] \
     || fail "preprocess --safe-all wrote --out-step despite abort"
 
-# ---- --allow-overlaps lets it through -----------------------------------
+# ---- --allow-overlaps remains available for inspection ------------------
 "$exe" inspect "$bad" --allow-overlaps --report "$outdir/allowed.json" \
     >/dev/null 2>&1
 status=$?
@@ -100,6 +110,57 @@ rm -f "$outdir/allow_safe_all.step"
     --out-step "$outdir/allow_safe_all.step" >/dev/null 2>&1 || true
 [ -s "$outdir/allow_safe_all.step" ] \
     || fail "preprocess --safe-all --allow-overlaps did not write --out-step"
+
+# ---- bounded single-owner resolution -----------------------------------
+# The overlap is exactly 1 mm^3. Each source box is 8 mm^3 and the document
+# baseline is 16 mm^3, so 5% is too small while 20% permits the operation.
+rm -f "$outdir/resolved.i" "$outdir/resolved.step" "$outdir/resolved.json" \
+    "$outdir/resolved.log"
+if "$exe" decompose-apply "$bad" --out "$outdir/too_small.i" \
+    --approx-volume 5% --allow-shatter-fallback \
+    >/dev/null 2>"$outdir/too_small.err"; then
+    fail "overlap ownership exceeded its 5% body budget but was accepted"
+fi
+grep -q "approximation_action_budget_exceeded\|approximation_body_budget_exceeded" \
+    "$outdir/too_small.err" \
+    || fail "small-budget overlap rejection omitted its measured reason"
+
+"$exe" decompose-apply "$bad" --out "$outdir/resolved.i" \
+    --out-step "$outdir/resolved.step" --approx-volume 20% \
+    --allow-shatter-fallback --max-actions 16 \
+    --log "$outdir/resolved.log" \
+    --report "$outdir/resolved.json" >/dev/null 2>"$outdir/resolved.err" \
+    || fail "bounded overlap ownership/decomposition failed"
+python3 - "$outdir/resolved.json" <<'PY' || exit 1
+import json, sys
+r = json.load(open(sys.argv[1]))
+s = r["mcnp_geometry_safety"]
+a = r["approximation"]
+assert s["validated"] is True and s["safe_to_emit"] is True
+assert s["overlap_count"] == 0 and s["overlap_unknown_count"] == 0
+assert a["policy"]["allow_overlap_resolution"] is True
+assert abs(a["ledger"]["cumulative_removed_volume"] - 1.0) < 1e-8
+assert a["ledger"]["cumulative_added_volume"] == 0
+assert sum(b["accepted_actions"] for b in a["ledger"]["bodies"]) == 1
+PY
+[ -s "$outdir/resolved.i" ] || fail "resolved overlap wrote no MCNP deck"
+[ -s "$outdir/resolved.step" ] || fail "resolved overlap wrote no STEP"
+
+# Ownership is causal: compaction must retain it before the decomposition,
+# and replay must reproduce both the deck and terminal approximation ledger.
+"$exe" compact "$outdir/resolved.log" --out "$outdir/resolved-recipe.lua" \
+    >/dev/null || fail "could not compact overlap-ownership recipe"
+grep -q 's:resolve_overlap(' "$outdir/resolved-recipe.lua" \
+    || fail "compactor dropped the overlap-ownership decision"
+"$exe" replay "$outdir/resolved-recipe.json" --step "$bad" \
+    --out "$outdir/resolved-replay.i" \
+    --report "$outdir/resolved-replay.json" >/dev/null \
+    || fail "overlap-ownership recipe did not replay"
+cmp "$outdir/resolved.i" "$outdir/resolved-replay.i" \
+    || fail "overlap-ownership replay deck differs"
+grep -q '"postconditions": {"checked":true,"passed":true}' \
+    "$outdir/resolved-replay.json" \
+    || fail "overlap-ownership ledger postcondition failed"
 
 echo "overlap_gate_smoke: OK"
 exit 0

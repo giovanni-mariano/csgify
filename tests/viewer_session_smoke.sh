@@ -11,7 +11,7 @@
 #
 # This exercises the viewer's actual decision code (remove_target / accept /
 # reject / cycle / commit), not an analogue. The only untested remainder is the
-# X11 keysym -> controller-call mapping in src/viewer.cpp.
+# Qt signal / X11 keysym -> controller-call mapping in the GUI frontends.
 set -u
 
 exe="$1"
@@ -47,8 +47,12 @@ removals=$(grep -o '"op":"remove_solid"' "$log" | wc -l | tr -d ' ')
 recipe="$outdir/recipe.lua"
 "$exe" compact "$log" --out "$recipe" >/dev/null 2>&1 \
     || fail "compact returned non-zero"
-[[ "$(grep -c remove_solid "$recipe")" == "2" ]] \
-    || fail "recipe missing the two removals"
+grep -q 's:remove_solids({' "$recipe" \
+    || fail "recipe did not batch the two removals"
+grep -q 'doc:1/solid:2' "$recipe" \
+    || fail "recipe missing removal target solid:2"
+grep -q 'doc:1/solid:4' "$recipe" \
+    || fail "recipe missing removal target solid:4"
 
 replay="$outdir/replay.i"
 sed "s#$direct#$replay#" "$recipe" > "$outdir/recipe_run.lua"
@@ -57,7 +61,20 @@ sed "s#$direct#$replay#" "$recipe" > "$outdir/recipe_run.lua"
 diff "$direct" "$replay" >/dev/null 2>&1 \
     || fail "replayed deck differs from the logged-session deck"
 
-# --- 3. removal-set state machine: Tab / reject / accept --------------------
+# --- 3. undo uses the session journal and is itself auditable ---------------
+ulog="$outdir/undo.json"
+uout="$outdir/undo.i"
+rm -f "$ulog" "$uout" "$outdir/undo-stdout.txt"
+"$exe" view "$step" \
+    --keys "R:doc:1/solid:2,U,Q" --log "$ulog" --out "$uout" \
+    >"$outdir/undo-stdout.txt" 2>/dev/null \
+    || fail "headless viewer undo returned non-zero"
+grep -q '^logged undo_last_mutation doc:1$' "$outdir/undo-stdout.txt" \
+    || fail "undo did not report the restored document state"
+grep -q '"op":"undo_last_mutation"' "$ulog" \
+    || fail "undo was not recorded in the decision log"
+
+# --- 4. removal-set state machine: Tab / reject / accept --------------------
 # Only run if the private rails fixture (which has removal candidates) exists.
 rails="$fixtures/rails.stp"
 if [[ -f "$rails" ]]; then

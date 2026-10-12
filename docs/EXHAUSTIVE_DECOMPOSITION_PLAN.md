@@ -132,22 +132,26 @@ precise residual diagnostic rather than a silent wrong cell.
 
 ---
 
-### Phase 3 — Union reconstruction at emit (faithful output)
+### Phase 3 — OCCT coalescing and union reconstruction (faithful output)
 
-Currently each piece is emitted as an independent Alea cell (emit.cpp:495-510 loops
-`model.decomposed_pieces` and calls `convert_solid` per piece). To represent "one
-CAD solid = one body," group pieces by `source_solid_id` and emit **one cell whose
-root is `alea_union_n` of the per-piece intersection nodes**:
+Before emission, run a fixed-point OCCT coalescing pass over pieces sharing a
+`source_solid_id`. Fuse only adjacent pieces whose result is one valid solid,
+whose volume equals the input sum within the decomposition tolerance, and whose
+result passes the convex half-space certificate. This removes artificial split
+boundaries from both the review STEP and the final CSG.
+
+Then represent "one CAD solid = one body" by grouping the remaining pieces by
+`source_solid_id` and emitting **one cell whose root is `alea_union_n` of the
+per-piece intersection nodes**:
 
 - Refactor the per-solid body of `convert_solid` (emit.cpp:154-210) so the
   half-space-intersection construction is callable as
   `build_simple_cell_node(sys, solid, ...) -> alea_node_id_t` (no `alea_add_cell`).
 - In `convert_model` (emit.cpp:495-510), for each `source_solid_id` collect its
   active pieces, build each node, `alea_union_n` them, and `alea_add_cell` once.
-- Let Alea collapse the algebra: the existing `alea_simplify_and_prune_cells` call
-  (emit.cpp:529) already runs NNF + dedup + absorption. Enable surface dedup
-  (`cfg.dedup`) so the shared cut surfaces between adjacent pieces are merged into
-  one MCNP surface.
+- Let Alea perform secondary algebraic cleanup: the existing
+  `alea_simplify_and_prune_cells` call runs NNF + dedup + absorption after OCCT
+  has already established the maximal convex geometry.
 - Keep `options.split_union_cells` (emit.cpp:526) as the opt-out: callers who want
   the pieces as separate MCNP cells get `alea_split_union_cells` for free.
 

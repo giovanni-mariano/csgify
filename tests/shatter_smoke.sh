@@ -86,30 +86,36 @@ PY
 # --- 1c. large-coordinate assembly: a rails solid far from the origin -----
 # rails.stp sits at coordinates ~1e4. Before cutters were anchored on the
 # target solid, the bounded cutter face was centered on each surface's
-# intrinsic Location and never reached the part, so the split silently failed
-# and the solid stayed residual. The Boolean halfspace certificate now detects
-# a residual that the old vertex-only test missed. The safe contract is to
-# reject the entire mutation and preserve the source model.
+# intrinsic Location and never reached the part, so the split silently failed.
+# This all-planar solid must now shatter and coalesce into certified pieces.
+# Emission still fails because the untouched rails assembly contains other
+# non-convex solids; that unrelated global result must not roll back solid:16.
 rails="$fixtures/rails.stp"
 if [[ -f "$rails" ]]; then
     rails_report="$outdir/rails16.json"
-    if "$exe" simplify "$rails" --shatter solid:16 --out "$outdir/rails16.i" \
-        --report "$rails_report" --max-depth 8 >/dev/null 2>&1; then
-        fail "uncertified rails solid:16 shatter unexpectedly succeeded"
-    fi
+    "$exe" simplify "$rails" --shatter solid:16 --out "$outdir/rails16.i" \
+        --report "$rails_report" --max-depth 8 >/dev/null 2>&1 || true
     python3 - "$rails_report" <<'PY' || exit 1
 import json, sys
 r = json.load(open(sys.argv[1]))
 codes = {d.get("code") for d in r.get("diagnostics", [])}
-for required in ("shatter_residual_nonconvex", "mutation_rolled_back"):
+for required in ("shatter", "decomposition_pieces_coalesced"):
     if required not in codes:
         print(f"rails solid:16: missing {required}", file=sys.stderr)
         sys.exit(1)
-if r.get("document_revision") != 0:
-    print("rails solid:16: rejected shatter advanced revision", file=sys.stderr)
+for forbidden in ("shatter_residual_nonconvex", "mutation_rolled_back"):
+    if forbidden in codes:
+        print(f"rails solid:16: unexpected {forbidden}", file=sys.stderr)
+        sys.exit(1)
+if r.get("document_revision") != 1:
+    print("rails solid:16: accepted shatter did not advance revision", file=sys.stderr)
     sys.exit(1)
-if r.get("decomposed_pieces"):
-    print("rails solid:16: rejected shatter leaked pieces", file=sys.stderr)
+pieces = r.get("decomposed_pieces", [])
+if len(pieces) != 4:
+    print(f"rails solid:16: expected 4 coalesced pieces, got {len(pieces)}", file=sys.stderr)
+    sys.exit(1)
+if not all(p.get("exact_csg_supported") for p in pieces):
+    print("rails solid:16: an emitted piece is not exact-CSG certified", file=sys.stderr)
     sys.exit(1)
 PY
 fi
@@ -189,6 +195,22 @@ pieces = r.get("decomposed_pieces", [])
 if pieces:
     print(f"no-op shatter unexpectedly produced pieces: {pieces}", file=sys.stderr)
     sys.exit(1)
+PY
+
+# --- 5. standalone shatter uses the common numeric approximation ledger ----
+approx_report="$outdir/shatter_approximation.json"
+"$exe" shatter "$step" --out "$outdir/shatter_approximation.i" \
+    --target solid:1 --approx-volume 0.1% --report "$approx_report" \
+    >/dev/null 2>&1 || fail "standalone budgeted shatter returned non-zero"
+python3 - "$approx_report" <<'PY' || exit 1
+import json, sys
+r = json.load(open(sys.argv[1]))
+a = r["approximation"]
+assert a["enabled"] is True
+assert abs(a["policy"]["max_global_changed_volume_fraction"] - 0.001) < 1e-12
+assert a["ledger"]["bodies"][0]["accepted_actions"] == 1
+assert a["ledger"]["cumulative_changed_volume"] < 1e-6
+assert r["mcnp_geometry_safety"]["safe_to_emit"] is True
 PY
 
 echo "shatter_smoke: ok"

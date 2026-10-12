@@ -14,6 +14,9 @@
 // faces is deferred — face ids are not stable enough to make it useful
 // without per-face fingerprints.
 
+#include "csgify/session.hpp"
+
+#include <cstddef>
 #include <string>
 
 namespace csgify {
@@ -25,6 +28,33 @@ struct ReplayOptions {
     // Centroid distance must satisfy d <= rel_tolerance * bbox_diagonal
     // (so the threshold scales with the part's size).
 };
+
+struct ReconstructedSession {
+    SessionPtr session;
+    DocumentId document_id;
+    int status = 2;
+    std::string error;
+    bool same_source = false;
+    bool preparation_bound = false;
+    std::size_t applied_count = 0;
+    std::size_t soft_applied_count = 0;
+    std::size_t unmatched_count = 0;
+    std::size_t ambiguous_count = 0;
+    std::size_t dispatch_failed_count = 0;
+};
+
+// Reconstructs a live session through the same typed recipe dispatcher used
+// by CLI replay, but deliberately skips historical export commands. When
+// require_preparation_match is true, legacy recipes without explicit healing
+// and unit preparation or recipes that differ from expected_options fail
+// closed and return no session.
+ReconstructedSession reconstruct_recipe_session(
+    const std::string& recipe_json_path,
+    const std::string& step_override,
+    const ConversionOptions& expected_options,
+    const std::string& report_path = {},
+    const ReplayOptions& options = {},
+    bool require_preparation_match = true);
 
 // Replay a recipe.json against `step_override` (or, if empty, the
 // step_path recorded in the recipe). Writes the converted MCNP deck to

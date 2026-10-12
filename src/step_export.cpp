@@ -2,6 +2,8 @@
 
 #include "engine_internal.hpp"  // parse_solid_id
 #include "engine_model.hpp"
+#include "occt_boolean.hpp"
+#include "occt_document_guard.hpp"
 
 #include <fstream>
 #include <iostream>
@@ -134,6 +136,13 @@ std::string source_name_from_replacement_label(const CadModel& model,
 
 std::string export_name_for_synthetic(const CadModel& model,
                                       const SyntheticBody& body) {
+    if (body.role == "contained_medium") {
+        std::string host_name = body.host_solid_id;
+        std::size_t host_index = 0;
+        if (detail::parse_solid_id(body.host_solid_id, &host_index))
+            host_name = fallback_name_for_solid(model, host_index);
+        return host_name + " / contained medium";
+    }
     if (body.role == "hole_fill") {
         std::string host_name = body.host_solid_id;
         std::size_t host_index = 0;
@@ -275,16 +284,16 @@ TopoDS_Shape build_synthetic_recursive(
     TopoDS_Shape result;
     try {
         if (body.kind == SyntheticBodyKind::union_body) {
-            BRepAlgoAPI_Fuse op(left_shape, right_shape);
-            op.Build();
+            BRepAlgoAPI_Fuse op;
+            detail::build_binary_boolean(op, left_shape, right_shape);
             if (op.IsDone()) result = op.Shape();
         } else if (body.kind == SyntheticBodyKind::intersection_body) {
-            BRepAlgoAPI_Common op(left_shape, right_shape);
-            op.Build();
+            BRepAlgoAPI_Common op;
+            detail::build_binary_boolean(op, left_shape, right_shape);
             if (op.IsDone()) result = op.Shape();
         } else if (body.kind == SyntheticBodyKind::difference_body) {
-            BRepAlgoAPI_Cut op(left_shape, right_shape);
-            op.Build();
+            BRepAlgoAPI_Cut op;
+            detail::build_binary_boolean(op, left_shape, right_shape);
             if (op.IsDone()) result = op.Shape();
         }
     } catch (...) {
@@ -313,7 +322,8 @@ TopoDS_Shape build_synthetic_shape(const CadModel& model,
 
 } // namespace detail
 
-int export_step(const CadModel& model, const std::string& output_path) {
+int export_step(const CadModel& model, const std::string& output_path,
+                StepExportProgressCallback progress) {
     if (model.root.IsNull()) {
         std::cerr << "error step_export: model root is null\n";
         return 1;
@@ -321,7 +331,10 @@ int export_step(const CadModel& model, const std::string& output_path) {
 
     CoutSilencer silence_occt_transfer_stats;
     Handle(TDocStd_Document) doc;
-    XCAFApp_Application::GetApplication()->NewDocument("MDTV-XCAF", doc);
+    const Handle(XCAFApp_Application) application =
+        XCAFApp_Application::GetApplication();
+    application->NewDocument("MDTV-XCAF", doc);
+    detail::XcafDocumentGuard document_guard(application, doc);
     Handle(XCAFDoc_ShapeTool) shape_tool =
         XCAFDoc_DocumentTool::ShapeTool(doc->Main());
     if (shape_tool.IsNull()) {
@@ -331,6 +344,32 @@ int export_step(const CadModel& model, const std::string& output_path) {
     XCAFDoc_ShapeTool::SetAutoNaming(false);
 
     const std::unordered_set<std::size_t> removed = removed_indices(model);
+
+    std::size_t total = 0;
+    std::size_t source_index = 0;
+    for (TopExp_Explorer exp(model.root, TopAbs_SOLID); exp.More(); exp.Next()) {
+        ++source_index;
+        if (!removed.count(source_index)) ++total;
+    }
+    for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
+        if (piece.active && !piece.solid.IsNull()) ++total;
+    }
+    for (const CadBooleanBody& body : model.cad_boolean_bodies) {
+        if (body.active && !body.materialized_solid.IsNull()) ++total;
+    }
+    for (const SyntheticBody& body : model.synthetic_bodies) {
+        if (body.emit_as_cell) ++total;
+    }
+    std::size_t completed = 0;
+    const auto publish = [&](const std::string& target_id) {
+        ++completed;
+        if (!progress) return true;
+        try {
+            return progress(completed, total, target_id);
+        } catch (...) {
+            return false;
+        }
+    };
 
     // Surviving solids from the original root. Index matches solid:N.
     std::size_t index = 0;
@@ -342,6 +381,9 @@ int export_step(const CadModel& model, const std::string& output_path) {
                         exp.Current(),
                         fallback_name_for_solid(model, index),
                         &transferred);
+        if (!publish("solid:" + std::to_string(index))) {
+            return static_cast<int>(StepExportStatus::cancelled);
+        }
     }
 
     // Decomposition pieces — they replaced their source solid, which is
@@ -353,6 +395,21 @@ int export_step(const CadModel& model, const std::string& output_path) {
                         piece.solid,
                         export_name_for_piece(model, piece),
                         &transferred);
+        if (!publish(piece.id)) {
+            return static_cast<int>(StepExportStatus::cancelled);
+        }
+    }
+
+    // Shell-difference bodies retain the exact imported solid for CAD export;
+    // their positive/negative cell representation is an emission detail.
+    for (const CadBooleanBody& body : model.cad_boolean_bodies) {
+        if (!body.active || body.materialized_solid.IsNull()) continue;
+        add_named_shape(shape_tool, body.materialized_solid,
+                        body.label.empty() ? body.id : body.label,
+                        &transferred);
+        if (!publish(body.id)) {
+            return static_cast<int>(StepExportStatus::cancelled);
+        }
     }
 
     // Synthetic bodies, including recursively materialized Boolean nodes.
@@ -368,11 +425,24 @@ int export_step(const CadModel& model, const std::string& output_path) {
                         shape,
                         export_name_for_synthetic(model, body),
                         &transferred);
+        if (!publish(body.id)) {
+            return static_cast<int>(StepExportStatus::cancelled);
+        }
     }
 
     if (transferred == 0) {
         std::cerr << "error step_export: nothing to write (every solid removed?)\n";
         return 1;
+    }
+
+    if (progress) {
+        try {
+            if (!progress(completed, total, {})) {
+                return static_cast<int>(StepExportStatus::cancelled);
+            }
+        } catch (...) {
+            return static_cast<int>(StepExportStatus::cancelled);
+        }
     }
 
     STEPCAFControl_Writer writer;

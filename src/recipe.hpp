@@ -20,6 +20,9 @@ namespace csgify {
 
 struct CompactRecipeOptions {
     bool include_provenance_header = true;
+    // Retain the latest recorded export_step and its path. Off by default so
+    // replay does not create a STEP side output unless explicitly requested.
+    bool preserve_step_exports = false;
 };
 
 // Reads the JSON decision log at `log_path`, compacts it, and writes a

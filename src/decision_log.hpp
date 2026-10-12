@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "engine_model.hpp"  // ShapeFingerprint
+#include "csgify/session.hpp" // DecisionAuditContext
 
 namespace csgify {
 
@@ -66,16 +67,29 @@ public:
 
     // Append an undo record referencing a prior decision by sequence number.
     void record_undo(std::size_t undoes_seq);
+    void record_review(const std::string& target_id,
+                       const std::string& proposal_id,
+                       const std::string& decision,
+                       const std::string& review_kind = {},
+                       const std::string& action = {},
+                       const std::string& candidate_id = {},
+                       std::size_t base_revision = 0);
 
     const std::string& path() const { return path_; }
     std::size_t last_sequence() const { return seq_; }
+    void set_audit_context(const DecisionAuditContext& context) {
+        audit_context_ = context;
+    }
+    void clear_audit_context() { audit_context_ = {}; }
 
 private:
+    void append_line(const std::string& line, const char* failure_message);
     void write_manifest(const std::string& step_path);
 
     std::string path_;
     std::ofstream out_;
     std::size_t seq_ = 0;        // last assigned seq; 0 == manifest
+    DecisionAuditContext audit_context_;
 };
 
 } // namespace csgify

@@ -124,7 +124,7 @@ import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 summary = report["summary"]
-assert summary["solids_converted"] == 2, summary
+assert summary["solids_converted"] == 1, summary
 codes = {d["code"] for d in report["diagnostics"]}
 assert "plane_decomposition" in codes, codes
 PY
@@ -140,7 +140,7 @@ assert_codes "$outdir/cylinder.json" ""
 # ---- non-convex solid: must produce the documented decomposition code ----
 
 run_inspect l_shape.step "$outdir/l_shape.json"
-assert_codes "$outdir/l_shape.json" "nonconvex_solid_requires_decomposition"
+assert_codes "$outdir/l_shape.json" "nonconvex_solid_requires_decomposition,prismatic_solid_detected"
 python3 - "$outdir/l_shape.json" <<'PY'
 import json
 import sys
@@ -149,7 +149,7 @@ requests = report["decision_requests"]
 decomp = [r for r in requests
           if r["kind"] == "decomposition" and r["target_id"] == "solid:1"]
 assert len(decomp) == 1, requests
-assert decomp[0]["recommended_action"] == "decompose-suggest", decomp[0]
+assert decomp[0]["recommended_action"] == "prismatic_decomposition", decomp[0]
 assert decomp[0]["candidates"], decomp[0]
 PY
 if [ "$?" -ne 0 ]; then
@@ -199,7 +199,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 
 summary = report["summary"]
 assert summary["decomposition_pieces"] == 2, summary
-assert summary["solids_converted"] == 2, summary
+assert summary["solids_converted"] == 1, summary
 codes = {d["code"] for d in report["diagnostics"]}
 assert "face_decomposition" in codes, codes
 assert "nonconvex_solid_requires_decomposition" not in codes, codes
@@ -223,7 +223,7 @@ with open(sys.argv[1], "r", encoding="utf-8") as handle:
 
 summary = report["summary"]
 assert summary["decomposition_pieces"] == 2, summary
-assert summary["solids_converted"] == 2, summary
+assert summary["solids_converted"] == 1, summary
 codes = {d["code"] for d in report["diagnostics"]}
 assert "auto_decompose_bsp_complete" in codes, codes
 assert "face_decomposition" in codes, codes
@@ -247,7 +247,7 @@ import sys
 
 report = json.load(open(sys.argv[1], encoding="utf-8"))
 proposal = json.load(open(sys.argv[2], encoding="utf-8"))
-assert report["summary"]["solids_converted"] == 2, report["summary"]
+assert report["summary"]["solids_converted"] == 1, report["summary"]
 assert report["summary"]["decomposition_pieces"] == 2, report["summary"]
 assert proposal["best_candidate_id"] == "candidate:7", proposal
 assert proposal["candidates"][0]["source_face_id"] == "face:1.7", proposal["candidates"][0]

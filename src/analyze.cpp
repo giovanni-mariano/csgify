@@ -6,15 +6,21 @@
 
 #include "analytic_surface.hpp"
 #include "engine_internal.hpp"
+#include "topology_analysis.hpp"
 #include "fitted_candidates.hpp"
+#include "occt_boolean.hpp"
 #include "spline_fit.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -31,11 +37,190 @@
 #include <TopoDS_Solid.hxx>
 #include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
+#include <gp_Trsf.hxx>
 
 namespace csgify {
 namespace {
 
 using namespace csgify::detail;
+
+bool rigid_transform(const InstanceTransform& transform) {
+    const auto& m = transform.values;
+    for (int column_a = 0; column_a < 3; ++column_a) {
+        for (int column_b = 0; column_b < 3; ++column_b) {
+            double dot = 0.0;
+            for (int row = 0; row < 3; ++row) {
+                dot += m[4 * row + column_a] * m[4 * row + column_b];
+            }
+            const double expected = column_a == column_b ? 1.0 : 0.0;
+            if (std::abs(dot - expected) > 1.0e-9) return false;
+        }
+    }
+    return true;
+}
+
+InstanceTransform shape_location_transform(const TopoDS_Shape& shape) {
+    InstanceTransform result;
+    const gp_Trsf transform = shape.Location().Transformation();
+    for (int row = 1; row <= 3; ++row) {
+        for (int column = 1; column <= 4; ++column) {
+            result.values[4 * (row - 1) + (column - 1)] =
+                transform.Value(row, column);
+        }
+    }
+    return result;
+}
+
+Vec3 occurrence_point(const Vec3& point,
+                      const InstanceTransform& from,
+                      const InstanceTransform& to) {
+    // Instance matrices are rigid local-to-document transforms. First apply
+    // from^-1 (R^T), then apply `to`.
+    const auto& a = from.values;
+    const auto& b = to.values;
+    const double shifted[3] = {
+        point.x - a[3], point.y - a[7], point.z - a[11]
+    };
+    double local[3]{};
+    for (int column = 0; column < 3; ++column) {
+        for (int row = 0; row < 3; ++row) {
+            local[column] += a[4 * row + column] * shifted[row];
+        }
+    }
+    Vec3 result;
+    result.x = b[0] * local[0] + b[1] * local[1] + b[2] * local[2] + b[3];
+    result.y = b[4] * local[0] + b[5] * local[1] + b[6] * local[2] + b[7];
+    result.z = b[8] * local[0] + b[9] * local[1] + b[10] * local[2] + b[11];
+    return result;
+}
+
+Vec3 occurrence_direction(const Vec3& direction,
+                          const InstanceTransform& from,
+                          const InstanceTransform& to) {
+    InstanceTransform from_without_translation = from;
+    InstanceTransform to_without_translation = to;
+    from_without_translation.values[3] = 0.0;
+    from_without_translation.values[7] = 0.0;
+    from_without_translation.values[11] = 0.0;
+    to_without_translation.values[3] = 0.0;
+    to_without_translation.values[7] = 0.0;
+    to_without_translation.values[11] = 0.0;
+    Vec3 result = occurrence_point(direction, from_without_translation,
+                                   to_without_translation);
+    const double norm = std::sqrt(result.x * result.x + result.y * result.y
+                                  + result.z * result.z);
+    if (norm > 0.0) {
+        result.x /= norm;
+        result.y /= norm;
+        result.z /= norm;
+    }
+    return result;
+}
+
+Vec3 occurrence_vector(const Vec3& vector,
+                       const InstanceTransform& from,
+                       const InstanceTransform& to) {
+    InstanceTransform from_without_translation = from;
+    InstanceTransform to_without_translation = to;
+    from_without_translation.values[3] = 0.0;
+    from_without_translation.values[7] = 0.0;
+    from_without_translation.values[11] = 0.0;
+    to_without_translation.values[3] = 0.0;
+    to_without_translation.values[7] = 0.0;
+    to_without_translation.values[11] = 0.0;
+    return occurrence_point(vector, from_without_translation,
+                            to_without_translation);
+}
+
+BBox occurrence_bbox(const BBox& bbox,
+                     const InstanceTransform& from,
+                     const InstanceTransform& to) {
+    if (!bbox.valid) return bbox;
+    BBox result;
+    for (int xi = 0; xi < 2; ++xi) {
+        for (int yi = 0; yi < 2; ++yi) {
+            for (int zi = 0; zi < 2; ++zi) {
+                const Vec3 point = occurrence_point(
+                    {xi ? bbox.xmax : bbox.xmin,
+                     yi ? bbox.ymax : bbox.ymin,
+                     zi ? bbox.zmax : bbox.zmin}, from, to);
+                if (!result.valid) {
+                    result.xmin = result.xmax = point.x;
+                    result.ymin = result.ymax = point.y;
+                    result.zmin = result.zmax = point.z;
+                    result.valid = true;
+                } else {
+                    result.xmin = std::min(result.xmin, point.x);
+                    result.ymin = std::min(result.ymin, point.y);
+                    result.zmin = std::min(result.zmin, point.z);
+                    result.xmax = std::max(result.xmax, point.x);
+                    result.ymax = std::max(result.ymax, point.y);
+                    result.zmax = std::max(result.zmax, point.z);
+                }
+            }
+        }
+    }
+    return result;
+}
+
+SolidTopology transport_topology(const SolidTopology& topology,
+                                 const InstanceTransform& from,
+                                 const InstanceTransform& to) {
+    SolidTopology result = topology;
+    result.prism_axis = occurrence_direction(result.prism_axis, from, to);
+    result.pipe_annulus.axis_origin = occurrence_point(
+        result.pipe_annulus.axis_origin, from, to);
+    result.pipe_annulus.axis_direction = occurrence_direction(
+        result.pipe_annulus.axis_direction, from, to);
+    for (PipePortTopology& port : result.pipe_annulus.ports) {
+        port.center = occurrence_point(port.center, from, to);
+        port.normal = occurrence_direction(port.normal, from, to);
+    }
+    result.revolution.axis_origin = occurrence_point(
+        result.revolution.axis_origin, from, to);
+    result.revolution.axis_direction = occurrence_direction(
+        result.revolution.axis_direction, from, to);
+    return result;
+}
+
+void transport_spline_fit(SplineFaceFit* fit,
+                          const InstanceTransform& from,
+                          const InstanceTransform& to) {
+    if (!fit || !fit->available) return;
+    fit->origin = occurrence_point(fit->origin, from, to);
+    fit->direction = occurrence_direction(fit->direction, from, to);
+}
+
+void transport_fitted_candidates(AnalyzedSolid* solid,
+                                 const InstanceTransform& from,
+                                 const InstanceTransform& to) {
+    if (!solid) return;
+    FittedCylinderCandidate& cylinder = solid->fitted_cylinder_replacement;
+    cylinder.axis_origin = occurrence_point(cylinder.axis_origin, from, to);
+    cylinder.axis_direction = occurrence_direction(
+        cylinder.axis_direction, from, to);
+    cylinder.base = occurrence_point(cylinder.base, from, to);
+    cylinder.height = occurrence_vector(cylinder.height, from, to);
+    FittedSphereCandidate& sphere = solid->fitted_sphere_replacement;
+    sphere.center = occurrence_point(sphere.center, from, to);
+    FittedConeCandidate& cone = solid->fitted_cone_replacement;
+    cone.axis_origin = occurrence_point(cone.axis_origin, from, to);
+    cone.axis_direction = occurrence_direction(cone.axis_direction, from, to);
+    cone.base = occurrence_point(cone.base, from, to);
+    cone.height = occurrence_vector(cone.height, from, to);
+}
+
+std::string replace_all(std::string value,
+                        const std::string& from,
+                        const std::string& to) {
+    if (from.empty() || from == to) return value;
+    std::size_t position = 0;
+    while ((position = value.find(from, position)) != std::string::npos) {
+        value.replace(position, from.size(), to);
+        position += to.size();
+    }
+    return value;
+}
 
 const ShapeMetadata* find_solid_metadata(const CadModel& model, const std::string& id) {
     for (const ShapeMetadata& metadata : model.solid_metadata) {
@@ -142,7 +327,8 @@ void inspect_solid(const TopoDS_Solid& solid,
                    std::size_t solid_index,
                    const CadModel& model,
                    const ConversionOptions& options,
-                   ConversionReport& report) {
+                   ConversionReport& report,
+                   const SolidTopology* recognized_topology = nullptr) {
     GProp_GProps props;
     BRepGProp::VolumeProperties(solid, props);
     const double volume = std::abs(props.Mass());
@@ -157,6 +343,75 @@ void inspect_solid(const TopoDS_Solid& solid,
     }
     analyzed_solid.volume = volume;
     analyzed_solid.bbox = bbox_from_shape(solid);
+    analyzed_solid.topology = recognized_topology
+        ? *recognized_topology
+        : analyze_solid_topology(solid, volume, options);
+    if (analyzed_solid.topology.nonmanifold_edge_count > 0
+        || analyzed_solid.topology.boundary_edge_count > 0) {
+        std::ostringstream msg;
+        msg << "Solid topology has "
+            << analyzed_solid.topology.boundary_edge_count
+            << " boundary edge(s) and "
+            << analyzed_solid.topology.nonmanifold_edge_count
+            << " non-manifold edge(s).";
+        add_diag(report, DiagnosticSeverity::error,
+                 "invalid_solid_topology", msg.str(), label);
+    }
+    if (analyzed_solid.topology.cavity_shell_count > 0) {
+        std::ostringstream msg;
+        msg << "Detected " << analyzed_solid.topology.cavity_shell_count
+            << " enclosed cavity shell(s); Boolean difference is an exact "
+               "candidate representation.";
+        add_diag(report, DiagnosticSeverity::info,
+                 "enclosed_voids_detected", msg.str(), label);
+    }
+    if (analyzed_solid.topology.prismatic_candidate
+        && (analyzed_solid.topology.concave_edge_count > 0
+            || analyzed_solid.topology.face_inner_wire_count > 0
+            || analyzed_solid.topology.cavity_shell_count > 0)) {
+        std::ostringstream msg;
+        msg << "All faces are planar and all edges are linear with "
+            << analyzed_solid.topology.normal_direction_count
+            << " support-normal direction(s) and "
+            << analyzed_solid.topology.axial_level_count
+            << " axial level(s) along the support-derived axis ("
+            << analyzed_solid.topology.prism_axis.x << ", "
+            << analyzed_solid.topology.prism_axis.y << ", "
+            << analyzed_solid.topology.prism_axis.z << ")";
+        if (analyzed_solid.topology.constant_cross_section_candidate) {
+            msg << "; a constant cross-section extrusion was recognized";
+        }
+        if (analyzed_solid.topology.extrusion_profile_hole_count > 0) {
+            msg << " with "
+                << analyzed_solid.topology.extrusion_profile_hole_count
+                << " end-profile hole wire(s)";
+        }
+        msg << "; planar-prismatic decomposition is recommended.";
+        add_diag(report, DiagnosticSeverity::info,
+                 "prismatic_solid_detected", msg.str(), label);
+    }
+    if (analyzed_solid.topology.revolution.candidate
+        && (analyzed_solid.topology.concave_edge_count > 0
+            || analyzed_solid.topology.face_inner_wire_count > 0)) {
+        const RevolutionTopology& revolution =
+            analyzed_solid.topology.revolution;
+        std::ostringstream msg;
+        msg << "Detected "
+            << (revolution.full_revolution ? "a full" : "a partial")
+            << " analytic revolution around axis ("
+            << revolution.axis_direction.x << ", "
+            << revolution.axis_direction.y << ", "
+            << revolution.axis_direction.z << ") with "
+            << revolution.axial_level_count << " axial topology level(s), "
+            << revolution.cylindrical_face_count << " cylindrical, "
+            << revolution.conical_face_count << " conical, and "
+            << revolution.toroidal_face_count << " toroidal face(s).";
+        add_diag(report, DiagnosticSeverity::info,
+                 revolution.full_revolution
+                     ? "full_revolution_detected"
+                     : "partial_revolution_detected",
+                 msg.str(), label);
+    }
 
     report.total_volume += volume;
     report.solid_volumes.push_back({label, volume});
@@ -180,11 +435,12 @@ void inspect_solid(const TopoDS_Solid& solid,
         analyzed_face.label = face_label(solid_index, face_index);
         analyzed_face.solid_id = analyzed_solid.id;
         analyzed_face.index = face_index;
-        analyzed_face.bbox = bbox_from_shape(face);
-
-        GProp_GProps face_props;
-        BRepGProp::SurfaceProperties(face, face_props);
-        analyzed_face.area = std::abs(face_props.Mass());
+        if (options.analyze_face_metrics) {
+            analyzed_face.bbox = bbox_from_shape(face);
+            GProp_GProps face_props;
+            BRepGProp::SurfaceProperties(face, face_props);
+            analyzed_face.area = std::abs(face_props.Mass());
+        }
 
         BRepAdaptor_Surface adaptor(face, false);
         const GeomAbs_SurfaceType surface_type = adaptor.GetType();
@@ -217,7 +473,8 @@ void inspect_solid(const TopoDS_Solid& solid,
             analyzed_face.needs_spline_replacement
             || (!exact_supported && !analyzed_face.needs_emitter);
 
-        if (analyzed_face.needs_spline_replacement) {
+        if (analyzed_face.needs_spline_replacement
+            && options.analyze_face_metrics) {
             analyzed_face.spline_fits = fit_spline_face(face);
             // Pick the best fit and append a hint to the freshly-emitted
             // unsupported_spline_face diagnostic for this face.
@@ -262,32 +519,102 @@ void inspect_solid(const TopoDS_Solid& solid,
 
     if (options.require_convex_cells
         && !validate_convex_halfspace_cell(solid, interior_point, solid_index,
-                                           options, report, false, true, false,
+                                           options, report, true, true, false,
                                            nullptr, &analyzed_solid.certificate)) {
-        analyzed_solid.needs_decomposition = true;
-        analyzed_solid.needs_user_decision = true;
-        add_diag(report, DiagnosticSeverity::error,
-                 "nonconvex_solid_requires_decomposition",
-                 "At least one vertex lies outside a face halfspace selected from the solid interior point; emitting one Alea intersection cell would remove valid volume.",
-                 label);
+        if (analyzed_solid.certificate.failure_code
+            == "curved_halfspace_certificate_deferred") {
+            analyzed_solid.convexity_certificate_deferred = true;
+        } else {
+            analyzed_solid.needs_decomposition = true;
+            analyzed_solid.needs_user_decision = true;
+        }
     }
 
     analyzed_solid.exact_csg_supported =
-        !analyzed_solid.needs_decomposition
+        !analyzed_solid.convexity_certificate_deferred
+        && !analyzed_solid.needs_decomposition
         && !analyzed_solid.needs_spline_replacement
         && !analyzed_solid.needs_surface_replacement
         && !analyzed_solid.needs_user_decision;
-    analyzed_solid.fitted_cylinder_replacement =
-        fitted_cylinder_candidate(solid, analyzed_solid.volume);
-    analyzed_solid.fitted_sphere_replacement =
-        fitted_sphere_candidate(solid, analyzed_solid.volume);
-    analyzed_solid.fitted_cone_replacement =
-        fitted_cone_candidate(solid, analyzed_solid.volume);
+    if (options.analyze_fitted_replacements) {
+        analyzed_solid.fitted_cylinder_replacement =
+            fitted_cylinder_candidate(solid, analyzed_solid.volume);
+        analyzed_solid.fitted_sphere_replacement =
+            fitted_sphere_candidate(solid, analyzed_solid.volume);
+        analyzed_solid.fitted_cone_replacement =
+            fitted_cone_candidate(solid, analyzed_solid.volume);
+    }
     report.solids.push_back(analyzed_solid);
 }
 
 void append_decision_requests(ConversionReport& report) {
     std::vector<DecisionRequest> requests;
+
+    for (const MediumGenerationRequest& medium : report.medium_requests) {
+        const bool applied = std::any_of(
+            report.derived_regions.begin(), report.derived_regions.end(),
+            [&](const DerivedRegionRecord& region) {
+                return region.request_id == medium.id;
+        });
+        if (applied) continue;
+
+        std::size_t unresolved = 0;
+        if (medium.host_component_ids.size() != 1
+            || medium.material_id.empty() || medium.ports.size() != 2) {
+            DecisionRequest request;
+            request.id = "decision:contained_medium:" + medium.id + ":request";
+            request.kind = "contained_medium_request";
+            request.target_id = medium.id;
+            request.reason = "incomplete_medium_request";
+            request.recommended_action = "review_medium_request";
+            request.summary = "Straight-pipe medium v1 requires one host, one configured material, and explicit treatment of both recognized ports.";
+            request.metrics = {
+                metric("host_count", static_cast<double>(
+                    medium.host_component_ids.size())),
+                metric("port_count", static_cast<double>(medium.ports.size())),
+            };
+            request.candidates.push_back(candidate_view(
+                "action:complete:" + medium.id,
+                "stage_contained_medium_request", "review",
+                "Complete or correct the staged physical-medium intent."));
+            requests.push_back(std::move(request));
+            ++unresolved;
+        }
+        for (const MediumPortDecision& port : medium.ports) {
+            if (port.disposition != MediumPortDisposition::unresolved) continue;
+            ++unresolved;
+            DecisionRequest request;
+            request.id = "decision:contained_medium:" + medium.id + ":" + port.port_id;
+            request.kind = "contained_medium_port";
+            request.target_id = medium.id;
+            request.reason = "unresolved_medium_port";
+            request.recommended_action = "review_medium_ports";
+            request.summary = "Choose the physical boundary treatment for medium port "
+                + port.port_id + ".";
+            request.candidates.push_back(candidate_view(
+                "action:cap:" + port.port_id, "cap_here", "review",
+                "Close the generated material region at this CAD port."));
+            request.candidates.push_back(candidate_view(
+                "action:external:" + port.port_id,
+                "interface_to_external_model", "review",
+                "Treat this port as an explicitly modeled external interface."));
+            requests.push_back(std::move(request));
+        }
+
+        if (unresolved == 0) {
+            DecisionRequest request;
+            request.id = "decision:contained_medium:" + medium.id + ":apply";
+            request.kind = "contained_medium_apply";
+            request.target_id = medium.id;
+            request.reason = "medium_request_staged_not_applied";
+            request.recommended_action = "apply_contained_medium";
+            request.summary = "The medium request is fully specified but still requires authorization and a fresh geometry certificate.";
+            request.candidates.push_back(candidate_view(
+                "action:apply:" + medium.id, "apply_contained_medium", "review",
+                "Recompute the lumen and overlap certificate, then commit it as a material region."));
+            requests.push_back(std::move(request));
+        }
+    }
 
     for (const AnalyzedSolid& solid : report.solids) {
         if (solid.needs_decomposition) {
@@ -296,13 +623,19 @@ void append_decision_requests(ConversionReport& report) {
             request.kind = "decomposition";
             request.target_id = solid.id;
             request.reason = "nonconvex_or_not_single_cell_convertible";
-            request.recommended_action = "decompose-suggest";
+            request.recommended_action = solid.topology.recommended_strategy.empty()
+                ? "decompose-suggest" : solid.topology.recommended_strategy;
             request.summary =
                 "Solid needs decomposition before it can be emitted as valid CSG.";
             request.metrics = {
                 metric("volume", solid.volume),
                 metric("volume_fraction", solid.volume_fraction),
                 metric("face_count", static_cast<double>(solid.face_count)),
+                metric("concave_edge_count",
+                       static_cast<double>(solid.topology.concave_edge_count)),
+                metric("cavity_shell_count",
+                       static_cast<double>(solid.topology.cavity_shell_count)),
+                metric("bbox_fill_ratio", solid.topology.bbox_fill_ratio),
             };
             request.candidates.push_back(candidate_view(
                 "action:decompose-suggest",
@@ -628,17 +961,12 @@ double shape_volume(const TopoDS_Shape& shape) {
     return std::abs(props.Mass());
 }
 
-struct IntersectionResult {
-    bool known = false;
-    double volume = 0.0;
-};
-
-IntersectionResult intersection_volume(const TopoDS_Shape& a,
-                                       const TopoDS_Shape& b) {
-    IntersectionResult result;
+OverlapIntersectionEvidence intersection_volume(const TopoDS_Shape& a,
+                                                const TopoDS_Shape& b) {
+    OverlapIntersectionEvidence result;
     try {
-        BRepAlgoAPI_Common common(a, b);
-        common.Build();
+        BRepAlgoAPI_Common common;
+        build_binary_boolean(common, a, b);
         if (common.IsDone()) {
             result.known = true;
             if (!common.Shape().IsNull()) {
@@ -668,9 +996,12 @@ IntersectionResult intersection_volume(const TopoDS_Shape& a,
 // internal post-mutation analyze.
 void detect_solid_overlaps(CadModel& model,
                             const ConversionOptions& options,
-                            ConversionReport& report) {
+                            ConversionReport& report,
+                            const OverlapPairCache* reusable,
+                            OverlapPairCache* cache_out) {
     if (!options.check_overlaps) return;
     if (model.root.IsNull()) return;
+    if (cache_out) cache_out->clear();
 
     // Refresh the persistent record. Each full overlap pass recomputes
     // the current pairwise overlap set, so stale overlap entries from
@@ -704,6 +1035,31 @@ void detect_solid_overlaps(CadModel& model,
         Bnd_Box bbox;
         double volume = 0.0;
     };
+    struct ReportGeometry {
+        BBox bbox;
+        double volume = 0.0;
+    };
+    std::unordered_map<std::string, ReportGeometry> report_geometry;
+    for (const AnalyzedSolid& solid : report.solids) {
+        report_geometry.emplace(solid.id,
+                                ReportGeometry{solid.bbox, solid.volume});
+    }
+    for (const AnalyzedDecomposedPiece& piece : report.decomposed_pieces) {
+        report_geometry.emplace(piece.id,
+                                ReportGeometry{piece.bbox, piece.volume});
+    }
+    const auto populate_measures = [&](Entry* entry) {
+        const auto measured = report_geometry.find(entry->id);
+        if (measured != report_geometry.end() && measured->second.bbox.valid) {
+            const BBox& bbox = measured->second.bbox;
+            entry->bbox.Update(bbox.xmin, bbox.ymin, bbox.zmin,
+                               bbox.xmax, bbox.ymax, bbox.zmax);
+            entry->volume = measured->second.volume;
+        } else {
+            BRepBndLib::Add(entry->shape, entry->bbox);
+            entry->volume = shape_volume(entry->shape);
+        }
+    };
     std::vector<Entry> entries;
     std::size_t solid_index = 0;
     for (TopExp_Explorer exp(model.root, TopAbs_SOLID); exp.More(); exp.Next()) {
@@ -713,8 +1069,7 @@ void detect_solid_overlaps(CadModel& model,
         Entry e;
         e.id = id;
         e.shape = exp.Current();
-        BRepBndLib::Add(e.shape, e.bbox);
-        e.volume = shape_volume(e.shape);
+        populate_measures(&e);
         entries.push_back(std::move(e));
     }
     for (const DecomposedSolidPiece& piece : model.decomposed_pieces) {
@@ -722,6 +1077,14 @@ void detect_solid_overlaps(CadModel& model,
         Entry e;
         e.id = piece.id;
         e.shape = piece.solid;
+        populate_measures(&e);
+        entries.push_back(std::move(e));
+    }
+    for (const CadBooleanBody& body : model.cad_boolean_bodies) {
+        if (!body.active || body.materialized_solid.IsNull()) continue;
+        Entry e;
+        e.id = body.id;
+        e.shape = body.materialized_solid;
         BRepBndLib::Add(e.shape, e.bbox);
         e.volume = shape_volume(e.shape);
         entries.push_back(std::move(e));
@@ -742,13 +1105,113 @@ void detect_solid_overlaps(CadModel& model,
     // numerically-touching pairs.
     const double pad = std::max(options.linear_tolerance, 1.0e-9);
 
-    for (std::size_t i = 0; i < entries.size(); ++i) {
-        for (std::size_t j = i + 1; j < entries.size(); ++j) {
-            if (!bboxes_intersect(entries[i].bbox, entries[j].bbox, pad)) {
+    // Sweep on X and retain only currently overlapping intervals. This turns
+    // sparse assemblies from an all-pairs bbox pass into O(N log N + K), where
+    // K is the number of local bbox neighbours. Candidate pairs are sorted
+    // back into stable source order before exact OCCT intersections.
+    struct SweepEntry {
+        std::size_t index = 0;
+        double xmin = 0.0;
+        double xmax = 0.0;
+    };
+    std::vector<SweepEntry> sweep;
+    sweep.reserve(entries.size());
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        if (entries[index].bbox.IsVoid()) continue;
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        entries[index].bbox.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        sweep.push_back({index, xmin, xmax});
+    }
+    std::sort(sweep.begin(), sweep.end(), [&](const SweepEntry& a,
+                                              const SweepEntry& b) {
+        if (a.xmin != b.xmin) return a.xmin < b.xmin;
+        return entries[a.index].id < entries[b.index].id;
+    });
+    std::vector<SweepEntry> active;
+    std::vector<std::pair<std::size_t, std::size_t>> candidates;
+    for (const SweepEntry& current : sweep) {
+        active.erase(std::remove_if(active.begin(), active.end(),
+                                    [&](const SweepEntry& prior) {
+            return prior.xmax + pad < current.xmin;
+        }), active.end());
+        for (const SweepEntry& prior : active) {
+            if (!bboxes_intersect(entries[prior.index].bbox,
+                                  entries[current.index].bbox, pad)) {
                 continue;
             }
-            const IntersectionResult intersection =
-                intersection_volume(entries[i].shape, entries[j].shape);
+            candidates.emplace_back(
+                std::min(prior.index, current.index),
+                std::max(prior.index, current.index));
+        }
+        active.push_back(current);
+    }
+    std::sort(candidates.begin(), candidates.end());
+    report.performance.spatial_candidate_pairs += candidates.size();
+
+    std::vector<OverlapIntersectionEvidence> intersections(candidates.size());
+    std::vector<std::size_t> uncached;
+    uncached.reserve(candidates.size());
+    for (std::size_t candidate_index = 0;
+         candidate_index < candidates.size(); ++candidate_index) {
+        const auto& candidate = candidates[candidate_index];
+        const std::size_t i = candidate.first;
+        const std::size_t j = candidate.second;
+        const auto key = entries[i].id < entries[j].id
+            ? std::make_pair(entries[i].id, entries[j].id)
+            : std::make_pair(entries[j].id, entries[i].id);
+        const auto cached = reusable ? reusable->find(key)
+                                     : OverlapPairCache::const_iterator{};
+        if (reusable && cached != reusable->end() && cached->second.known) {
+            intersections[candidate_index] = cached->second;
+            ++report.performance.overlap_pair_cache_hits;
+        } else {
+            uncached.push_back(candidate_index);
+        }
+    }
+    report.performance.exact_overlap_tests += uncached.size();
+    report.performance.overlap_pair_cache_misses += uncached.size();
+
+    const std::size_t worker_count = std::min(
+        std::max<std::size_t>(1, options.overlap_parallelism),
+        uncached.size());
+    if (worker_count <= 1) {
+        for (const std::size_t candidate_index : uncached) {
+            const auto& candidate = candidates[candidate_index];
+            intersections[candidate_index] = intersection_volume(
+                entries[candidate.first].shape,
+                entries[candidate.second].shape);
+        }
+    } else {
+        std::atomic<std::size_t> next{0};
+        std::vector<std::thread> workers;
+        workers.reserve(worker_count);
+        for (std::size_t worker = 0; worker < worker_count; ++worker) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    const std::size_t work = next.fetch_add(1);
+                    if (work >= uncached.size()) break;
+                    const std::size_t candidate_index = uncached[work];
+                    const auto& candidate = candidates[candidate_index];
+                    intersections[candidate_index] = intersection_volume(
+                        entries[candidate.first].shape,
+                        entries[candidate.second].shape);
+                }
+            });
+        }
+        for (std::thread& worker : workers) worker.join();
+    }
+
+    for (std::size_t candidate_index = 0;
+         candidate_index < candidates.size(); ++candidate_index) {
+            const auto& candidate = candidates[candidate_index];
+            const std::size_t i = candidate.first;
+            const std::size_t j = candidate.second;
+            const auto key = entries[i].id < entries[j].id
+                ? std::make_pair(entries[i].id, entries[j].id)
+                : std::make_pair(entries[j].id, entries[i].id);
+            const OverlapIntersectionEvidence& intersection =
+                intersections[candidate_index];
+            if (cache_out) (*cache_out)[key] = intersection;
             if (!intersection.known) {
                 std::ostringstream msg;
                 msg << "Could not evaluate boolean intersection between "
@@ -811,7 +1274,6 @@ void detect_solid_overlaps(CadModel& model,
             // diagnostic forward, keeping report.ok() == false until
             // the overlap is resolved.
             model.diagnostics.push_back(d);
-        }
     }
 }
 
@@ -1055,7 +1517,7 @@ void detect_mutation_overlaps(
             if (!ego.source_solid_id.empty()
                 && ego.source_solid_id == n.id) continue;
             if (!bboxes_intersect(ego.bbox, n.bbox, pad)) continue;
-            const IntersectionResult intersection =
+            const OverlapIntersectionEvidence intersection =
                 intersection_volume(ego.shape, n.shape);
             if (!intersection.known) {
                 record_unknown(ego, n.id);
@@ -1072,7 +1534,7 @@ void detect_mutation_overlaps(
     for (std::size_t i = 0; i < egos.size(); ++i) {
         for (std::size_t j = i + 1; j < egos.size(); ++j) {
             if (!bboxes_intersect(egos[i].bbox, egos[j].bbox, pad)) continue;
-            const IntersectionResult intersection =
+            const OverlapIntersectionEvidence intersection =
                 intersection_volume(egos[i].shape, egos[j].shape);
             if (!intersection.known) {
                 record_unknown(egos[i], egos[j].id);
@@ -1087,11 +1549,21 @@ void detect_mutation_overlaps(
 } // namespace
 
 AnalysisReport analyze_model(const CadModel& model,
-                             const ConversionOptions& options) {
+                             const ConversionOptions& options,
+                             AnalysisProgressCallback progress,
+                             bool* cancelled_out) {
     using namespace csgify::detail;
     AnalysisReport report;
+    if (cancelled_out) *cancelled_out = false;
     report.diagnostics = model.diagnostics;
     report.assembly = model.assembly;
+    report.strings = model.strings;
+    report.metadata = model.metadata;
+    report.component_definitions = model.component_definitions;
+    report.component_instances = model.component_instances;
+    report.materials = model.materials;
+    report.medium_requests = model.medium_requests;
+    report.derived_regions = model.derived_regions;
     report.length_unit = model.length_unit;
     report.length_unit_to_mm = model.length_unit_to_mm;
 
@@ -1099,17 +1571,229 @@ AnalysisReport analyze_model(const CadModel& model,
         return report;
     }
 
+    std::unordered_map<std::string, const ComponentDefinition*> definitions;
+    for (const ComponentDefinition& definition : model.component_definitions) {
+        definitions.emplace(definition.id, &definition);
+    }
+    std::unordered_map<std::string, const ComponentInstance*> instances;
+    std::unordered_map<std::string, const ComponentInstance*> instances_by_id;
+    for (const ComponentInstance& instance : model.component_instances) {
+        if (instance.active) instances_by_id.emplace(instance.id, &instance);
+        if (instance.active && !instance.source_shape_id.empty()) {
+            instances.emplace(instance.source_shape_id, &instance);
+        }
+    }
+    std::unordered_map<std::string, const AssemblyNode*> nodes_by_entry;
+    for (const AssemblyNode& node : model.assembly) {
+        if (node.kind == "shape" && !node.label_entry.empty()) {
+            nodes_by_entry.emplace(node.label_entry, &node);
+        }
+    }
+    struct CachedAnalysis {
+        AnalyzedSolid solid;
+        std::vector<AnalyzedFace> faces;
+        std::vector<Diagnostic> diagnostics;
+        InstanceTransform transform;
+    };
+    std::unordered_map<std::string, CachedAnalysis> analysis_cache;
+    // A component definition may contain multiple solids. XCAF associates all
+    // of them with the same occurrence label, while source_shape_id names only
+    // the first solid for legacy compatibility. Track each solid's stable
+    // local ordinal so every repeated multi-solid definition can reuse the
+    // complete analysis, not merely its first body.
+    std::unordered_map<std::string, std::size_t> occurrence_solid_ordinals;
+
+    std::size_t solid_total = 0;
+    for (TopExp_Explorer count(model.root, TopAbs_SOLID); count.More(); count.Next())
+        ++solid_total;
     std::size_t solid_index = 0;
+    std::size_t progress_completed = 0;
+    bool cancelled = false;
+    const auto publish_solid = [&](const std::string& id) {
+        ++progress_completed;
+        if (!progress) return true;
+        try {
+            return progress(progress_completed, solid_total, id);
+        } catch (...) {
+            return false;
+        }
+    };
     for (TopExp_Explorer solid_exp(model.root, TopAbs_SOLID); solid_exp.More(); solid_exp.Next()) {
         ++solid_index;
         const std::string id = solid_id(solid_index);
+        if (!options.analysis_target_ids.empty()
+            && !contains_id(options.analysis_target_ids, id)) {
+            if (!publish_solid(id)) { cancelled = true; break; }
+            continue;
+        }
         if (contains_id(model.removed_solid_ids, id)) {
             add_diag(report, DiagnosticSeverity::info, "solid_removed",
                      "Solid is suppressed by preprocessing.", solid_label(solid_index));
+            if (!publish_solid(id)) { cancelled = true; break; }
             continue;
         }
         ++report.solids_seen;
-        inspect_solid(TopoDS::Solid(solid_exp.Current()), solid_index, model, options, report);
+        const TopoDS_Solid current_solid = TopoDS::Solid(solid_exp.Current());
+        const InstanceTransform current_transform =
+            shape_location_transform(current_solid);
+        const ComponentInstance* instance = nullptr;
+        const ComponentDefinition* definition = nullptr;
+        const ShapeMetadata* solid_metadata = find_solid_metadata(model, id);
+        const auto instance_it = instances.find(id);
+        if (instance_it != instances.end()) {
+            instance = instance_it->second;
+        } else if (solid_metadata && !solid_metadata->component_entry.empty()) {
+            const auto node_it = nodes_by_entry.find(
+                solid_metadata->component_entry);
+            if (node_it != nodes_by_entry.end()) {
+                const auto semantic_instance = instances_by_id.find(
+                    node_it->second->instance_id);
+                if (semantic_instance != instances_by_id.end()) {
+                    instance = semantic_instance->second;
+                }
+            }
+        }
+        std::size_t definition_solid_ordinal = 0;
+        if (instance) {
+            definition_solid_ordinal =
+                ++occurrence_solid_ordinals[instance->id];
+            const auto definition_it = definitions.find(instance->definition_id);
+            if (definition_it != definitions.end()
+                && definition_it->second->geometry_digest_verified
+                && !definition_it->second->geometry_digest.empty()
+                && rigid_transform(instance->transform)) {
+                definition = definition_it->second;
+            }
+        }
+        // OCCT preserves the underlying TShape when the same definition body
+        // is instantiated at different rigid locations. Pointer identity is
+        // therefore a stronger in-document proof than XCAF label association
+        // (which can resolve to a nested subshape label). Prefer it, while
+        // retaining the verified definition/local-ordinal key for documents
+        // whose reader materializes distinct but definition-identical TShapes.
+        const void* tshape_identity = current_solid.TShape().get();
+        const std::string analysis_cache_key = definition
+            ? definition->geometry_digest + "|solid:"
+                + std::to_string(definition_solid_ordinal)
+            : (tshape_identity
+                ? "tshape:"
+                    + std::to_string(reinterpret_cast<std::uintptr_t>(
+                        tshape_identity))
+                : std::string{});
+        const InstanceTransform analysis_transform = definition && instance
+            ? instance->transform : current_transform;
+
+        const bool occurrence_has_face_replacement = std::any_of(
+            model.face_replacements.begin(), model.face_replacements.end(),
+            [&](const FaceReplacement& replacement) {
+                std::size_t replacement_solid = 0;
+                std::size_t replacement_face = 0;
+                return parse_face_id(replacement.face_id, &replacement_solid,
+                                     &replacement_face)
+                    && replacement_solid == solid_index;
+            });
+        const auto cached = !analysis_cache_key.empty()
+                && !occurrence_has_face_replacement
+            ? analysis_cache.find(analysis_cache_key)
+            : analysis_cache.end();
+        if (cached != analysis_cache.end()) {
+            const CachedAnalysis& source = cached->second;
+            AnalyzedSolid solid = source.solid;
+            const std::string source_id = solid.id;
+            const std::string source_label = solid.label;
+            solid.id = id;
+            solid.label = solid_label(solid_index);
+            solid.index = solid_index;
+            solid.name.clear();
+            solid.hierarchy_path.clear();
+            if (const ShapeMetadata* metadata = find_solid_metadata(model, id)) {
+                solid.name = metadata->name;
+                solid.hierarchy_path = metadata->hierarchy_path;
+            }
+            solid.bbox = occurrence_bbox(
+                source.solid.bbox, source.transform, analysis_transform);
+            solid.topology = transport_topology(
+                source.solid.topology, source.transform, analysis_transform);
+            transport_fitted_candidates(
+                &solid, source.transform, analysis_transform);
+            solid.face_ids.clear();
+
+            report.total_volume += solid.volume;
+            report.solid_volumes.push_back({solid.label, solid.volume});
+            for (const AnalyzedFace& cached_face : source.faces) {
+                AnalyzedFace face = cached_face;
+                face.id = face_id(solid_index, cached_face.index);
+                face.label = face_label(solid_index, cached_face.index);
+                face.solid_id = id;
+                face.bbox = occurrence_bbox(
+                    cached_face.bbox, source.transform, analysis_transform);
+                transport_spline_fit(
+                    &face.spline_fits.plane, source.transform,
+                    analysis_transform);
+                transport_spline_fit(
+                    &face.spline_fits.sphere, source.transform,
+                    analysis_transform);
+                transport_spline_fit(
+                    &face.spline_fits.cylinder, source.transform,
+                    analysis_transform);
+                transport_spline_fit(
+                    &face.spline_fits.cone, source.transform,
+                    analysis_transform);
+                solid.face_ids.push_back(face.id);
+                ++report.faces_seen;
+                if (face.exact_csg_supported) ++report.analytic_faces;
+                report.faces.push_back(std::move(face));
+            }
+            solid.face_count = solid.face_ids.size();
+            for (const Diagnostic& cached_diagnostic : source.diagnostics) {
+                Diagnostic diagnostic = cached_diagnostic;
+                diagnostic.shape_id = replace_all(
+                    diagnostic.shape_id, source_id, id);
+                diagnostic.local_shape_id = replace_all(
+                    diagnostic.local_shape_id, source_id, id);
+                diagnostic.shape_label = replace_all(
+                    diagnostic.shape_label, source_label, solid.label);
+                report.diagnostics.push_back(std::move(diagnostic));
+            }
+            report.solids.push_back(std::move(solid));
+            ++report.performance.definition_recognition_cache_hits;
+        } else {
+            const std::size_t face_start = report.faces.size();
+            const std::size_t diagnostic_start = report.diagnostics.size();
+            inspect_solid(current_solid, solid_index,
+                          model, options, report);
+            if (!analysis_cache_key.empty() && !report.solids.empty()
+                && report.solids.back().id == id
+                && !occurrence_has_face_replacement) {
+                CachedAnalysis analysis;
+                analysis.solid = report.solids.back();
+                analysis.faces.assign(
+                    report.faces.begin()
+                        + static_cast<std::ptrdiff_t>(face_start),
+                    report.faces.end());
+                analysis.diagnostics.assign(
+                    report.diagnostics.begin()
+                        + static_cast<std::ptrdiff_t>(diagnostic_start),
+                    report.diagnostics.end());
+                analysis.transform = analysis_transform;
+                analysis_cache.emplace(
+                    analysis_cache_key,
+                    std::move(analysis));
+                ++report.performance.definition_recognition_cache_misses;
+            }
+        }
+        if (!report.solids.empty() && report.solids.back().id == id
+            && instance) {
+            report.solids.back().component_instance_id = instance->id;
+            report.solids.back().component_definition_id =
+                instance->definition_id;
+        }
+        if (!publish_solid(id)) { cancelled = true; break; }
+    }
+
+    if (cancelled) {
+        if (cancelled_out) *cancelled_out = true;
+        return report;
     }
 
     for (const SyntheticBody& body : model.synthetic_bodies) {
@@ -1131,6 +1815,10 @@ AnalysisReport analyze_model(const CadModel& model,
                 provenance.source_ids.push_back(body.host_solid_id);
             if (!body.source_solid_id.empty())
                 provenance.source_ids.push_back(body.source_solid_id);
+        } else if (body.role == "contained_medium") {
+            provenance.operation = "generate_straight_pipe_medium";
+            if (!body.host_solid_id.empty())
+                provenance.source_ids.push_back(body.host_solid_id);
         } else {
             const struct PrefixOperation { const char* prefix; const char* op; } mappings[] = {
                 {"bbox_from_", "replace_solid_with_bbox"},
@@ -1160,7 +1848,9 @@ AnalysisReport analyze_model(const CadModel& model,
         solid.id = body.id;
         solid.label = body.label;
         solid.volume = synthetic_volume_estimate(body);
-        solid.bbox = body.bbox;
+        solid.bbox = body.bbox.valid
+            ? body.bbox
+            : bbox_from_shape(detail::build_synthetic_shape(model, body));
         solid.exact_csg_supported = true;
         report.solids.push_back(solid);
         report.solid_volumes.push_back({body.label, solid.volume});
@@ -1188,6 +1878,23 @@ AnalysisReport analyze_model(const CadModel& model,
         if (analyzed_piece.needs_decomposition) {
             ++report.solids_requiring_decomposition;
         }
+    }
+
+    for (const CadBooleanBody& body : model.cad_boolean_bodies) {
+        if (!body.active || body.materialized_solid.IsNull()) continue;
+        AnalyzedSolid solid;
+        solid.id = body.id;
+        solid.label = body.label;
+        solid.volume = shape_volume(body.materialized_solid);
+        solid.bbox = bbox_from_shape(body.materialized_solid);
+        solid.exact_csg_supported = true;
+        report.solids.push_back(solid);
+        report.solid_volumes.push_back({body.label, solid.volume});
+        report.total_volume += solid.volume;
+        ++report.solids_seen;
+        report.provenance.push_back({body.id, "shell_difference",
+                                     {body.source_solid_id}, true, false,
+                                     false, 0.0});
     }
 
     for (const std::string& removed_id : model.removed_solid_ids) {

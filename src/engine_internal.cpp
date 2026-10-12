@@ -1,9 +1,11 @@
 #include "engine_internal.hpp"
 
 #include "analytic_surface.hpp"
+#include "occt_boolean.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <sstream>
 
 #include <algorithm>
@@ -22,6 +24,7 @@
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Face.hxx>
+#include <TopoDS_Edge.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <gp_Vec.hxx>
 #include <Standard_Failure.hxx>
@@ -279,6 +282,71 @@ std::vector<gp_Pnt> solid_vertices(const TopoDS_Solid& solid) {
     return points;
 }
 
+double solid_topological_tolerance(const TopoDS_Solid& solid,
+                                   double requested) {
+    double tolerance = requested;
+    for (TopExp_Explorer it(solid, TopAbs_VERTEX); it.More(); it.Next()) {
+        tolerance = std::max(
+            tolerance, BRep_Tool::Tolerance(TopoDS::Vertex(it.Current())));
+    }
+    for (TopExp_Explorer it(solid, TopAbs_EDGE); it.More(); it.Next()) {
+        tolerance = std::max(
+            tolerance, BRep_Tool::Tolerance(TopoDS::Edge(it.Current())));
+    }
+    for (TopExp_Explorer it(solid, TopAbs_FACE); it.More(); it.Next()) {
+        tolerance = std::max(
+            tolerance, BRep_Tool::Tolerance(TopoDS::Face(it.Current())));
+    }
+    return tolerance;
+}
+
+int selected_halfspace_sense(const AnalyticSurface& surface,
+                             const gp_Pnt& interior,
+                             const std::vector<gp_Pnt>& vertices,
+                             double tolerance) {
+    const double interior_value = surface.signed_distance_at(interior);
+    if (interior_value < -tolerance) return -1;
+    if (interior_value > tolerance) return 1;
+
+    // A classifier may legitimately return ON for a centre-of-mass point on
+    // thin or symmetric splitter output.  In that case the sign at the point
+    // is ambiguous. Pick the halfspace containing the larger number of solid
+    // vertices; this is deterministic and avoids rejecting a convex cell only
+    // because the chosen point lies on one of its supports.
+    std::size_t outside_negative = 0;
+    std::size_t outside_positive = 0;
+    for (const gp_Pnt& vertex : vertices) {
+        const double value = surface.signed_distance_at(vertex);
+        if (value > tolerance) ++outside_negative;
+        if (value < -tolerance) ++outside_positive;
+    }
+    return outside_negative <= outside_positive ? -1 : 1;
+}
+
+gp_Pnt halfspace_reference_point(const AnalyticSurface& surface,
+                                 const gp_Pnt& interior,
+                                 const std::vector<gp_Pnt>& vertices,
+                                 int sense,
+                                 double tolerance) {
+    if (std::abs(surface.signed_distance_at(interior)) > tolerance) {
+        return interior;
+    }
+    const gp_Pnt* best = nullptr;
+    double best_value = sense < 0
+        ? std::numeric_limits<double>::infinity()
+        : -std::numeric_limits<double>::infinity();
+    for (const gp_Pnt& vertex : vertices) {
+        const double value = surface.signed_distance_at(vertex);
+        if ((sense < 0 && value < best_value)
+            || (sense > 0 && value > best_value)) {
+            best = &vertex;
+            best_value = value;
+        }
+    }
+    if (!best || std::abs(best_value) <= tolerance) return interior;
+    return interior.Translated(gp_Vec(interior, *best).Multiplied(0.01));
+}
+
 bool point_is_inside_or_on(const TopoDS_Solid& solid,
                            const gp_Pnt& point,
                            double tolerance) {
@@ -398,10 +466,24 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
     GProp_GProps solid_props;
     BRepGProp::VolumeProperties(solid, solid_props);
     cert.source_volume = std::abs(solid_props.Mass());
+    const double effective_tolerance =
+        solid_topological_tolerance(solid, options.linear_tolerance);
+    Bnd_Box certificate_box;
+    BRepBndLib::Add(solid, certificate_box);
+    double scale2 = 1.0;
+    if (!certificate_box.IsVoid()) {
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        certificate_box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        const double dx = xmax - xmin;
+        const double dy = ymax - ymin;
+        const double dz = zmax - zmin;
+        scale2 = std::max(1.0, dx * dx + dy * dy + dz * dz);
+    }
     cert.allowed_outside_volume = std::max(
         options.linear_tolerance * options.linear_tolerance
             * options.linear_tolerance,
-        cert.source_volume * 1.0e-10);
+        std::max(cert.source_volume * 1.0e-10,
+                 effective_tolerance * scale2));
     const std::vector<gp_Pnt> vertices = solid_vertices(solid);
     if (vertices.empty()) {
         add_diag(report, DiagnosticSeverity::warning, "convexity_vertex_check_skipped",
@@ -411,6 +493,7 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
         return false;
     }
     std::size_t face_index = 0;
+    bool curved_certificate_deferred = false;
     for (TopExp_Explorer face_exp(solid, TopAbs_FACE); face_exp.More(); face_exp.Next()) {
         ++face_index;
         if (count_faces) {
@@ -431,26 +514,54 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
         // kind -- raw value_at() returns length^2 for quadrics/spheres and
         // length^4 for tori, which made the check spuriously fail on
         // large-radius faces and triggered cuts that could not split.
-        const double interior_value = surface.signed_distance_at(interior_point);
-        const int sense = interior_value <= options.linear_tolerance ? -1 : 1;
+        const int sense = selected_halfspace_sense(
+            surface, interior_point, vertices, effective_tolerance);
         for (const gp_Pnt& vertex : vertices) {
             const double value = surface.signed_distance_at(vertex);
             const bool outside = sense < 0
-                ? value > options.linear_tolerance
-                : value < -options.linear_tolerance;
+                ? value > effective_tolerance
+                : value < -effective_tolerance;
             if (outside) {
                 if (count_decomposition) {
                     ++report.solids_requiring_decomposition;
                 }
                 if (emit_error) {
+                    std::ostringstream message;
+                    message << "At least one vertex lies outside a face "
+                               "halfspace selected from the solid interior "
+                               "point; emitting one Alea intersection cell "
+                               "would remove valid volume. face=" << face_index
+                            << " interior_distance="
+                            << surface.signed_distance_at(interior_point)
+                            << " vertex_distance=" << value
+                            << " sense=" << sense
+                            << " tolerance=" << effective_tolerance;
                     add_diag(report, DiagnosticSeverity::error,
                              "nonconvex_solid_requires_decomposition",
-                             "At least one vertex lies outside a face halfspace selected from the solid interior point; emitting one Alea intersection cell would remove valid volume.",
+                             message.str(),
                              solid_label(solid_index));
                 }
                 cert.failure_code = "vertex_outside_halfspace";
                 return false;
             }
+        }
+
+        // For a planar polyhedral face, signed distance is affine and its
+        // extrema over every polygonal edge/face occur at vertices. Passing
+        // the all-vertices half-space test above is therefore already a
+        // complete containment certificate. OCCT 8's MakeHalfSpace/Cut path
+        // can select the opposite side for small partition faces and report
+        // the entire solid as "outside", producing false non-convex results.
+        // Retain the Boolean certificate below for curved surfaces, where
+        // vertices alone cannot bound face-interior extrema.
+        if (surface.kind == AnalyticSurfaceKind::plane) {
+            ++cert.boolean_halfspace_checks;
+            continue;
+        }
+
+        if (options.defer_curved_halfspace_certificates) {
+            curved_certificate_deferred = true;
+            continue;
         }
 
         // Boolean certificate: the solid minus the face halfspace selected by
@@ -459,10 +570,13 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
         // extrema through OCCT's B-rep kernel.
         try {
             const TopoDS_Face face = TopoDS::Face(face_exp.Current());
+            const gp_Pnt reference = halfspace_reference_point(
+                surface, interior_point, vertices, sense,
+                effective_tolerance);
             const TopoDS_Solid halfspace =
-                BRepPrimAPI_MakeHalfSpace(face, interior_point).Solid();
-            BRepAlgoAPI_Cut outside_cut(solid, halfspace);
-            outside_cut.Build();
+                BRepPrimAPI_MakeHalfSpace(face, reference).Solid();
+            BRepAlgoAPI_Cut outside_cut;
+            build_binary_boolean(outside_cut, solid, halfspace);
             if (!outside_cut.IsDone()) {
                 cert.failure_code = "halfspace_boolean_failed";
                 add_diag(report, DiagnosticSeverity::error,
@@ -497,9 +611,52 @@ bool validate_convex_halfspace_cell(const TopoDS_Solid& solid,
             return false;
         }
     }
+    if (curved_certificate_deferred) {
+        cert.failure_code = "curved_halfspace_certificate_deferred";
+        cert.certified = false;
+        return false;
+    }
     cert.certified = cert.faces_checked > 0
         && cert.boolean_halfspace_checks == cert.faces_checked;
     return true;
+}
+
+std::size_t convexity_halfspace_violation_count(
+    const TopoDS_Solid& solid,
+    std::size_t solid_index,
+    const ConversionOptions& options) {
+    GProp_GProps props;
+    BRepGProp::VolumeProperties(solid, props);
+    gp_Pnt interior;
+    if (!find_interior_point(solid, props, options.linear_tolerance, &interior)) {
+        return 1;
+    }
+    const std::vector<gp_Pnt> vertices = solid_vertices(solid);
+    const double effective_tolerance =
+        solid_topological_tolerance(solid, options.linear_tolerance);
+    std::size_t violations = 0;
+    std::size_t face_index = 0;
+    ConversionReport scratch;
+    for (TopExp_Explorer face_exp(solid, TopAbs_FACE);
+         face_exp.More(); face_exp.Next()) {
+        ++face_index;
+        AnalyticSurface surface;
+        if (!analytic_surface_from_face(TopoDS::Face(face_exp.Current()),
+                                        solid_index, face_index, scratch,
+                                        false, &surface, nullptr)) {
+            continue;
+        }
+        const int sense = selected_halfspace_sense(
+            surface, interior, vertices, effective_tolerance);
+        const bool face_violated = std::any_of(
+            vertices.begin(), vertices.end(), [&](const gp_Pnt& vertex) {
+                const double value = surface.signed_distance_at(vertex);
+                return sense < 0 ? value > effective_tolerance
+                                 : value < -effective_tolerance;
+            });
+        if (face_violated) ++violations;
+    }
+    return violations;
 }
 
 bool find_convexity_failure_face(const TopoDS_Solid& solid,
@@ -517,6 +674,8 @@ bool find_convexity_failure_face(const TopoDS_Solid& solid,
     if (vertices.empty()) {
         return false;
     }
+    const double effective_tolerance =
+        solid_topological_tolerance(solid, options.linear_tolerance);
 
     std::size_t face_index = 0;
     ConversionReport scratch;
@@ -536,13 +695,13 @@ bool find_convexity_failure_face(const TopoDS_Solid& solid,
         // kind -- raw value_at() returns length^2 for quadrics/spheres and
         // length^4 for tori, which made the check spuriously fail on
         // large-radius faces and triggered cuts that could not split.
-        const double interior_value = surface.signed_distance_at(interior_point);
-        const int sense = interior_value <= options.linear_tolerance ? -1 : 1;
+        const int sense = selected_halfspace_sense(
+            surface, interior_point, vertices, effective_tolerance);
         for (const gp_Pnt& vertex : vertices) {
             const double value = surface.signed_distance_at(vertex);
             const bool outside = sense < 0
-                ? value > options.linear_tolerance
-                : value < -options.linear_tolerance;
+                ? value > effective_tolerance
+                : value < -effective_tolerance;
             if (outside) {
                 *face_index_out = face_index;
                 return true;
@@ -550,10 +709,13 @@ bool find_convexity_failure_face(const TopoDS_Solid& solid,
         }
         try {
             const TopoDS_Face face = TopoDS::Face(face_exp.Current());
+            const gp_Pnt reference = halfspace_reference_point(
+                surface, interior_point, vertices, sense,
+                effective_tolerance);
             const TopoDS_Solid halfspace =
-                BRepPrimAPI_MakeHalfSpace(face, interior_point).Solid();
-            BRepAlgoAPI_Cut outside_cut(solid, halfspace);
-            outside_cut.Build();
+                BRepPrimAPI_MakeHalfSpace(face, reference).Solid();
+            BRepAlgoAPI_Cut outside_cut;
+            build_binary_boolean(outside_cut, solid, halfspace);
             if (!outside_cut.IsDone()) continue;
             GProp_GProps outside_props;
             BRepGProp::VolumeProperties(outside_cut.Shape(), outside_props);

@@ -1,0 +1,15 @@
+{
+  "schema": "csgify.autonomy-actions",
+  "schema_version": 2,
+  "request_id": "request:certified-fixed-point",
+  "source_digest": "dff5aa386cae4b29b05d6da4ac0c2f8f",
+  "expected_revision": 0,
+  "actor": "llm:test",
+  "actions": [
+    {
+      "id": "certified-fixed-point",
+      "op": "decompose_to_fixed_point",
+      "rationale": "Run the bounded global coordinator; it accepts only certified progress."
+    }
+  ]
+}

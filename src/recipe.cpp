@@ -1,5 +1,6 @@
 #include "recipe.hpp"
 
+#include "csgify/session.hpp"
 #include "json_parser.hpp"
 #include "operation_registry.hpp"
 
@@ -46,7 +47,70 @@ struct Decision {
     FingerprintRecord fingerprint;
     std::unordered_map<std::string, std::shared_ptr<JsonValue>> params;
     std::size_t undoes_seq = 0;   // only for "undo"
+    std::string review_target_id;
+    std::string proposal_id;
+    std::string review_decision;
+    std::string review_kind;
+    std::string review_action;
+    std::string review_candidate_id;
+    std::size_t review_base_revision = 0;
+    DecisionAuditContext audit;
 };
+
+struct RecipePostconditions {
+    bool present = false;
+    bool has_decomposition_state = false;
+    std::size_t residual_count = 0;
+    std::size_t active_piece_count = 0;
+    std::size_t max_overlap_errors = 0;
+    bool has_approximation_ledger = false;
+    double cumulative_changed_volume = 0.0;
+    double cumulative_added_volume = 0.0;
+    double cumulative_removed_volume = 0.0;
+};
+
+RecipePostconditions derive_postconditions(const std::vector<Decision>& ops) {
+    RecipePostconditions out;
+    for (const Decision& op : ops) {
+        const auto residual = op.params.find("residual_count_after");
+        const auto pieces = op.params.find("active_piece_count_after");
+        if (residual == op.params.end() || pieces == op.params.end()
+            || !residual->second || !pieces->second) {
+            const OperationDescriptor* descriptor = find_operation(op.op);
+            if (out.present && descriptor && descriptor->mutating) {
+                // A later unrelated mutation invalidates the coordinator's
+                // terminal counts. Omit rather than encode stale evidence.
+                out = {};
+            }
+            continue;
+        }
+        out.present = true;
+        out.has_decomposition_state = true;
+        out.residual_count = static_cast<std::size_t>(
+            residual->second->as_number());
+        out.active_piece_count = static_cast<std::size_t>(
+            pieces->second->as_number());
+        out.max_overlap_errors = 0;
+    }
+    for (const Decision& op : ops) {
+        if (op.op != "apply_budgeted_replacement_operation"
+            && op.op != "shatter_with_approximation"
+            && op.op != "remove_residual_with_approximation"
+            && op.op != "resolve_overlap_with_approximation"
+            && op.op != "apply_budgeted_surface_replacement_candidate") continue;
+        auto changed = op.params.find("changed_volume");
+        auto added = op.params.find("added_volume");
+        auto removed = op.params.find("removed_volume");
+        if (changed == op.params.end() || added == op.params.end()
+            || removed == op.params.end()) continue;
+        out.present = true;
+        out.has_approximation_ledger = true;
+        out.cumulative_changed_volume += changed->second->as_number();
+        out.cumulative_added_volume += added->second->as_number();
+        out.cumulative_removed_volume += removed->second->as_number();
+    }
+    return out;
+}
 
 // Category groups ops that supersede one another on the same target. A
 // later op of the same category replaces an earlier one in the recipe.
@@ -106,6 +170,34 @@ Decision read_record(const JsonValue& obj) {
     if (const JsonValue* v = obj.get("undoes_seq")) {
         d.undoes_seq = static_cast<std::size_t>(v->as_number());
     }
+    if (const JsonValue* v = obj.get("target_id"))
+        d.review_target_id = v->as_string();
+    if (const JsonValue* v = obj.get("proposal_id"))
+        d.proposal_id = v->as_string();
+    if (const JsonValue* v = obj.get("decision"))
+        d.review_decision = v->as_string();
+    if (const JsonValue* v = obj.get("review_kind"))
+        d.review_kind = v->as_string();
+    if (const JsonValue* v = obj.get("action"))
+        d.review_action = v->as_string();
+    if (const JsonValue* v = obj.get("candidate_id"))
+        d.review_candidate_id = v->as_string();
+    if (const JsonValue* v = obj.get("base_revision"))
+        d.review_base_revision = static_cast<std::size_t>(v->as_number());
+    if (const JsonValue* audit = obj.get("audit")) {
+        if (const JsonValue* v = audit->get("actor"))
+            d.audit.actor = v->as_string();
+        if (const JsonValue* v = audit->get("proposal_actor"))
+            d.audit.proposal_actor = v->as_string();
+        if (const JsonValue* v = audit->get("proposal_id"))
+            d.audit.proposal_id = v->as_string();
+        if (const JsonValue* v = audit->get("rationale"))
+            d.audit.rationale = v->as_string();
+        if (const JsonValue* v = audit->get("policy_rule"))
+            d.audit.policy_rule = v->as_string();
+        if (const JsonValue* v = audit->get("approval_mode"))
+            d.audit.approval_mode = v->as_string();
+    }
     if (const JsonValue* t = obj.get("target")) {
         if (const JsonValue* v = t->get("kind")) d.target_kind = v->as_string();
         if (const JsonValue* v = t->get("shape_id")) d.target_shape_id = v->as_string();
@@ -135,6 +227,31 @@ Decision read_record(const JsonValue& obj) {
     return d;
 }
 
+std::vector<Decision> compact_reviews(const std::vector<Decision>& records) {
+    std::map<std::size_t, Decision> latest;
+    std::unordered_map<std::string, std::size_t> sequence_by_identity;
+    for (const Decision& record : records) {
+        if (record.kind != "review" || record.review_target_id.empty()
+            || record.proposal_id.empty() || record.review_decision.empty()) {
+            continue;
+        }
+        const std::string identity = record.review_target_id + "\n"
+            + record.proposal_id;
+        Decision normalized = record;
+        if (normalized.audit.proposal_id.empty())
+            normalized.audit.proposal_id = normalized.proposal_id;
+        const auto previous = sequence_by_identity.find(identity);
+        if (previous != sequence_by_identity.end())
+            latest.erase(previous->second);
+        sequence_by_identity[identity] = record.seq;
+        latest[record.seq] = std::move(normalized);
+    }
+    std::vector<Decision> reviews;
+    reviews.reserve(latest.size());
+    for (const auto& entry : latest) reviews.push_back(entry.second);
+    return reviews;
+}
+
 struct Manifest {
     std::string step_path;
     std::string step_digest;
@@ -151,7 +268,7 @@ struct Manifest {
 //   3. For each (target, category), keep only the latest surviving op.
 //   4. Drop ops whose target is later remove_solid'd. (A "removal" of
 //      itself survives — the model genuinely has that solid removed.)
-//   5. load_step is always first; emit_mcnp is always last.
+//   5. load_step is always first; export_step and emit_mcnp are last.
 //
 // Steps deferred to step 3:
 //   - Intermediate-decomposition pieces: this MVP keeps ops on pieces
@@ -159,7 +276,8 @@ struct Manifest {
 //     matter; covered there.
 //   - Fingerprint-based stable ordering across runs that arrive at the
 //     same final model.
-std::vector<Decision> compact(const std::vector<Decision>& records) {
+std::vector<Decision> compact(const std::vector<Decision>& records,
+                              bool preserve_step_exports) {
     std::unordered_set<std::size_t> undone;
     for (const Decision& d : records) {
         if (d.kind == "undo" && d.undoes_seq != 0) {
@@ -180,13 +298,9 @@ std::vector<Decision> compact(const std::vector<Decision>& records) {
         if (d.kind != "decision") continue;
         if (d.result != "applied") continue;
         if (undone.count(d.seq)) continue;
-        // export_step writes the simplified STEP, a side-output rather than a
-        // step in the MCNP conversion pipeline. The recipe pins no STEP output
-        // path; `csgify replay --out-step` is the knob for that. Dropping it
-        // keeps recipe.lua, recipe.json, and replay free of an op none of them
-        // can act on.
-        if (d.op == "export_step") continue;
-        if (d.op == "load_step" || d.op == "emit_mcnp") {
+        if (d.op == "export_step" && !preserve_step_exports) continue;
+        if (d.op == "load_step" || d.op == "export_step"
+            || d.op == "emit_mcnp") {
             kept[d.seq] = d;
             continue;
         }
@@ -220,8 +334,10 @@ std::vector<Decision> compact(const std::vector<Decision>& records) {
     out.reserve(kept.size());
     Decision load_step_op;
     Decision emit_mcnp_op;
+    Decision export_step_op;
     bool have_load = false;
     bool have_emit = false;
+    bool have_export = false;
 
     for (auto& kv : kept) {
         Decision& d = kv.second;
@@ -235,6 +351,11 @@ std::vector<Decision> compact(const std::vector<Decision>& records) {
             have_emit = true;
             continue;
         }
+        if (d.op == "export_step") {
+            export_step_op = d;
+            have_export = true;
+            continue;
+        }
         if (category_for(d.op) == "solid" && d.op != "remove_solid") {
             const std::string id = d.component_entry.empty()
                 ? d.target_shape_id
@@ -245,9 +366,10 @@ std::vector<Decision> compact(const std::vector<Decision>& records) {
     }
 
     std::vector<Decision> ordered;
-    ordered.reserve(out.size() + 2);
+    ordered.reserve(out.size() + 3);
     if (have_load) ordered.push_back(load_step_op);
     for (Decision& d : out) ordered.push_back(std::move(d));
+    if (have_export) ordered.push_back(export_step_op);
     if (have_emit) ordered.push_back(emit_mcnp_op);
     return ordered;
 }
@@ -283,12 +405,120 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
         out << "s:remove_solid(" << quoted_id << ")\n";
         return true;
     }
+    if (d.op == "remove_residual_with_approximation") {
+        auto number = [&](const char* key, double fallback) {
+            auto it = d.params.find(key);
+            return it == d.params.end() ? fallback
+                                        : it->second->as_number(fallback);
+        };
+        auto boolean = [&](const char* key, bool fallback) {
+            auto it = d.params.find(key);
+            return it == d.params.end() ? fallback
+                                        : it->second->as_bool(fallback);
+        };
+        emit_comment(out, d);
+        out << "s:remove_solid(" << quoted_id
+            << ", { approx_global_limit = "
+            << format_double(number("approximation_global_limit", 0.0))
+            << ", approx_body_limit = "
+            << format_double(number("approximation_body_limit", 0.0))
+            << ", approx_action_limit = "
+            << format_double(number("approximation_action_limit", 0.0))
+            << ", approx_global_added_limit = "
+            << format_double(number("approximation_global_added_limit", 0.0))
+            << ", approx_global_removed_limit = "
+            << format_double(number("approximation_global_removed_limit", 0.0))
+            << ", approx_body_added_limit = "
+            << format_double(number("approximation_body_added_limit", 0.0))
+            << ", approx_body_removed_limit = "
+            << format_double(number("approximation_body_removed_limit", 0.0))
+            << ", allow_sliver_removal = true"
+            << ", require_containment_preservation = "
+            << (boolean("require_containment_preservation", true) ? "true" : "false")
+            << ", require_topology_preservation = "
+            << (boolean("require_topology_preservation", true) ? "true" : "false")
+            << " })\n";
+        return true;
+    }
+    if (d.op == "resolve_overlap_with_approximation") {
+        auto owner = d.params.find("owner_shape_id");
+        if (owner == d.params.end()) {
+            std::cerr << "recipe: overlap resolution is missing owner_shape_id\n";
+            return false;
+        }
+        auto number = [&](const char* key, double fallback) {
+            auto it = d.params.find(key);
+            return it == d.params.end() ? fallback
+                                        : it->second->as_number(fallback);
+        };
+        auto boolean = [&](const char* key, bool fallback) {
+            auto it = d.params.find(key);
+            return it == d.params.end() ? fallback
+                                        : it->second->as_bool(fallback);
+        };
+        emit_comment(out, d);
+        out << "s:resolve_overlap(" << quoted_id << ", \""
+            << lua_escape(owner->second->as_string())
+            << "\", { approx_global_limit = "
+            << format_double(number("approximation_global_limit", 0.0))
+            << ", approx_body_limit = "
+            << format_double(number("approximation_body_limit", 0.0))
+            << ", approx_action_limit = "
+            << format_double(number("approximation_action_limit", 0.0))
+            << ", approx_global_added_limit = "
+            << format_double(number("approximation_global_added_limit", 0.0))
+            << ", approx_global_removed_limit = "
+            << format_double(number("approximation_global_removed_limit", 0.0))
+            << ", approx_body_added_limit = "
+            << format_double(number("approximation_body_added_limit", 0.0))
+            << ", approx_body_removed_limit = "
+            << format_double(number("approximation_body_removed_limit", 0.0))
+            << ", allow_overlap_resolution = true"
+            << ", require_containment_preservation = "
+            << (boolean("require_containment_preservation", true)
+                    ? "true" : "false")
+            << ", require_topology_preservation = "
+            << (boolean("require_topology_preservation", true)
+                    ? "true" : "false")
+            << " })\n";
+        return true;
+    }
     if (d.op == "decompose_planar") {
         emit_comment(out, d);
         out << "s:decompose_planar(" << quoted_id << ")\n";
         return true;
     }
-    if (d.op == "shatter") {
+    if (d.op == "decompose_prismatic") {
+        emit_comment(out, d);
+        out << "s:decompose_prismatic(" << quoted_id << ")\n";
+        return true;
+    }
+    if (d.op == "decompose_revolution") {
+        emit_comment(out, d);
+        out << "s:decompose_revolution(" << quoted_id << ")\n";
+        return true;
+    }
+    if (d.op == "reuse_definition_conversion") {
+        const auto source = d.params.find("source_solid_id");
+        const std::string source_id = source == d.params.end()
+            || !source->second ? std::string{} : source->second->as_string();
+        if (source_id.empty()) return false;
+        emit_comment(out, d);
+        out << "s:reuse_definition_conversion(" << quoted_id << ", "
+            << "\"" << lua_escape(source_id) << "\")\n";
+        return true;
+    }
+    if (d.op == "decompose_shell_difference") {
+        emit_comment(out, d);
+        out << "s:decompose_shell_difference(" << quoted_id << ")\n";
+        return true;
+    }
+    if (d.op == "decompose_pipe_annulus") {
+        emit_comment(out, d);
+        out << "s:decompose_pipe_annulus(" << quoted_id << ")\n";
+        return true;
+    }
+    if (d.op == "shatter" || d.op == "shatter_with_approximation") {
         int max_depth = 8;
         bool allow_drift = false;
         if (auto it = d.params.find("max_depth"); it != d.params.end()) {
@@ -298,9 +528,44 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
             allow_drift = it->second->as_bool(false);
         }
         emit_comment(out, d);
-        out << "s:shatter(" << quoted_id << ", { max_depth = " << max_depth
-            << ", allow_volume_drift = " << (allow_drift ? "true" : "false")
-            << " })\n";
+        out << "s:shatter(" << quoted_id << ", { max_depth = " << max_depth;
+        if (d.op == "shatter") {
+            out << ", allow_volume_drift = "
+                << (allow_drift ? "true" : "false");
+        } else {
+            auto number = [&](const char* key, double fallback) {
+                auto it = d.params.find(key);
+                return it == d.params.end() ? fallback
+                                            : it->second->as_number(fallback);
+            };
+            auto boolean = [&](const char* key, bool fallback) {
+                auto it = d.params.find(key);
+                return it == d.params.end() ? fallback
+                                            : it->second->as_bool(fallback);
+            };
+            out << ", approx_global_limit = "
+                << format_double(number("approximation_global_limit", 0.0))
+                << ", approx_body_limit = "
+                << format_double(number("approximation_body_limit", 0.0))
+                << ", approx_action_limit = "
+                << format_double(number("approximation_action_limit", 0.0))
+                << ", approx_global_added_limit = "
+                << format_double(number("approximation_global_added_limit", 0.0))
+                << ", approx_global_removed_limit = "
+                << format_double(number("approximation_global_removed_limit", 0.0))
+                << ", approx_body_added_limit = "
+                << format_double(number("approximation_body_added_limit", 0.0))
+                << ", approx_body_removed_limit = "
+                << format_double(number("approximation_body_removed_limit", 0.0))
+                << ", allow_numerical_shatter_loss = true"
+                << ", require_containment_preservation = "
+                << (boolean("require_containment_preservation", true)
+                        ? "true" : "false")
+                << ", require_topology_preservation = "
+                << (boolean("require_topology_preservation", true)
+                        ? "true" : "false");
+        }
+        out << " })\n";
         return true;
     }
     if (d.op == "decompose_by_face") {
@@ -415,7 +680,8 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
         return true;
     }
     if (d.op == "apply_replacement_operation"
-        || d.op == "apply_checked_replacement_operation") {
+        || d.op == "apply_checked_replacement_operation"
+        || d.op == "apply_budgeted_replacement_operation") {
         auto it = d.params.find("operation");
         if (it == d.params.end() || it->second->kind != JsonKind::number) {
             std::cerr << "recipe: missing 'operation' param on " << d.op << "\n";
@@ -428,8 +694,58 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
             return false;
         }
         emit_comment(out, d);
-        out << "s:" << method << "(" << quoted_id;
-        if (d.op == "apply_checked_replacement_operation") {
+        if (d.op == "apply_budgeted_replacement_operation") {
+            const OperationDescriptor* descriptor =
+                find_replacement(static_cast<ReplacementOperation>(op_enum));
+            if (!descriptor) {
+                std::cerr << "recipe: missing replacement descriptor for enum "
+                          << op_enum << "\n";
+                return false;
+            }
+            out << "s:replace_solid(" << quoted_id << ", \""
+                << descriptor->lua_value << "\"";
+        } else {
+            out << "s:" << method << "(" << quoted_id;
+        }
+        if (d.op == "apply_budgeted_replacement_operation") {
+            auto number = [&](const char* key, double fallback) {
+                auto pit = d.params.find(key);
+                return pit == d.params.end() ? fallback
+                                             : pit->second->as_number(fallback);
+            };
+            auto boolean = [&](const char* key, bool fallback) {
+                auto pit = d.params.find(key);
+                return pit == d.params.end() ? fallback
+                                             : pit->second->as_bool(fallback);
+            };
+            out << ", { approx_global_limit = "
+                << format_double(number("approximation_global_limit", 0.0))
+                << ", approx_body_limit = "
+                << format_double(number("approximation_body_limit", 0.0))
+                << ", approx_action_limit = "
+                << format_double(number("approximation_action_limit", 0.0))
+                << ", approx_global_added_limit = "
+                << format_double(number("approximation_global_added_limit", 0.0))
+                << ", approx_global_removed_limit = "
+                << format_double(number("approximation_global_removed_limit", 0.0))
+                << ", approx_body_added_limit = "
+                << format_double(number("approximation_body_added_limit", 0.0))
+                << ", approx_body_removed_limit = "
+                << format_double(number("approximation_body_removed_limit", 0.0))
+                << ", approx_surface_deviation_limit = "
+                << format_double(number("approximation_surface_deviation_limit", 0.0))
+                << ", allow_surface_replacement = "
+                << (boolean("allow_surface_replacement", false) ? "true" : "false")
+                << ", allow_bbox_replacement = "
+                << (boolean("allow_bbox_replacement", false) ? "true" : "false")
+                << ", allow_sliver_removal = "
+                << (boolean("allow_sliver_removal", false) ? "true" : "false")
+                << ", require_containment_preservation = "
+                << (boolean("require_containment_preservation", true) ? "true" : "false")
+                << ", require_topology_preservation = "
+                << (boolean("require_topology_preservation", true) ? "true" : "false")
+                << " }";
+        } else if (d.op == "apply_checked_replacement_operation") {
             bool wrote = false;
             auto has_abs = d.params.find("has_max_abs_delta");
             auto max_abs = d.params.find("max_abs_delta");
@@ -458,6 +774,47 @@ bool emit_solid_op(std::ostream& out, const Decision& d) {
 }
 
 bool emit_face_op(std::ostream& out, const Decision& d) {
+    if (d.op == "apply_budgeted_surface_replacement_candidate") {
+        auto candidate = d.params.find("candidate_id");
+        if (candidate == d.params.end()) return false;
+        auto number = [&](const char* key, double fallback) {
+            auto it = d.params.find(key);
+            return it == d.params.end() ? fallback
+                                        : it->second->as_number(fallback);
+        };
+        auto boolean = [&](const char* key, bool fallback) {
+            auto it = d.params.find(key);
+            return it == d.params.end() ? fallback
+                                        : it->second->as_bool(fallback);
+        };
+        emit_comment(out, d);
+        out << "s:apply_surface_replacement_candidate(\""
+            << lua_escape(d.target_shape_id) << "\", \""
+            << lua_escape(candidate->second->as_string())
+            << "\", { approx_global_limit = "
+            << format_double(number("approximation_global_limit", 0.0))
+            << ", approx_body_limit = "
+            << format_double(number("approximation_body_limit", 0.0))
+            << ", approx_action_limit = "
+            << format_double(number("approximation_action_limit", 0.0))
+            << ", approx_global_added_limit = "
+            << format_double(number("approximation_global_added_limit", 0.0))
+            << ", approx_global_removed_limit = "
+            << format_double(number("approximation_global_removed_limit", 0.0))
+            << ", approx_body_added_limit = "
+            << format_double(number("approximation_body_added_limit", 0.0))
+            << ", approx_body_removed_limit = "
+            << format_double(number("approximation_body_removed_limit", 0.0))
+            << ", approx_surface_deviation_limit = "
+            << format_double(number("approximation_surface_deviation_limit", 0.0))
+            << ", allow_surface_replacement = true"
+            << ", require_containment_preservation = "
+            << (boolean("require_containment_preservation", true) ? "true" : "false")
+            << ", require_topology_preservation = "
+            << (boolean("require_topology_preservation", true) ? "true" : "false")
+            << " })\n";
+        return true;
+    }
     if (d.op == "apply_surface_replacement_candidate") {
         auto kind_it = d.params.find("kind");
         auto budget_it = d.params.find("max_deviation_budget");
@@ -504,8 +861,8 @@ bool emit_face_op(std::ostream& out, const Decision& d) {
 }
 
 // Build a Lua options table from the conversion options journaled on a
-// load_step decision (currently the overlap knobs). Returns "" when none are
-// present, so ordinary recipes keep the bare s:load_step(path) form. Mirrors
+// load_step decision. Returns "" when none are present, so legacy ordinary
+// recipes keep the bare s:load_step(path) form. Mirrors
 // the params written in session.cpp and consumed by replay.cpp.
 std::string load_step_options_table(const Decision& d) {
     std::vector<std::string> fields;
@@ -523,10 +880,23 @@ std::string load_step_options_table(const Decision& d) {
                              + format_double(it->second->as_number()));
         }
     };
+    auto add_string = [&](const char* key) {
+        auto it = d.params.find(key);
+        if (it != d.params.end() && it->second->kind == JsonKind::string) {
+            fields.push_back(std::string(key) + " = \""
+                             + lua_escape(it->second->as_string()) + "\"");
+        }
+    };
     add_bool("allow_overlaps");
     add_bool("check_overlaps");
+    add_bool("heal_shape");
+    add_string("unit_override");
+    add_num("unit_scale_to_mm_override");
+    add_string("normalize_to_unit");
     add_num("overlap_volume_threshold");
     add_num("overlap_volume_fraction");
+    add_string("mcnp_domain_id");
+    add_bool("require_domain_coverage");
     if (fields.empty()) return "";
     std::string table = "{ ";
     for (std::size_t i = 0; i < fields.size(); ++i) {
@@ -554,6 +924,13 @@ bool emit_document_op(std::ostream& out, const Decision& d, const std::string& d
         out << "s:emit(" << doc_var << ", \"" << lua_escape(outpath) << "\")\n";
         return true;
     }
+    if (d.op == "export_step") {
+        auto it = d.params.find("output_path");
+        const std::string outpath = it != d.params.end() ? it->second->as_string() : "";
+        out << "s:export_step(" << doc_var << ", \""
+            << lua_escape(outpath) << "\")\n";
+        return true;
+    }
     if (d.op == "auto_fit_splines") {
         out << "s:auto_fit_splines(" << doc_var;
         auto has_dev = d.params.find("has_max_deviation");
@@ -563,6 +940,115 @@ bool emit_document_op(std::ostream& out, const Decision& d, const std::string& d
             out << ", { max_deviation = " << format_double(dev->second->as_number()) << " }";
         }
         out << ")\n";
+        return true;
+    }
+    if (d.op == "define_material") {
+        const auto id = d.params.find("material_id");
+        const auto phase = d.params.find("phase");
+        const auto density = d.params.find("density");
+        if (id == d.params.end() || phase == d.params.end()
+            || density == d.params.end()) return false;
+        out << "s:define_material(" << doc_var << ", { id = \""
+            << lua_escape(id->second->as_string()) << "\", phase = \""
+            << lua_escape(phase->second->as_string()) << "\", density = "
+            << format_double(density->second->as_number()) << " })\n";
+        return true;
+    }
+    if (d.op == "apply_contained_medium"
+        || d.op == "stage_contained_medium_request") {
+        auto value = [&](const char* key) -> std::string {
+            const auto it = d.params.find(key);
+            return it == d.params.end() || !it->second
+                ? std::string{} : it->second->as_string();
+        };
+        auto number = [&](const char* key, double fallback) {
+            const auto it = d.params.find(key);
+            return it == d.params.end() || !it->second
+                ? fallback : it->second->as_number(fallback);
+        };
+        out << "s:" << (d.op == "apply_contained_medium"
+                ? "apply_contained_medium" : "stage_contained_medium_request")
+            << "(" << doc_var << ", { id = \""
+            << lua_escape(value("request_id")) << "\", material_id = \""
+            << lua_escape(value("material_id"))
+            << "\", complement_material_id = \""
+            << lua_escape(value("complement_material_id"))
+            << "\", fill_mode = \"" << lua_escape(value("fill_mode"))
+            << "\", host_component_ids = { ";
+        const int host_count = static_cast<int>(number("host_count", 0));
+        if (host_count > 0) {
+            for (int index = 1; index <= host_count; ++index) {
+                if (index > 1) out << ", ";
+                out << '"' << lua_escape(value(
+                    ("host_" + std::to_string(index) + "_component_id").c_str()))
+                    << '"';
+            }
+        } else if (!value("host_component_id").empty()) {
+            out << '"' << lua_escape(value("host_component_id")) << '"';
+        }
+        out << " }, ports = { ";
+        bool wrote_port = false;
+        const int port_count = static_cast<int>(number("port_count", 2));
+        for (int index = 1; index <= port_count; ++index) {
+            const std::string prefix = "port_" + std::to_string(index);
+            const std::string port_id = value((prefix + "_id").c_str());
+            if (port_id.empty()) continue;
+            if (wrote_port) out << ", ";
+            wrote_port = true;
+            out << "{ port_id = \"" << lua_escape(port_id)
+                << "\", disposition = \""
+                << lua_escape(value((prefix + "_disposition").c_str()))
+                << "\", peer_port_id = \""
+                << lua_escape(value((prefix + "_peer_id").c_str()))
+                << "\", valve_state = \""
+                << lua_escape(value((prefix + "_valve_state").c_str()))
+                << "\" }";
+        }
+        out << " }, internal_components_to_subtract = { ";
+        const int internal_count = static_cast<int>(
+            number("internal_component_count", 0));
+        for (int index = 1; index <= internal_count; ++index) {
+            if (index > 1) out << ", ";
+            out << '"' << lua_escape(value(
+                ("internal_" + std::to_string(index) + "_component_id").c_str()))
+                << '"';
+        }
+        out << " }, seed_points_or_faces = { ";
+        const int seed_count = static_cast<int>(number("seed_count", 0));
+        for (int index = 1; index <= seed_count; ++index) {
+            if (index > 1) out << ", ";
+            const std::string prefix = "seed_" + std::to_string(index);
+            out << "{ kind = \""
+                << lua_escape(value((prefix + "_kind").c_str()))
+                << "\", entity_id = \""
+                << lua_escape(value((prefix + "_entity_id").c_str()))
+                << "\", point = { "
+                << format_double(number((prefix + "_x").c_str(), 0.0)) << ", "
+                << format_double(number((prefix + "_y").c_str(), 0.0)) << ", "
+                << format_double(number((prefix + "_z").c_str(), 0.0))
+                << " } }";
+        }
+        out << " }, max_worker_count = "
+            << static_cast<int>(number("max_worker_count", 1));
+        const auto fill_level = d.params.find("fill_level");
+        if (fill_level != d.params.end())
+            out << ", fill_level = "
+                << format_double(fill_level->second->as_number());
+        const auto fraction = d.params.find("target_volume_fraction");
+        if (fraction != d.params.end())
+            out << ", target_volume_fraction = "
+                << format_double(fraction->second->as_number());
+        const auto pockets = d.params.find("allow_disconnected_pockets");
+        out << ", allow_disconnected_pockets = "
+            << (pockets != d.params.end() && pockets->second->as_bool()
+                    ? "true" : "false");
+        if (d.op == "apply_contained_medium") {
+            const auto approved = d.params.find("user_approved");
+            out << ", user_approved = "
+                << (approved != d.params.end() && approved->second->as_bool()
+                        ? "true" : "false");
+        }
+        out << " })\n";
         return true;
     }
     if (d.op == "undo_last_mutation") {
@@ -645,7 +1131,9 @@ void emit_op_json(std::ostream& out, const Decision& d) {
 
 bool emit_recipe_json(std::ostream& out,
                       const Manifest& manifest,
-                      const std::vector<Decision>& ops) {
+                      const std::vector<Decision>& ops,
+                      const std::vector<Decision>& reviews,
+                      const RecipePostconditions& postconditions) {
     out << "{\n";
     out << "  \"schema\": \"csgify.recipe\",\n";
     out << "  \"schema_version\": 1,\n";
@@ -655,6 +1143,63 @@ bool emit_recipe_json(std::ostream& out,
     out << ",\"csgify_version\":";emit_json_string(out, manifest.csgify_version);
     out << ",\"occt_version\":";   emit_json_string(out, manifest.occt_version);
     out << "},\n";
+    if (postconditions.present) {
+        out << "  \"postconditions\": {";
+        bool wrote = false;
+        if (postconditions.has_decomposition_state) {
+            out << "\"residual_count\":" << postconditions.residual_count
+                << ",\"active_piece_count\":"
+                << postconditions.active_piece_count
+                << ",\"max_overlap_errors\":"
+                << postconditions.max_overlap_errors;
+            wrote = true;
+        }
+        if (postconditions.has_approximation_ledger) {
+            if (wrote) out << ",";
+            out << "\"approximation_ledger\":{"
+                << "\"cumulative_changed_volume\":"
+                << format_double(postconditions.cumulative_changed_volume)
+                << ",\"cumulative_added_volume\":"
+                << format_double(postconditions.cumulative_added_volume)
+                << ",\"cumulative_removed_volume\":"
+                << format_double(postconditions.cumulative_removed_volume)
+                << "}";
+        }
+        out << "},\n";
+    }
+    out << "  \"reviews\": [\n";
+    for (std::size_t i = 0; i < reviews.size(); ++i) {
+        const Decision& review = reviews[i];
+        out << "    {\"target_id\":";
+        emit_json_string(out, review.review_target_id);
+        out << ",\"proposal_id\":";
+        emit_json_string(out, review.proposal_id);
+        out << ",\"decision\":";
+        emit_json_string(out, review.review_decision);
+        out << ",\"review_kind\":";
+        emit_json_string(out, review.review_kind);
+        out << ",\"action\":";
+        emit_json_string(out, review.review_action);
+        out << ",\"candidate_id\":";
+        emit_json_string(out, review.review_candidate_id);
+        out << ",\"base_revision\":" << review.review_base_revision;
+        out << ",\"audit\":{\"actor\":";
+        emit_json_string(out, review.audit.actor);
+        out << ",\"proposal_actor\":";
+        emit_json_string(out, review.audit.proposal_actor);
+        out << ",\"proposal_id\":";
+        emit_json_string(out, review.audit.proposal_id);
+        out << ",\"rationale\":";
+        emit_json_string(out, review.audit.rationale);
+        out << ",\"policy_rule\":";
+        emit_json_string(out, review.audit.policy_rule);
+        out << ",\"approval_mode\":";
+        emit_json_string(out, review.audit.approval_mode);
+        out << "}}";
+        if (i + 1 < reviews.size()) out << ",";
+        out << "\n";
+    }
+    out << "  ],\n";
     out << "  \"ops\": [\n";
     for (std::size_t i = 0; i < ops.size(); ++i) {
         out << "    ";
@@ -684,21 +1229,40 @@ bool emit_recipe(std::ostream& out,
     out << "local s = csgify.session()\n";
     const std::string doc_var = "doc1";
     bool ok = true;
-    for (const Decision& d : ops) {
+    for (std::size_t i = 0; i < ops.size();) {
+        const Decision& d = ops[i];
+        if (d.target_kind == "solid" && d.op == "remove_solid") {
+            std::size_t end = i + 1;
+            while (end < ops.size()
+                   && ops[end].target_kind == "solid"
+                   && ops[end].op == "remove_solid") {
+                ++end;
+            }
+            if (end - i > 1) {
+                for (std::size_t j = i; j < end; ++j) {
+                    emit_comment(out, ops[j]);
+                }
+                out << "s:remove_solids({\n";
+                for (std::size_t j = i; j < end; ++j) {
+                    out << "    \"" << lua_escape(ops[j].target_shape_id)
+                        << "\"" << (j + 1 < end ? "," : "") << "\n";
+                }
+                out << "})\n";
+                i = end;
+                continue;
+            }
+        }
         if (d.target_kind == "document") {
             ok = emit_document_op(out, d, doc_var) && ok;
-            continue;
-        }
-        if (d.target_kind == "solid") {
+        } else if (d.target_kind == "solid") {
             ok = emit_solid_op(out, d) && ok;
-            continue;
-        }
-        if (d.target_kind == "face") {
+        } else if (d.target_kind == "face") {
             ok = emit_face_op(out, d) && ok;
-            continue;
+        } else {
+            std::cerr << "recipe: unknown target kind " << d.target_kind << "\n";
+            ok = false;
         }
-        std::cerr << "recipe: unknown target kind " << d.target_kind << "\n";
-        ok = false;
+        ++i;
     }
     return ok;
 }
@@ -782,7 +1346,10 @@ int compact_log_to_recipe(const std::string& log_path,
         records.push_back(read_record(*entry));
     }
 
-    const std::vector<Decision> ops = compact(records);
+    const std::vector<Decision> ops = compact(
+        records, options.preserve_step_exports);
+    const std::vector<Decision> reviews = compact_reviews(records);
+    const RecipePostconditions postconditions = derive_postconditions(ops);
     for (const Decision& op : ops) {
         const OperationDescriptor* descriptor = find_operation(op.op);
         if (!descriptor) {
@@ -821,7 +1388,7 @@ int compact_log_to_recipe(const std::string& log_path,
         std::cerr << "error: could not open " << json_path << " for writing\n";
         return 1;
     }
-    ok = emit_recipe_json(jout, manifest, ops) && ok;
+    ok = emit_recipe_json(jout, manifest, ops, reviews, postconditions) && ok;
 
     return ok ? 0 : 1;
 }
