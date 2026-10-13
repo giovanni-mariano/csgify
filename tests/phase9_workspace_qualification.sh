@@ -56,9 +56,27 @@ grep -q 'queue_item_not_rejectable' "$out/reject.stderr"
 
 # Construct the complete Qt workspace with real project/certificate/queue
 # attachments. Smoke mode closes on the event loop without loading STEP.
-QT_QPA_PLATFORM=offscreen "$bin" project review "$project" \
+# Existing API credentials must not opt the user into embedded chat.
+env -u CSGIFY_ENABLE_EMBEDDED_CHAT QT_QPA_PLATFORM=offscreen \
+  OPENAI_API_KEY=unused-test-key CSGIFY_OPENAI_MODEL=unused-test-model \
+  "$bin" project review "$project" \
   --source "$fixtures/overlapping_boxes.step" --coverage "$blocked" \
   --queue "$queue" --smoke-test
+python3 - "$project/project.sqlite" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    assert db.execute("SELECT COUNT(*) FROM agent_conversations").fetchone()[0] == 0
+PY
+
+# The optional simulator remains available only after explicit opt-in.
+CSGIFY_ENABLE_EMBEDDED_CHAT=1 QT_QPA_PLATFORM=offscreen \
+  OPENAI_API_KEY= CSGIFY_OPENAI_MODEL= \
+  "$bin" project review "$project" --smoke-test
+python3 - "$project/project.sqlite" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as db:
+    assert db.execute("SELECT COUNT(*) FROM agent_conversations").fetchone()[0] == 1
+PY
 
 # Model the corrective single-owner result with one component and reconcile
 # against evidence, not an acknowledgement flag.

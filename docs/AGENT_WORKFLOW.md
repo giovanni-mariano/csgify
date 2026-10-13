@@ -1,14 +1,31 @@
 # Agent Workflow
 
-csgify supports two distinct agent boundaries. Codex, Pi, Claude, and other
-external planners use the strict `context`/`autonomy`/`queue` CLI workflow in
+The default workflow uses Codex, Claude Code, Pi, or another external agent as
+the conversation and planning interface. csgify does not need a separate LLM
+API key for this path. The Qt workspace provides geometry inspection, preview,
+and human approval; it does not open an embedded chat by default.
+
+Ask the external agent to:
+
+1. Read `csgify context` for the source model and project policy.
+2. Choose an advertised action and submit it through
+   `csgify autonomy --mode propose`.
+3. Open the resulting decision queue in the Qt workspace for human review.
+4. After approval, continue through the supported queue workflow and verify
+   the resulting geometry and export.
+
+The strict `context`/`autonomy`/`queue` contract is documented in
 [CLI_AGENT_PROTOTYPE.md](CLI_AGENT_PROTOTYPE.md). It binds requests to source
 and policy identity and does not give the planner general scripting authority.
 
 ## Embedded project conversation
 
-The Qt project workspace can answer questions about the loaded model through
-an embedded OpenAI provider. The key is read from the process environment,
+The optional embedded chat requires explicit opt-in with
+`CSGIFY_ENABLE_EMBEDDED_CHAT=1`. Without that setting, the workspace creates no
+conversation dock or provider, even if API credentials are present.
+
+When enabled, the Qt project workspace can answer questions about the loaded
+model through an embedded OpenAI provider. The key is read from the process environment,
 kept in memory, and never written to the project database. An explicit model
 identifier is also required; csgify does not silently select or change models.
 
@@ -16,6 +33,7 @@ identifier is also required; csgify does not silently select or change models.
 cmake -S . -B build -DCSGIFY_ENABLE_QT_VIEWER=ON
 cmake --build build -j2
 
+export CSGIFY_ENABLE_EMBEDDED_CHAT=1
 export OPENAI_API_KEY='<your-api-key>'
 export CSGIFY_OPENAI_MODEL='<model-id-available-to-your-project>'
 

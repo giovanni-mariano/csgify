@@ -3,13 +3,26 @@
 ## Scope
 
 The first agent-facing product uses the `csgify` command line directly from
-Codex, Pi, Claude, or another coding agent. No MCP server or embedded model is
-required. The host agent handles conversation and planning; csgify remains the
+Codex, Claude Code, Pi, or another coding agent. No MCP server, embedded model,
+or separate csgify LLM API key is required. The embedded chat is disabled by
+default. The host agent handles conversation and planning; csgify remains the
 authority for geometry, policy, mutation, persistence, and export.
 
 Agents use the strict autonomy interface for untrusted proposals. The Lua API
 is reserved for scripts the user explicitly trusts and is not an alternative
 when an autonomy operation is unavailable.
+
+## Starting from an external agent
+
+Open this repository in Codex or Claude Code and give it a concrete request:
+
+> Follow docs/CLI_AGENT_PROTOTYPE.md. Inspect model.step, initialize a project
+> if needed, and explain what blocks conversion. Read the engine's context,
+> propose a certified decomposition without approximation or removal, and
+> open the decision queue in the GUI for my review.
+
+The agent uses the CLI commands below. Continue the conversation in your
+external agent and use the workspace for geometry previews and decisions.
 
 ## Project policy
 

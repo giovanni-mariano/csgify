@@ -4954,61 +4954,8 @@ public:
         tabs->addTab(makeReviewTab(), QStringLiteral("Coverage & autonomy"));
 
         geometry_load_controller_ = new CadJobController(this);
-        agent_controller_ = new CadJobController(this);
-        agent_dock_ = new AgentConversationDock(this);
-        addDockWidget(Qt::RightDockWidgetArea, agent_dock_);
-#if CSGIFY_HAVE_OPENAI_PROVIDER
-        const QString openai_key = QString::fromUtf8(qgetenv("OPENAI_API_KEY"));
-        const QString openai_model = QString::fromUtf8(
-            qgetenv("CSGIFY_OPENAI_MODEL"));
-        openai_agent_provider_ = new OpenAiAgentProvider(
-            openai_key, openai_model, this);
-        if (openai_agent_provider_->configured()) {
-            agent_dock_->setProvider(
-                QStringLiteral("Evidence assistant · OpenAI %1 · advisory")
-                    .arg(openai_model), false);
-        }
-        connect(openai_agent_provider_, &OpenAiAgentProvider::completed,
-                this, [this](const AgentResponsePtr& response) {
-                    completeLiveAgentResponse(response);
-                });
-        connect(openai_agent_provider_, &OpenAiAgentProvider::failed,
-                this, [this](const QString& code, const QString& message) {
-                    failLiveAgentResponse(code, message);
-                });
-        connect(openai_agent_provider_, &OpenAiAgentProvider::activeChanged,
-                this, [this](bool) { refreshAgentActivity(); });
-#endif
-        connect(agent_dock_, &AgentConversationDock::askRequested,
-                this, [this](const QString& question) {
-                    askAgent(question);
-                });
-        connect(agent_dock_, &AgentConversationDock::stopRequested,
-                this, [this]() {
-                    if (agent_controller_ && agent_controller_->active())
-                        agent_controller_->cancel();
-#if CSGIFY_HAVE_OPENAI_PROVIDER
-                    if (openai_agent_provider_
-                        && openai_agent_provider_->active())
-                        openai_agent_provider_->cancel();
-#endif
-                });
-        connect(agent_controller_, &CadJobController::agentContextCompleted,
-                this, [this](const AgentContextSnapshotPtr& context) {
-                    answerAgentQuestion(context);
-                });
-        connect(agent_controller_, &CadJobController::failed,
-                this, [this](const QString&, const QString& message) {
-                    persistAgentTerminalMessage(
-                        "Assistant unavailable: " + message.toStdString(),
-                        ProjectAgentMessageState::failed, nullptr, {});
-                    pending_agent_question_.clear();
-                    pending_agent_snapshot_.reset();
-                    if (agent_dock_) agent_dock_->appendError(message);
-                });
-        connect(agent_controller_, &CadJobController::activeChanged,
-                this, [this](bool) { refreshAgentActivity(); });
-        restoreAgentConversation();
+        if (qEnvironmentVariable("CSGIFY_ENABLE_EMBEDDED_CHAT") == QStringLiteral("1"))
+            initializeEmbeddedConversation();
         geometry_load_dock_ = new JobProgressDock(this);
         geometry_load_dock_->setWindowTitle(QStringLiteral("Model loading"));
         addDockWidget(Qt::BottomDockWidgetArea, geometry_load_dock_);
@@ -5222,6 +5169,65 @@ protected:
 private:
     enum class ExportKind { none, step, mcnp };
 
+    void initializeEmbeddedConversation() {
+        agent_controller_ = new CadJobController(this);
+        agent_dock_ = new AgentConversationDock(this);
+        addDockWidget(Qt::RightDockWidgetArea, agent_dock_);
+#if CSGIFY_HAVE_OPENAI_PROVIDER
+        const QString openai_key = QString::fromUtf8(qgetenv("OPENAI_API_KEY"));
+        const QString openai_model = QString::fromUtf8(
+            qgetenv("CSGIFY_OPENAI_MODEL"));
+        openai_agent_provider_ = new OpenAiAgentProvider(
+            openai_key, openai_model, this);
+        if (openai_agent_provider_->configured()) {
+            agent_dock_->setProvider(
+                QStringLiteral("Evidence assistant · OpenAI %1 · advisory")
+                    .arg(openai_model), false);
+        }
+        connect(openai_agent_provider_, &OpenAiAgentProvider::completed,
+                this, [this](const AgentResponsePtr& response) {
+                    completeLiveAgentResponse(response);
+                });
+        connect(openai_agent_provider_, &OpenAiAgentProvider::failed,
+                this, [this](const QString& code, const QString& message) {
+                    failLiveAgentResponse(code, message);
+                });
+        connect(openai_agent_provider_, &OpenAiAgentProvider::activeChanged,
+                this, [this](bool) { refreshAgentActivity(); });
+#endif
+        connect(agent_dock_, &AgentConversationDock::askRequested,
+                this, [this](const QString& question) {
+                    askAgent(question);
+                });
+        connect(agent_dock_, &AgentConversationDock::stopRequested,
+                this, [this]() {
+                    if (agent_controller_ && agent_controller_->active())
+                        agent_controller_->cancel();
+#if CSGIFY_HAVE_OPENAI_PROVIDER
+                    if (openai_agent_provider_
+                        && openai_agent_provider_->active())
+                        openai_agent_provider_->cancel();
+#endif
+                });
+        connect(agent_controller_, &CadJobController::agentContextCompleted,
+                this, [this](const AgentContextSnapshotPtr& context) {
+                    answerAgentQuestion(context);
+                });
+        connect(agent_controller_, &CadJobController::failed,
+                this, [this](const QString&, const QString& message) {
+                    persistAgentTerminalMessage(
+                        "Assistant unavailable: " + message.toStdString(),
+                        ProjectAgentMessageState::failed, nullptr, {});
+                    pending_agent_question_.clear();
+                    pending_agent_snapshot_.reset();
+                    if (agent_dock_) agent_dock_->appendError(message);
+                });
+        connect(agent_controller_, &CadJobController::activeChanged,
+                this, [this](bool) { refreshAgentActivity(); });
+        restoreAgentConversation();
+    }
+
+
     bool agentBusy() const {
         if (agent_controller_ && agent_controller_->active()) return true;
 #if CSGIFY_HAVE_OPENAI_PROVIDER
@@ -5376,7 +5382,7 @@ private:
             agent_messages_.push_back(
                 {AgentMessageRole::assistant, message.text});
         }
-        agent_dock_->setAvailable(false);
+        if (agent_dock_) agent_dock_->setAvailable(false);
     }
 
     bool persistAgentUserMessage(const QString& question) {
@@ -5640,6 +5646,11 @@ private:
         overview_ = new QLabel(page);
         overview_->setTextInteractionFlags(Qt::TextSelectableByMouse);
         layout->addWidget(overview_);
+        auto* agent_workflow = new QLabel(QStringLiteral(
+            "Use Codex or Claude Code to discuss the model and propose changes. "
+            "Inspect geometry and approve proposals in this workspace."), page);
+        agent_workflow->setWordWrap(true);
+        layout->addWidget(agent_workflow);
 
         source_summary_ = new QLabel(page);
         source_summary_->setObjectName(QStringLiteral("projectSourceSummary"));
@@ -6332,7 +6343,7 @@ private:
             return;
         session_.reset();
         document_id_.clear();
-        agent_dock_->setAvailable(false);
+        if (agent_dock_) agent_dock_->setAvailable(false);
         source_path_ = selected.toStdString();
         geometry_load_succeeded_ = false;
         evaluated_readiness_ = QStringLiteral(
@@ -6370,7 +6381,7 @@ private:
             load_options_ = conversionOptionsForProject(policy_);
             session_.reset();
             document_id_.clear();
-            agent_dock_->setAvailable(false);
+            if (agent_dock_) agent_dock_->setAvailable(false);
             queue_.reset();
             geometry_load_succeeded_ = false;
             evaluated_readiness_ = QStringLiteral(
@@ -6399,7 +6410,7 @@ private:
             if (session_) {
                 session_.reset();
                 document_id_.clear();
-                agent_dock_->setAvailable(false);
+                if (agent_dock_) agent_dock_->setAvailable(false);
                 queue_.reset();
                 geometry_load_succeeded_ = false;
                 evaluated_readiness_ = QStringLiteral(
@@ -7273,7 +7284,16 @@ int run_qt_project_workspace(const std::string& project_path,
                     QStringLiteral("askAgentButton"))
                 && window.findChild<QPushButton*>(
                     QStringLiteral("stopAgentButton"));
-            if (!prototype_controls_present || !conversation_controls_present)
+            const bool embedded_chat_enabled =
+                qEnvironmentVariable("CSGIFY_ENABLE_EMBEDDED_CHAT") == QStringLiteral("1");
+            const bool any_conversation_control =
+                window.findChild<AgentConversationDock*>(QStringLiteral("agentConversationDock"))
+                || window.findChild<QPlainTextEdit*>(QStringLiteral("agentQuestionComposer"))
+                || window.findChild<QPushButton*>(QStringLiteral("askAgentButton"))
+                || window.findChild<QPushButton*>(QStringLiteral("stopAgentButton"));
+            if (!prototype_controls_present
+                || (embedded_chat_enabled ? !conversation_controls_present
+                                          : any_conversation_control))
                 return EXIT_FAILURE;
         }
         window.show();

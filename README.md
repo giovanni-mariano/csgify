@@ -47,11 +47,14 @@ settings without dropping advanced restrictions, and export reviewed STEP or
 gated MCNP output without closing the project. Successful exports are also
 copied into the project's immutable artifact store.
 
-The project workspace also has a persistent advisory conversation dock. Set
-`OPENAI_API_KEY` and `CSGIFY_OPENAI_MODEL` before launching to use the embedded
-OpenAI Responses provider; without both variables it uses a clearly labelled
-simulated provider. The current slice answers revision-bound geometry
-questions and never mutates the model. Setup and privacy boundaries are in
+Use Codex, Claude Code, or another external agent for conversation and planning.
+The agent reads `csgify context`, submits structured proposals through
+`csgify autonomy --mode propose`, and uses the Qt workspace for human review.
+No separate LLM API key is required by csgify for this workflow. See
+[docs/CLI_AGENT_PROTOTYPE.md](docs/CLI_AGENT_PROTOTYPE.md).
+
+The embedded advisory chat is disabled by default. It is available only with
+`CSGIFY_ENABLE_EMBEDDED_CHAT=1`; provider setup and privacy boundaries are in
 [docs/AGENT_WORKFLOW.md](docs/AGENT_WORKFLOW.md#embedded-project-conversation).
 
 The Qt queue labels its active authority as Advisory, Assisted, or Delegated
