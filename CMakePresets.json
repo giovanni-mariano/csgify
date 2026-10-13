@@ -10,12 +10,31 @@
         "CMAKE_PREFIX_PATH": "/home/giovanni/OCCT-8_0_0-install",
         "CSGIFY_LIBALEA_ROOT": "${sourceDir}/../libalea"
       }
+    },
+    {
+      "name": "macos",
+      "displayName": "macOS Qt and CLI (local OCCT 8.0.0)",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_MAKE_PROGRAM": "${sourceDir}/build/tools/bin/ninja",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/build/deps/occt-install;/opt/homebrew/opt/qtbase",
+        "CSGIFY_LIBALEA_ROOT": "${sourceDir}/../libalea.c",
+        "CSGIFY_ENABLE_QT_VIEWER": "ON",
+        "CSGIFY_TEST_STEP": "${sourceDir}/build/deps/occt-src/data/step/screw.step"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "occt8",
       "configurePreset": "occt8"
+    },
+    {
+      "name": "macos",
+      "configurePreset": "macos",
+      "jobs": 8
     }
   ]
 }

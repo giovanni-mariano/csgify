@@ -12,6 +12,7 @@
 #include <string>
 #include <vector>
 
+#if CSGIFY_HAVE_X11_RENDERER
 #include <AIS_InteractiveContext.hxx>
 #include <AIS_Shape.hxx>
 #include <Aspect_DisplayConnection.hxx>
@@ -27,6 +28,7 @@
 #include <V3d_View.hxx>
 #include <V3d_Viewer.hxx>
 #include <Xw_Window.hxx>
+#endif
 
 namespace csgify {
 namespace {
@@ -120,6 +122,7 @@ bool write_text_file(const std::filesystem::path& path,
     return true;
 }
 
+#if CSGIFY_HAVE_X11_RENDERER
 bool ensure_occt_driver_factory() {
     if (Graphic3d_GraphicDriverFactory::DefaultDriverFactory().IsNull()) {
         Graphic3d_GraphicDriverFactory::RegisterFactory(
@@ -204,6 +207,15 @@ bool write_occt_overview_png(const CadModel& model,
         return false;
     }
 }
+
+#else
+bool write_occt_overview_png(const CadModel&,
+                             const std::filesystem::path&,
+                             std::string* error) {
+    if (error) *error = "OCCT X11 renderer was not built";
+    return false;
+}
+#endif
 
 bool find_target(const ConversionReport& report,
                  const std::string& target_id,

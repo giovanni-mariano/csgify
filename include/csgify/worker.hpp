@@ -8,6 +8,9 @@
 namespace csgify {
 
 struct ProcessLimits {
+    // Zero disables this limit. Linux uses RLIMIT_AS (virtual address space).
+    // macOS polls the worker's resident memory and checks exit peak RSS; it
+    // permits brief overshoot and does not aggregate descendant memory.
     std::uint64_t memory_bytes = 0;
     std::uint64_t wall_time_ms = 0;
     std::uint64_t cpu_time_seconds = 0;
@@ -27,6 +30,9 @@ struct ProcessResult {
     std::string standard_error;
     std::string limit_reason;
     std::string launch_error;
+    bool memory_limit_exceeded = false;
+    // Resident-memory high water mark on macOS; zero when not measured.
+    std::uint64_t peak_memory_bytes = 0;
 };
 
 ProcessResult run_bounded_process(

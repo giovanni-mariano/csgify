@@ -26,7 +26,8 @@ int run_qt_viewer_command(Session& session,
 
 // Offscreen interaction regression for the real decision window. It avoids
 // showing the native OCCT viewport while driving its Qt tree, actions, worker
-// completion, cancellation, and close-event policy.
+// completion, cancellation, and close-event policy. With CSGIFY_NATIVE_VIEW_CAPTURE
+// set, instead open a native viewport, resize it, and save a PNG render.
 int run_qt_decision_widget_smoke(Session& session,
                                  const std::string& step_path,
                                  const std::string& document_id);

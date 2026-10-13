@@ -19,7 +19,11 @@
 #include <Aspect_GridParams.hxx>
 #include <Aspect_TypeOfTriedronPosition.hxx>
 #include <Aspect_DisplayConnection.hxx>
+#if defined(__APPLE__)
+#include <Cocoa_Window.hxx>
+#else
 #include <Aspect_NeutralWindow.hxx>
+#endif
 #include <BRepBuilderAPI_MakeFace.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepPrimAPI_MakeCone.hxx>
@@ -27,6 +31,7 @@
 #include <BRepPrimAPI_MakeSphere.hxx>
 #include <Graphic3d_GraphicDriverFactory.hxx>
 #include <Graphic3d_RenderingParams.hxx>
+#include <Image_PixMap.hxx>
 #include <OpenGl_GraphicDriverFactory.hxx>
 #include <Quantity_Color.hxx>
 #include <V3d_View.hxx>
@@ -59,6 +64,7 @@
 #include <QFormLayout>
 #include <QGroupBox>
 #include <QLabel>
+#include <QImage>
 #include <QLineEdit>
 #include <QMainWindow>
 #include <QMessageBox>
@@ -262,8 +268,19 @@ public:
     bool dumpPng(const QString& path) {
         if (view_.IsNull()) return false;
         view_->Redraw();
-        const QByteArray encoded = path.toLocal8Bit();
-        return view_->Dump(encoded.constData());
+        Image_PixMap pixels;
+        if (!view_->ToPixMap(pixels, width(), height())) return false;
+        QImage image(width(), height(), QImage::Format_RGB32);
+        for (int y = 0; y < image.height(); ++y) {
+            auto* row = reinterpret_cast<QRgb*>(image.scanLine(y));
+            for (int x = 0; x < image.width(); ++x) {
+                const auto color = pixels.PixelColor(x, y).GetRGB();
+                row[x] = qRgb(qRound(color.Red() * 255),
+                              qRound(color.Green() * 255),
+                              qRound(color.Blue() * 255));
+            }
+        }
+        return image.save(path, "PNG");
     }
 
     void showCandidate(const DecompositionCandidate* candidate) {
@@ -339,7 +356,9 @@ protected:
     void resizeEvent(QResizeEvent* event) override {
         QWidget::resizeEvent(event);
         if (!window_.IsNull()) {
+#if !defined(__APPLE__)
             window_->SetSize(width(), height());
+#endif
             view_->MustBeResized();
             view_->Redraw();
         }
@@ -414,6 +433,12 @@ private:
             Graphic3d_GraphicDriverFactory::RegisterFactory(
                 new OpenGl_GraphicDriverFactory(), true);
         }
+#if defined(__APPLE__)
+        // Cocoa defaults to legacy GL unless the core profile is requested.
+        const auto factory = Handle(OpenGl_GraphicDriverFactory)::DownCast(
+            Graphic3d_GraphicDriverFactory::DefaultDriverFactory());
+        if (!factory.IsNull()) factory->DefaultOptions()->contextCompatible = false;
+#endif
         display_ = new Aspect_DisplayConnection();
         driver_ = Graphic3d_GraphicDriverFactory::DefaultDriverFactory()
                       ->CreateDriver(display_);
@@ -427,9 +452,13 @@ private:
         view_->ChangeRenderingParams().TransparencyMethod =
             Graphic3d_RTM_DEPTH_PEELING_OIT;
         view_->ChangeRenderingParams().NbOitDepthPeelingLayers = 6;
+#if defined(__APPLE__)
+        window_ = new Cocoa_Window(reinterpret_cast<NSView*>(winId()));
+#else
         window_ = new Aspect_NeutralWindow();
         window_->SetNativeHandle(static_cast<Aspect_Drawable>(winId()));
         window_->SetSize(width(), height());
+#endif
         view_->SetWindow(window_);
         view_->SetBgGradientColors(
             Quantity_Color(0.17, 0.17, 0.22, Quantity_TOC_sRGB),
@@ -824,7 +853,11 @@ private:
     Handle(V3d_Viewer) viewer_;
     Handle(AIS_InteractiveContext) context_;
     Handle(V3d_View) view_;
+#if defined(__APPLE__)
+    Handle(Cocoa_Window) window_;
+#else
     Handle(Aspect_NeutralWindow) window_;
+#endif
     std::vector<SolidViewEntry> entries_;
     std::vector<std::pair<std::string, Handle(AIS_Shape)>> shapes_;
     std::map<AIS_InteractiveObject*, std::string> ais_ids_;
@@ -6899,6 +6932,22 @@ int run_qt_decision_widget_smoke(Session& session,
         application.processEvents(QEventLoop::AllEvents, 25);
         return ready();
     };
+
+    // Opt-in native render check; requires a real desktop session.
+    const QString native_capture = qEnvironmentVariable("CSGIFY_NATIVE_VIEW_CAPTURE");
+    if (!native_capture.isEmpty()) {
+        window.show();
+        application.processEvents();
+        auto* viewport = dynamic_cast<OcctViewWidget*>(window.findChild<QWidget*>(
+            QStringLiteral("nativeGeometryViewport")));
+        if (!viewport) return fail("native viewport not found");
+        window.resize(1100, 760);
+        application.processEvents();
+        if (!viewport->dumpPng(native_capture))
+            return fail("native viewport capture failed");
+        window.close();
+        return EXIT_SUCCESS;
+    }
 
     // Optional real-widget layout captures. Keep the native OCCT surface
     // hidden: offscreen Qt has no X11/OpenGL drawable for it.

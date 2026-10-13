@@ -92,6 +92,48 @@ Configuration compiles and links an Alea API probe before generating the main
 build. If `../libalea/include` is newer than `../libalea/bin`, rebuild libalea;
 csgify deliberately refuses a mismatched header/archive pair.
 
+### macOS build
+
+The `macos` preset uses OCCT 8.0.0 installed under
+`build/deps/occt-install`, the neighboring `../libalea.c` checkout, and local
+CMake/Ninja tools under `build/tools`. After those dependencies are built:
+
+```sh
+build/tools/bin/cmake --preset macos
+build/tools/bin/cmake --build --preset macos
+```
+
+Lua and the native Qt viewer are enabled. The preset discovers Homebrew Qt 6
+under `/opt/homebrew/opt/qtbase`; override `CMAKE_PREFIX_PATH` for another
+installation. OCCT must include its visualization libraries and FreeType
+(`USE_FREETYPE=ON`) for text labels. The macOS viewer uses Cocoa and does not require XQuartz or a `DISPLAY` variable.
+
+```sh
+./build/csgify viewer-check
+./build/csgify view tests/fixtures/l_shape.step
+./build/csgify project review
+```
+
+The legacy X11 viewer and standalone PNG decision-packet renderer remain
+unavailable on macOS; decision packets retain their SVG overview.
+The Qt viewer can capture PNG artifacts through its native renderer.
+To verify actual rendering (opens and closes a test window):
+
+```sh
+QT_QPA_PLATFORM=cocoa CSGIFY_NATIVE_VIEW_CAPTURE="$PWD/build/native-viewer.png" \
+  ./build/csgify_qt_decision_widget tests/fixtures/l_shape.step
+```
+
+Use `-DCSGIFY_LIBALEA_ROOT=/path/to/libalea` to select another Alea checkout.
+
+Worker memory budgets use `RLIMIT_AS` on Linux. On macOS, the bounded-process
+runner checks the worker's resident memory approximately every 20 ms and its
+peak resident memory at exit. Exceeding the budget terminates the process group
+and reports `memory_bytes`; a child that already exited is still marked failed.
+This is a monitored budget, permits brief overshoot, and does not aggregate
+memory across descendants. Limit setup or monitoring errors fail the operation
+explicitly rather than running silently without protection.
+
 Run:
 
 ```sh

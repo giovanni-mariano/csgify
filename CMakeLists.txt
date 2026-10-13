@@ -59,6 +59,11 @@ find_library(CSGIFY_OCCT_TKOPENGL
     PATHS "${OpenCASCADE_LIBRARY_DIR}"
     NO_DEFAULT_PATH
 )
+set(CSGIFY_HAVE_X11_VIEWER OFF)
+if(CSGIFY_OCCT_TKOPENGL AND UNIX AND NOT APPLE)
+    find_package(X11 REQUIRED)
+    set(CSGIFY_HAVE_X11_VIEWER ON)
+endif()
 
 option(CSGIFY_ENABLE_LUA "Build the batch Lua runner from vendored Lua sources" ON)
 option(CSGIFY_ENABLE_QT_VIEWER
@@ -112,7 +117,11 @@ if(CSGIFY_ENABLE_LUA)
         "${CSGIFY_VENDOR_LUA_SRC}/lzio.c"
     )
     target_include_directories(csgify_lua PUBLIC "${CSGIFY_VENDOR_LUA_SRC}")
-    target_compile_definitions(csgify_lua PRIVATE LUA_USE_LINUX)
+    if(APPLE)
+        target_compile_definitions(csgify_lua PRIVATE LUA_USE_MACOSX)
+    else()
+        target_compile_definitions(csgify_lua PRIVATE LUA_USE_LINUX)
+    endif()
     set_target_properties(csgify_lua PROPERTIES POSITION_INDEPENDENT_CODE ON)
 endif()
 
@@ -167,7 +176,8 @@ target_include_directories(csgify_engine
         ${OpenCASCADE_INCLUDE_DIR}
 )
 target_compile_definitions(csgify_engine PRIVATE
-    CSGIFY_VERSION="${PROJECT_VERSION}")
+    CSGIFY_VERSION="${PROJECT_VERSION}"
+    CSGIFY_HAVE_X11_RENDERER=$<BOOL:${CSGIFY_HAVE_X11_VIEWER}>)
 
 target_link_libraries(csgify_engine
     PUBLIC
@@ -178,13 +188,15 @@ target_link_libraries(csgify_engine
 )
 if(CSGIFY_ENABLE_LUA)
     target_compile_definitions(csgify_engine PRIVATE CSGIFY_ENABLE_LUA=1)
-    target_link_libraries(csgify_engine PRIVATE csgify_lua dl)
+    target_link_libraries(csgify_engine PRIVATE csgify_lua ${CMAKE_DL_LIBS})
 else()
     target_compile_definitions(csgify_engine PRIVATE CSGIFY_ENABLE_LUA=0)
 endif()
 
 add_executable(csgify src/main.cpp)
 target_link_libraries(csgify PRIVATE csgify_engine)
+target_compile_definitions(csgify PRIVATE
+    CSGIFY_HAVE_X11_VIEWER=$<BOOL:${CSGIFY_HAVE_X11_VIEWER}>)
 if(CSGIFY_OCCT_TKOPENGL)
     find_library(CSGIFY_OCCT_TKV3D
         NAMES TKV3d
@@ -196,12 +208,14 @@ if(CSGIFY_OCCT_TKOPENGL)
         PATHS "${OpenCASCADE_LIBRARY_DIR}"
         NO_DEFAULT_PATH
     )
-    target_sources(csgify PRIVATE src/viewer.cpp)
+    if(CSGIFY_HAVE_X11_VIEWER)
+        target_sources(csgify PRIVATE src/viewer.cpp)
+        target_link_libraries(csgify PRIVATE X11::X11)
+    endif()
     target_link_libraries(csgify PRIVATE
         "${CSGIFY_OCCT_TKOPENGL}"
         "${CSGIFY_OCCT_TKV3D}"
         "${CSGIFY_OCCT_TKSERVICE}"
-        X11
     )
     target_compile_definitions(csgify PRIVATE CSGIFY_HAVE_TKOPENGL=1)
     if(CSGIFY_ENABLE_QT_VIEWER AND Qt6Widgets_FOUND)
@@ -237,7 +251,7 @@ if(CSGIFY_OCCT_TKOPENGL)
     else()
         target_compile_definitions(csgify PRIVATE CSGIFY_HAVE_QT6_VIEWER=0)
         if(CSGIFY_ENABLE_QT_VIEWER)
-            message(STATUS "csgify Qt 6 decision viewer: Qt6 Widgets not found; using X11 viewer")
+            message(STATUS "csgify Qt 6 decision viewer: Qt6 Widgets not found; Qt viewer disabled")
         endif()
     endif()
 else()
@@ -250,7 +264,7 @@ set_target_properties(csgify PROPERTIES
     BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
     INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}"
 )
-target_link_options(csgify PRIVATE "-Wl,--disable-new-dtags")
+target_link_options(csgify PRIVATE "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
 option(CSGIFY_BUILD_FIXTURE_GENERATOR "Build the developer tool that generates STEP test fixtures" OFF)
 if(CSGIFY_BUILD_FIXTURE_GENERATOR)
@@ -260,7 +274,7 @@ if(CSGIFY_BUILD_FIXTURE_GENERATOR)
     set_target_properties(csgify_generate_fixtures PROPERTIES
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
-    target_link_options(csgify_generate_fixtures PRIVATE "-Wl,--disable-new-dtags")
+    target_link_options(csgify_generate_fixtures PRIVATE "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 endif()
 
 include(CTest)
@@ -287,7 +301,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_semantic_metadata PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_semantic_metadata COMMAND csgify_semantic_metadata)
 
     add_executable(csgify_semantic_import tests/semantic_import.cpp)
@@ -296,7 +310,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_semantic_import PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_semantic_import
         COMMAND csgify_semantic_import
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/box.step")
@@ -307,7 +321,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_artifact_store PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_artifact_store COMMAND csgify_artifact_store)
 
     add_executable(csgify_alea_bridge tests/alea_bridge.cpp)
@@ -316,7 +330,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_alea_bridge PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_alea_bridge COMMAND csgify_alea_bridge)
 
     add_executable(csgify_alea_void_bridge tests/alea_void_bridge.cpp)
@@ -325,7 +339,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_alea_void_bridge PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_alea_void_bridge COMMAND csgify_alea_void_bridge)
     add_test(
         NAME csgify_alea_void_cli_smoke
@@ -349,7 +363,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_medium_request PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_medium_request COMMAND csgify_medium_request)
 
     add_executable(csgify_medium_network tests/medium_network.cpp)
@@ -361,7 +375,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_medium_network PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_medium_network COMMAND csgify_medium_network)
 
     add_executable(csgify_project_database tests/project_database.cpp)
@@ -370,7 +384,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_project_database PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_project_database COMMAND csgify_project_database)
 
     add_executable(csgify_definition_recognition_cache
@@ -383,7 +397,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_definition_recognition_cache PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_definition_recognition_cache
         COMMAND csgify_definition_recognition_cache)
 
@@ -411,7 +425,7 @@ if(BUILD_TESTING)
         target_link_libraries(csgify_qt_cad_job_controller PRIVATE
             csgify_engine Qt6::Core)
         target_link_options(csgify_qt_cad_job_controller PRIVATE
-            "-Wl,--disable-new-dtags")
+            "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
         add_test(
             NAME csgify_qt_cad_job_controller
             COMMAND "$<TARGET_FILE:csgify_qt_cad_job_controller>"
@@ -448,10 +462,9 @@ if(BUILD_TESTING)
             csgify_engine Qt6::Widgets
             "${CSGIFY_OCCT_TKOPENGL}"
             "${CSGIFY_OCCT_TKV3D}"
-            "${CSGIFY_OCCT_TKSERVICE}"
-            X11)
+            "${CSGIFY_OCCT_TKSERVICE}")
         target_link_options(csgify_qt_decision_widget PRIVATE
-            "-Wl,--disable-new-dtags")
+            "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
         add_test(
             NAME csgify_qt_decision_widget
             COMMAND "$<TARGET_FILE:csgify_qt_decision_widget>"
@@ -474,7 +487,7 @@ if(BUILD_TESTING)
         target_link_libraries(csgify_qt_agent_conversation_dock PRIVATE
             csgify_engine Qt6::Widgets)
         target_link_options(csgify_qt_agent_conversation_dock PRIVATE
-            "-Wl,--disable-new-dtags")
+            "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
         add_test(
             NAME csgify_qt_agent_conversation_dock
             COMMAND "$<TARGET_FILE:csgify_qt_agent_conversation_dock>")
@@ -497,7 +510,7 @@ if(BUILD_TESTING)
             target_link_libraries(csgify_openai_agent_provider PRIVATE
                 csgify_engine Qt6::Core Qt6::Network)
             target_link_options(csgify_openai_agent_provider PRIVATE
-                "-Wl,--disable-new-dtags")
+                "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
             add_test(NAME csgify_openai_agent_provider
                 COMMAND "$<TARGET_FILE:csgify_openai_agent_provider>")
             set_tests_properties(csgify_openai_agent_provider PROPERTIES
@@ -528,7 +541,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_worker_process PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_worker_process COMMAND csgify_worker_process)
 
     add_executable(csgify_spatial_index tests/spatial_index.cpp)
@@ -537,7 +550,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_spatial_index PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_spatial_index COMMAND csgify_spatial_index)
 
     add_executable(csgify_spatial_overlap_prescreen
@@ -550,7 +563,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_spatial_overlap_prescreen PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_spatial_overlap_prescreen
         COMMAND csgify_spatial_overlap_prescreen)
 
@@ -564,7 +577,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_decomposition_ledger PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_decomposition_ledger
         COMMAND csgify_decomposition_ledger
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/l_shape.step")
@@ -579,7 +592,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_local_partition PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_local_partition COMMAND csgify_local_partition)
 
     add_executable(csgify_local_overlap tests/local_overlap.cpp)
@@ -591,7 +604,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_local_overlap PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
     add_test(NAME csgify_local_overlap COMMAND csgify_local_overlap)
 
     add_executable(csgify_session_smoke tests/session_smoke.cpp)
@@ -600,7 +613,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}"
     )
-    target_link_options(csgify_session_smoke PRIVATE "-Wl,--disable-new-dtags")
+    target_link_options(csgify_session_smoke PRIVATE "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_c_api_smoke tests/c_api_smoke.c)
     target_link_libraries(csgify_c_api_smoke PRIVATE csgify_engine)
@@ -608,7 +621,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}"
     )
-    target_link_options(csgify_c_api_smoke PRIVATE "-Wl,--disable-new-dtags")
+    target_link_options(csgify_c_api_smoke PRIVATE "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_synthetic_boolean_step
         tests/synthetic_boolean_step.cpp)
@@ -620,7 +633,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_synthetic_boolean_step PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_geometric_certificate_property
         tests/geometric_certificate_property.cpp)
@@ -633,7 +646,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_geometric_certificate_property PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_fixed_point_progress
         tests/fixed_point_progress.cpp)
@@ -642,7 +655,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_fixed_point_progress PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_fixed_point_callback
         tests/fixed_point_callback.cpp)
@@ -651,7 +664,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_fixed_point_callback PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_job_progress tests/job_progress.cpp)
     target_link_libraries(csgify_job_progress PRIVATE csgify_engine)
@@ -659,7 +672,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_job_progress PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_shell_difference tests/shell_difference.cpp)
     target_include_directories(csgify_shell_difference PRIVATE
@@ -670,7 +683,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_shell_difference PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_pipe_annulus tests/pipe_annulus.cpp)
     target_include_directories(csgify_pipe_annulus PRIVATE
@@ -681,7 +694,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_pipe_annulus PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_extrusion_recognition
         tests/extrusion_recognition.cpp)
@@ -693,7 +706,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_extrusion_recognition PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_revolution_recognition
         tests/revolution_recognition.cpp)
@@ -705,7 +718,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_revolution_recognition PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_decomposed_union tests/decomposed_union.cpp)
     target_include_directories(csgify_decomposed_union PRIVATE
@@ -716,7 +729,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_decomposed_union PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_decomposition_preview
         tests/decomposition_preview.cpp)
@@ -728,7 +741,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_decomposition_preview PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_approximation_metrics
         tests/approximation_metrics.cpp)
@@ -740,7 +753,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_approximation_metrics PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_spline_fit_evidence
         tests/spline_fit_evidence.cpp)
@@ -752,7 +765,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_spline_fit_evidence PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_xcaf_document_lifetime
         tests/xcaf_document_lifetime.cpp)
@@ -764,7 +777,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_xcaf_document_lifetime PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_operation_registry_contract
         tests/operation_registry_contract.cpp)
@@ -776,7 +789,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_operation_registry_contract PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_autonomy_request_contract
         tests/autonomy_request_contract.cpp)
@@ -788,7 +801,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_autonomy_request_contract PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_agent_protocol
         tests/agent_protocol.cpp)
@@ -800,7 +813,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_agent_protocol PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_executable(csgify_mcnp_geometry_safety
         tests/mcnp_geometry_safety.cpp)
@@ -812,7 +825,7 @@ if(BUILD_TESTING)
         BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}"
         INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")
     target_link_options(csgify_mcnp_geometry_safety PRIVATE
-        "-Wl,--disable-new-dtags")
+        "$<$<PLATFORM_ID:Linux>:-Wl,--disable-new-dtags>")
 
     add_test(
         NAME csgify_contract_smoke

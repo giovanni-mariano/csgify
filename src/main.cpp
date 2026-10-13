@@ -2221,10 +2221,13 @@ int run_autonomy_command(int argc, char** argv) {
             return csgify::run_qt_viewer_command(
                 *session, input_path, document, preselect, proposal,
                 escalated->proposal.candidate_id, review, output_path);
-#else
+#elif CSGIFY_HAVE_X11_VIEWER
             return csgify::run_viewer_command(
                 *session, input_path, document, preselect, proposal,
                 escalated->proposal.candidate_id, review, output_path);
+#else
+            std::cerr << "error viewer_not_built\n";
+            return 2;
 #endif
 #else
             std::cerr << "error viewer_not_built: use the queue report for external review\n";
@@ -2559,9 +2562,14 @@ int run_view_command(int argc, char** argv) {
         return EXIT_FAILURE;
     }
 #endif
+#if CSGIFY_HAVE_X11_VIEWER
     return csgify::run_viewer_command(
         *session, input_path, doc_id, preselect_id, proposal, candidate_id,
         review, commit_out_path);
+#else
+    std::cerr << "error x11_viewer_not_built: use the Qt viewer on this platform\n";
+    return EXIT_FAILURE;
+#endif
 #else
     (void)input_path; (void)preselect_id; (void)proposal; (void)candidate_id;
     std::cerr << "error viewer_not_built: csgify was built without TKOpenGl "
@@ -2600,7 +2608,7 @@ int run_viewer_check_command() {
     std::cout << "default_viewer_backend "
 #if CSGIFY_HAVE_QT6_VIEWER
               << "qt"
-#elif CSGIFY_HAVE_TKOPENGL
+#elif CSGIFY_HAVE_X11_VIEWER
               << "x11"
 #else
               << "none"
@@ -2624,12 +2632,18 @@ int run_viewer_check_command() {
         return EXIT_FAILURE;
     }
 
+#if !defined(__APPLE__)
     if ((!display || !display[0]) && (!wayland || !wayland[0])) {
         std::cout << "status probably_unavailable\n";
         std::cout << "reason no DISPLAY or WAYLAND_DISPLAY is set for the OCCT viewer.\n";
         return EXIT_FAILURE;
     }
 
+#endif
+#if !CSGIFY_HAVE_QT6_VIEWER && !CSGIFY_HAVE_X11_VIEWER
+    std::cout << "status unavailable\nreason no viewer frontend was built\n";
+    return EXIT_FAILURE;
+#endif
     std::cout << "status available\n";
     return EXIT_SUCCESS;
 }

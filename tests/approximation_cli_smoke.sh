@@ -7,7 +7,9 @@ outdir="$3"
 mkdir -p "$outdir"
 fail() { echo "approximation_cli_smoke: $*" >&2; exit 1; }
 rm -f "$outdir/strict.i" "$outdir/accepted.i" "$outdir/accepted.json" \
-  "$outdir/accepted-report.json" "$outdir/shatter.i" "$outdir/shatter.json"
+  "$outdir/accepted-report.json" "$outdir/shatter.i" "$outdir/shatter.json" \
+  "$outdir/surface-sampled.i" "$outdir/surface-sampled.log" \
+  "$outdir/surface-sampled.json" "$outdir/surface-partial.i"
 
 set +e
 "$exe" simplify "$fixtures/l_shape.step" --replace-solid-bbox solid:1 \
@@ -113,9 +115,9 @@ grep -q "approximation_protected_geometry" "$outdir/protected.err" \
 grep -q '"max_global_changed_volume_fraction": 0.01' "$outdir/preset.json" \
   || fail "preset was not expanded in the report"
 
-# Exact surface support substitutions can use the common gate immediately;
-# non-exact partial-face changes fail closed until the complete owner can be
-# materialized and measured as a closed solid.
+# A tiny sampled deviation is not certified exact evidence. Partial-face
+# changes fail closed until the complete owner can be materialized and
+# measured as a closed solid, even when the sampled fit meets the budget.
 "$exe" propose surface face:1.1 "$fixtures/spline_face.step" \
   --report "$outdir/surface-proposal.json" >/dev/null \
   || fail "spline surface proposal failed"
@@ -123,27 +125,44 @@ python3 - "$outdir/surface-proposal.json" <<'PY' \
   || fail "sampled spline fit was promoted to certified exact evidence"
 import json, sys
 p = json.load(open(sys.argv[1]))
-best = next(c for c in p["candidates"] if c["id"] == p["best_candidate_id"])
-assert best["reason"] == "sampled_analytic_fit"
-assert best["deviation_certified"] is False
-assert best["exact"] is False
+candidate = next(c for c in p["candidates"] if c["id"] == "candidate:3")
+assert candidate["reason"] == "sampled_analytic_fit"
+assert candidate["deviation_certified"] is False
+assert candidate["exact"] is False
+assert candidate["max_deviation"] <= 1e-6
 PY
 
 set +e
 "$exe" simplify "$fixtures/spline_face.step" \
-  --apply-surface-candidate face:1.1 --out "$outdir/surface-exact.i" \
+  --apply-surface-candidate face:1.1 --out "$outdir/surface-sampled.i" \
   --candidate candidate:3 --approx-volume 0.1% \
-  --max-deviation 0.000001 --log "$outdir/surface-exact.log" \
-  --report "$outdir/surface-exact.json" >/dev/null 2>"$outdir/surface-exact.err"
-surface_exact_rc=$?
+  --max-deviation 0.000001 --log "$outdir/surface-sampled.log" \
+  --report "$outdir/surface-sampled.json" >/dev/null 2>"$outdir/surface-sampled.err"
+surface_sampled_rc=$?
 set -e
-[[ "$surface_exact_rc" == "1" ]] \
-  || fail "single exact face unexpectedly made the whole fixture emit-ready"
-grep -q '"op":"apply_budgeted_surface_replacement_candidate"' \
-  "$outdir/surface-exact.log" \
-  || fail "exact surface substitution did not use the common budget gate"
-grep -q '"accepted_actions":1' "$outdir/surface-exact.json" \
-  || fail "bounded surface substitution was not ledgered"
+[[ "$surface_sampled_rc" == "1" ]] \
+  || fail "uncertified sampled surface approximation was accepted"
+grep -q "approximation_measurement_unknown" "$outdir/surface-sampled.err" \
+  || fail "sampled surface uncertainty did not fail closed"
+[[ ! -e "$outdir/surface-sampled.i" ]] \
+  || fail "rejected sampled surface approximation wrote MCNP"
+python3 - "$outdir/surface-sampled.log" <<'PY' \
+  || fail "sampled surface rejection or rollback was not audited"
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    events = [json.loads(line) for line in handle if line.strip()]
+operations = [event for event in events
+              if event.get("op") == "apply_budgeted_surface_replacement_candidate"]
+assert len(operations) == 1, operations
+operation = operations[0]
+assert operation["result"] == "failed", operation
+assert operation["params"]["approximation_policy_result"] == "approximation_measurement_unknown"
+assert operation["produced"] == [], operation
+undos = [event for event in events
+         if event.get("kind") == "undo" and event.get("undoes_seq") == operation["seq"]]
+assert len(undos) == 1, events
+assert undos[0]["seq"] > operation["seq"], undos
+PY
 
 set +e
 "$exe" simplify "$fixtures/spline_face.step" \
